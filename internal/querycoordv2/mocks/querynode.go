@@ -23,17 +23,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
-	. "github.com/milvus-io/milvus/internal/querycoordv2/params"
-	"github.com/milvus-io/milvus/internal/util/sessionutil"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
 	"github.com/stretchr/testify/mock"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	. "github.com/milvus-io/milvus/internal/querycoordv2/params"
+	"github.com/milvus-io/milvus/internal/util/sessionutil"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 type MockQueryNode struct {
@@ -59,7 +60,7 @@ func NewMockQueryNode(t *testing.T, etcdCli *clientv3.Client, nodeID int64) *Moc
 		MockQueryNodeServer: NewMockQueryNodeServer(t),
 		ctx:                 ctx,
 		cancel:              cancel,
-		session:             sessionutil.NewSession(ctx, Params.EtcdCfg.MetaRootPath.GetValue(), etcdCli),
+		session:             sessionutil.NewSessionWithEtcd(ctx, Params.EtcdCfg.MetaRootPath.GetValue(), etcdCli),
 		channels:            make(map[int64][]string),
 		segments:            make(map[int64]map[string][]int64),
 		ID:                  nodeID,
@@ -81,9 +82,7 @@ func (node *MockQueryNode) Start() error {
 		err = node.server.Serve(lis)
 	}()
 
-	successStatus := &commonpb.Status{
-		ErrorCode: commonpb.ErrorCode_Success,
-	}
+	successStatus := merr.Success()
 	node.EXPECT().GetDataDistribution(mock.Anything, mock.Anything).Return(&querypb.GetDataDistributionResponse{
 		Status:   successStatus,
 		NodeID:   node.ID,
@@ -118,7 +117,9 @@ func (node *MockQueryNode) Start() error {
 		case <-node.ctx.Done():
 			return nil
 		default:
-			return &milvuspb.ComponentStates{}
+			return &milvuspb.ComponentStates{
+				Status: successStatus,
+			}
 		}
 	}, func(context.Context, *milvuspb.GetComponentStatesRequest) error {
 		select {
@@ -133,7 +134,7 @@ func (node *MockQueryNode) Start() error {
 	node.session.Init(typeutil.QueryNodeRole, node.addr, false, true)
 	node.session.ServerID = node.ID
 	node.session.Register()
-	log.Debug("mock QueryNode started",
+	log.Ctx(context.TODO()).Debug("mock QueryNode started",
 		zap.Int64("nodeID", node.ID),
 		zap.String("nodeAddr", node.addr))
 

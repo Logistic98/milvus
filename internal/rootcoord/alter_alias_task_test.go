@@ -18,13 +18,15 @@ package rootcoord
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	mockrootcoord "github.com/milvus-io/milvus/internal/rootcoord/mocks"
 )
 
 func Test_alterAliasTask_Prepare(t *testing.T) {
@@ -43,9 +45,11 @@ func Test_alterAliasTask_Prepare(t *testing.T) {
 
 func Test_alterAliasTask_Execute(t *testing.T) {
 	t.Run("failed to expire cache", func(t *testing.T) {
-		core := newTestCore(withInvalidProxyManager())
+		mockMeta := mockrootcoord.NewIMetaTable(t)
+		mockMeta.EXPECT().GetCollectionID(mock.Anything, mock.Anything, mock.Anything).Return(111)
+		core := newTestCore(withInvalidProxyManager(), withMeta(mockMeta))
 		task := &alterAliasTask{
-			baseTask: baseTask{core: core},
+			baseTask: newBaseTask(context.Background(), core),
 			Req: &milvuspb.AlterAliasRequest{
 				Base:  &commonpb.MsgBase{MsgType: commonpb.MsgType_AlterAlias},
 				Alias: "test",
@@ -56,9 +60,13 @@ func Test_alterAliasTask_Execute(t *testing.T) {
 	})
 
 	t.Run("failed to alter alias", func(t *testing.T) {
-		core := newTestCore(withValidProxyManager(), withInvalidMeta())
+		mockMeta := mockrootcoord.NewIMetaTable(t)
+		mockMeta.EXPECT().GetCollectionID(mock.Anything, mock.Anything, mock.Anything).Return(111)
+		mockMeta.EXPECT().AlterAlias(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+			Return(fmt.Errorf("failed to alter alias"))
+		core := newTestCore(withValidProxyManager(), withMeta(mockMeta))
 		task := &alterAliasTask{
-			baseTask: baseTask{core: core},
+			baseTask: newBaseTask(context.Background(), core),
 			Req: &milvuspb.AlterAliasRequest{
 				Base:  &commonpb.MsgBase{MsgType: commonpb.MsgType_AlterAlias},
 				Alias: "test",

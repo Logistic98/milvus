@@ -23,7 +23,7 @@ import (
 	"github.com/apache/pulsar-client-go/pulsar"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper"
+	"github.com/milvus-io/milvus/pkg/mq/common"
 )
 
 func TestPulsarProducer(t *testing.T) {
@@ -34,21 +34,21 @@ func TestPulsarProducer(t *testing.T) {
 	assert.NotNil(t, pc)
 
 	topic := "TEST"
-	producer, err := pc.CreateProducer(mqwrapper.ProducerOptions{Topic: topic})
-	assert.Nil(t, err)
+	producer, err := pc.CreateProducer(context.TODO(), common.ProducerOptions{Topic: topic})
+	assert.NoError(t, err)
 	assert.NotNil(t, producer)
 
 	pulsarProd := producer.(*pulsarProducer)
 	fullTopicName, err := GetFullTopicName(DefaultPulsarTenant, DefaultPulsarNamespace, topic)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.Equal(t, pulsarProd.Topic(), fullTopicName)
 
-	msg := &mqwrapper.ProducerMessage{
+	msg := &common.ProducerMessage{
 		Payload:    []byte{},
 		Properties: map[string]string{},
 	}
 	_, err = producer.Send(context.TODO(), msg)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	pulsarProd.Close()
 }

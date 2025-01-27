@@ -25,23 +25,22 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
-	"github.com/milvus-io/milvus/internal/util/mock"
-
-	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/stretchr/testify/assert"
+	"go.uber.org/zap"
 	"google.golang.org/grpc"
 
-	"github.com/milvus-io/milvus/internal/proxy"
+	"github.com/milvus-io/milvus/internal/util/mock"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/proto/rootcoordpb"
 	"github.com/milvus-io/milvus/pkg/util/etcd"
-	"github.com/stretchr/testify/assert"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
 func TestMain(m *testing.M) {
 	// init embed etcd
 	embedetcdServer, tempDir, err := etcd.StartTestEmbedEtcdServer()
 	if err != nil {
-		log.Fatal(err.Error())
+		log.Fatal("failed to start embed etcd server", zap.Error(err))
 	}
 	defer os.RemoveAll(tempDir)
 	defer embedetcdServer.Close()
@@ -56,52 +55,33 @@ func TestMain(m *testing.M) {
 }
 
 func Test_NewClient(t *testing.T) {
-	proxy.Params.Init()
-
 	ctx := context.Background()
-	etcdCli, err := etcd.GetEtcdClient(
-		Params.EtcdCfg.UseEmbedEtcd.GetAsBool(),
-		Params.EtcdCfg.EtcdUseSSL.GetAsBool(),
-		Params.EtcdCfg.Endpoints.GetAsStrings(),
-		Params.EtcdCfg.EtcdTLSCert.GetValue(),
-		Params.EtcdCfg.EtcdTLSKey.GetValue(),
-		Params.EtcdCfg.EtcdTLSCACert.GetValue(),
-		Params.EtcdCfg.EtcdTLSMinVersion.GetValue())
+
+	client, err := NewClient(ctx)
 	assert.NoError(t, err)
-	client, err := NewClient(ctx, proxy.Params.EtcdCfg.MetaRootPath.GetValue(), etcdCli)
-	assert.Nil(t, err)
 	assert.NotNil(t, client)
-
-	err = client.Init()
-	assert.Nil(t, err)
-
-	err = client.Start()
-	assert.Nil(t, err)
-
-	err = client.Register()
-	assert.Nil(t, err)
 
 	checkFunc := func(retNotNil bool) {
 		retCheck := func(notNil bool, ret interface{}, err error) {
 			if notNil {
 				assert.NotNil(t, ret)
-				assert.Nil(t, err)
+				assert.NoError(t, err)
 			} else {
 				assert.Nil(t, ret)
-				assert.NotNil(t, err)
+				assert.Error(t, err)
 			}
 		}
 
 		{
-			r, err := client.GetComponentStates(ctx)
+			r, err := client.GetComponentStates(ctx, nil)
 			retCheck(retNotNil, r, err)
 		}
 		{
-			r, err := client.GetTimeTickChannel(ctx)
+			r, err := client.GetTimeTickChannel(ctx, nil)
 			retCheck(retNotNil, r, err)
 		}
 		{
-			r, err := client.GetStatisticsChannel(ctx)
+			r, err := client.GetStatisticsChannel(ctx, nil)
 			retCheck(retNotNil, r, err)
 		}
 		{
@@ -122,6 +102,10 @@ func Test_NewClient(t *testing.T) {
 		}
 		{
 			r, err := client.ShowCollections(ctx, nil)
+			retCheck(retNotNil, r, err)
+		}
+		{
+			r, err := client.ShowCollectionIDs(ctx, nil)
 			retCheck(retNotNil, r, err)
 		}
 		{
@@ -157,6 +141,10 @@ func Test_NewClient(t *testing.T) {
 			retCheck(retNotNil, r, err)
 		}
 		{
+			r, err := client.GetPChannelInfo(ctx, nil)
+			retCheck(retNotNil, r, err)
+		}
+		{
 			r, err := client.GetMetrics(ctx, nil)
 			retCheck(retNotNil, r, err)
 		}
@@ -173,15 +161,11 @@ func Test_NewClient(t *testing.T) {
 			retCheck(retNotNil, r, err)
 		}
 		{
-			r, err := client.Import(ctx, nil)
+			r, err := client.DescribeAlias(ctx, nil)
 			retCheck(retNotNil, r, err)
 		}
 		{
-			r, err := client.GetImportState(ctx, nil)
-			retCheck(retNotNil, r, err)
-		}
-		{
-			r, err := client.ReportImport(ctx, nil)
+			r, err := client.ListAliases(ctx, nil)
 			retCheck(retNotNil, r, err)
 		}
 		{
@@ -248,20 +232,64 @@ func Test_NewClient(t *testing.T) {
 			r, err := client.CheckHealth(ctx, nil)
 			retCheck(retNotNil, r, err)
 		}
+		{
+			r, err := client.CreateDatabase(ctx, nil)
+			retCheck(retNotNil, r, err)
+		}
+		{
+			r, err := client.DropDatabase(ctx, nil)
+			retCheck(retNotNil, r, err)
+		}
+		{
+			r, err := client.ListDatabases(ctx, nil)
+			retCheck(retNotNil, r, err)
+		}
+		{
+			r, err := client.AlterCollection(ctx, nil)
+			retCheck(retNotNil, r, err)
+		}
+		{
+			r, err := client.AlterDatabase(ctx, nil)
+			retCheck(retNotNil, r, err)
+		}
+		{
+			r, err := client.BackupRBAC(ctx, nil)
+			retCheck(retNotNil, r, err)
+		}
+		{
+			r, err := client.RestoreRBAC(ctx, nil)
+			retCheck(retNotNil, r, err)
+		}
+		{
+			r, err := client.CreatePrivilegeGroup(ctx, nil)
+			retCheck(retNotNil, r, err)
+		}
+		{
+			r, err := client.DropPrivilegeGroup(ctx, nil)
+			retCheck(retNotNil, r, err)
+		}
+		{
+			r, err := client.ListPrivilegeGroups(ctx, nil)
+			retCheck(retNotNil, r, err)
+		}
+		{
+			r, err := client.OperatePrivilegeGroup(ctx, nil)
+			retCheck(retNotNil, r, err)
+		}
 	}
 
-	client.grpcClient = &mock.GRPCClientBase[rootcoordpb.RootCoordClient]{
+	client.(*Client).grpcClient = &mock.GRPCClientBase[rootcoordpb.RootCoordClient]{
 		GetGrpcClientErr: errors.New("dummy"),
 	}
 
 	newFunc1 := func(cc *grpc.ClientConn) rootcoordpb.RootCoordClient {
 		return &mock.GrpcRootCoordClient{Err: nil}
 	}
-	client.grpcClient.SetNewGrpcClientFunc(newFunc1)
+	client.(*Client).grpcClient.SetNewGrpcClientFunc(newFunc1)
 
 	checkFunc(false)
 
-	client.grpcClient = &mock.GRPCClientBase[rootcoordpb.RootCoordClient]{
+	client.(*Client).grpcClient = &mock.GRPCClientBase[rootcoordpb.RootCoordClient]{
 		GetGrpcClientErr: nil,
 	}
 
@@ -269,18 +297,18 @@ func Test_NewClient(t *testing.T) {
 		return &mock.GrpcRootCoordClient{Err: errors.New("dummy")}
 	}
 
-	client.grpcClient.SetNewGrpcClientFunc(newFunc2)
+	client.(*Client).grpcClient.SetNewGrpcClientFunc(newFunc2)
 
 	checkFunc(false)
 
-	client.grpcClient = &mock.GRPCClientBase[rootcoordpb.RootCoordClient]{
+	client.(*Client).grpcClient = &mock.GRPCClientBase[rootcoordpb.RootCoordClient]{
 		GetGrpcClientErr: nil,
 	}
 
 	newFunc3 := func(cc *grpc.ClientConn) rootcoordpb.RootCoordClient {
 		return &mock.GrpcRootCoordClient{Err: nil}
 	}
-	client.grpcClient.SetNewGrpcClientFunc(newFunc3)
+	client.(*Client).grpcClient.SetNewGrpcClientFunc(newFunc3)
 
 	checkFunc(true)
 
@@ -292,18 +320,18 @@ func Test_NewClient(t *testing.T) {
 
 	retCheck := func(ret interface{}, err error) {
 		assert.Nil(t, ret)
-		assert.NotNil(t, err)
+		assert.Error(t, err)
 	}
 	{
-		rTimeout, err := client.GetComponentStates(shortCtx)
+		rTimeout, err := client.GetComponentStates(shortCtx, nil)
 		retCheck(rTimeout, err)
 	}
 	{
-		rTimeout, err := client.GetTimeTickChannel(shortCtx)
+		rTimeout, err := client.GetTimeTickChannel(shortCtx, nil)
 		retCheck(rTimeout, err)
 	}
 	{
-		rTimeout, err := client.GetStatisticsChannel(shortCtx)
+		rTimeout, err := client.GetStatisticsChannel(shortCtx, nil)
 		retCheck(rTimeout, err)
 	}
 	{
@@ -324,6 +352,10 @@ func Test_NewClient(t *testing.T) {
 	}
 	{
 		rTimeout, err := client.ShowCollections(shortCtx, nil)
+		retCheck(rTimeout, err)
+	}
+	{
+		rTimeout, err := client.ShowCollectionIDs(shortCtx, nil)
 		retCheck(rTimeout, err)
 	}
 	{
@@ -359,6 +391,10 @@ func Test_NewClient(t *testing.T) {
 		retCheck(rTimeout, err)
 	}
 	{
+		rTimeout, err := client.GetPChannelInfo(shortCtx, nil)
+		retCheck(rTimeout, err)
+	}
+	{
 		rTimeout, err := client.GetMetrics(shortCtx, nil)
 		retCheck(rTimeout, err)
 	}
@@ -375,15 +411,11 @@ func Test_NewClient(t *testing.T) {
 		retCheck(rTimeout, err)
 	}
 	{
-		rTimeout, err := client.Import(shortCtx, nil)
+		rTimeout, err := client.DescribeAlias(shortCtx, nil)
 		retCheck(rTimeout, err)
 	}
 	{
-		rTimeout, err := client.GetImportState(shortCtx, nil)
-		retCheck(rTimeout, err)
-	}
-	{
-		rTimeout, err := client.ReportImport(shortCtx, nil)
+		rTimeout, err := client.ListAliases(shortCtx, nil)
 		retCheck(rTimeout, err)
 	}
 	{
@@ -404,10 +436,6 @@ func Test_NewClient(t *testing.T) {
 	}
 	{
 		rTimeout, err := client.ListCredUsers(shortCtx, nil)
-		retCheck(rTimeout, err)
-	}
-	{
-		rTimeout, err := client.ListImportTasks(shortCtx, nil)
 		retCheck(rTimeout, err)
 	}
 	{
@@ -450,7 +478,19 @@ func Test_NewClient(t *testing.T) {
 		rTimeout, err := client.CheckHealth(shortCtx, nil)
 		retCheck(rTimeout, err)
 	}
+	{
+		rTimeout, err := client.CreateDatabase(shortCtx, nil)
+		retCheck(rTimeout, err)
+	}
+	{
+		rTimeout, err := client.DropDatabase(shortCtx, nil)
+		retCheck(rTimeout, err)
+	}
+	{
+		rTimeout, err := client.ListDatabases(shortCtx, nil)
+		retCheck(rTimeout, err)
+	}
 	// clean up
-	err = client.Stop()
-	assert.Nil(t, err)
+	err = client.Close()
+	assert.NoError(t, err)
 }

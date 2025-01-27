@@ -11,7 +11,7 @@ logger.remove()
 logger.add(sys.stderr, format= "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
     "<level>{level: <8}</level> | "
     "<cyan>{thread.name}</cyan> |"
-    "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>", 
+    "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
     level="INFO")
 
 pymilvus_version = pymilvus.__version__
@@ -28,10 +28,15 @@ NUM_REPLICAS = 2
 
 def filter_collections_by_prefix(prefix):
     col_list = list_collections()
+    logger.info(f"all collections: {col_list}")
     res = []
     for col in col_list:
         if col.startswith(prefix):
-            res.append(col)
+            if any(index_name in col for index_name in all_index_types):
+                res.append(col)
+            else:
+                logger.warning(f"collection {col} has no supported index, skip")
+    logger.info(f"filtered collections with prefix {prefix}: {res}")
     return res
 
 
@@ -90,7 +95,7 @@ def create_collections_and_insert_data(prefix, flush=True, count=3000, collectio
     for index_name in all_index_types[:collection_cnt]:
         logger.info("\nCreate collection...")
         col_name = prefix + index_name
-        collection = Collection(name=col_name, schema=default_schema) 
+        collection = Collection(name=col_name, schema=default_schema)
         logger.info(f"collection name: {col_name}")
         logger.info(f"begin insert, count: {count} nb: {nb}")
         times = int(count // nb)
@@ -108,6 +113,12 @@ def create_collections_and_insert_data(prefix, flush=True, count=3000, collectio
             end_time = time.time()
             logger.info(f"[{j+1}/{times}] insert {nb} data, time: {end_time - start_time:.4f}")
             total_time += end_time - start_time
+            if j <= times - 3:
+                collection.flush()
+                collection.num_entities
+            if j == times - 3:
+                collection.compact()
+
 
         logger.info(f"end insert, time: {total_time:.4f}")
         if flush:
@@ -172,9 +183,17 @@ def create_index(prefix):
         index["params"] = index_params_map[index_name]
         if index_name in ["BIN_FLAT", "BIN_IVF_FLAT"]:
             index["metric_type"] = "HAMMING"
-        t0 = time.time()
-        c.create_index(field_name="float_vector", index_params=index)
-        logger.info(f"create index time: {time.time() - t0:.4f}")
+        index_info_list = [x.to_dict() for x in c.indexes]
+        logger.info(index_info_list)
+        is_indexed = False
+        for index_info in index_info_list:
+            if "metric_type" in index_info.keys() or "metric_type" in index_info["index_param"]:
+                is_indexed = True
+                logger.info(f"collection {col_name} has been indexed with {index_info}")
+        if not is_indexed:
+            t0 = time.time()
+            c.create_index(field_name="float_vector", index_params=index)
+            logger.info(f"create index time: {time.time() - t0:.4f}")
         if replica_number > 0:
             c.load(replica_number=replica_number)
 
@@ -225,8 +244,7 @@ def load_and_search(prefix, replicas=1):
         # show result
         for hits in res:
             for hit in hits:
-                # Get value of the random value field for search result
-                logger.info(str(hits), hit.entity.get("random_value"))
+                logger.info(f"hit: {hit}")
             ids = hits.ids
             assert len(ids) == topK, f"get {len(ids)} results, but topK is {topK}"
             logger.info(ids)
@@ -234,7 +252,10 @@ def load_and_search(prefix, replicas=1):
         logger.info("search latency: %.4fs" % (end_time - start_time))
         t0 = time.time()
         expr = "count in [2,4,6,8]"
-        output_fields = ["count", "random_value"]
+        if "SQ" in col_name or "PQ" in col_name:
+            output_fields = ["count", "random_value"]
+        else:
+            output_fields = ["count", "random_value", "float_vector"]
         res = c.query(expr, output_fields, timeout=120)
         sorted_res = sorted(res, key=lambda k: k['count'])
         for r in sorted_res:

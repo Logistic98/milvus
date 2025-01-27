@@ -42,14 +42,22 @@ func Test_GetUsedMemoryCount(t *testing.T) {
 		zap.Uint64("UsedMemoryCount", GetUsedMemoryCount()))
 }
 
-func Test_GetDiskCount(t *testing.T) {
-	log.Info("TestGetDiskCount",
-		zap.Uint64("DiskCount", GetDiskCount()))
+func TestGetDiskUsage(t *testing.T) {
+	used, total, err := GetDiskUsage("/")
+	assert.NoError(t, err)
+	assert.GreaterOrEqual(t, used, 0.0)
+	assert.GreaterOrEqual(t, total, 0.0)
+
+	used, total, err = GetDiskUsage("/dir_not_exist")
+	assert.NoError(t, err)
+	assert.Equal(t, 0.0, used)
+	assert.Equal(t, 0.0, total)
 }
 
-func Test_GetDiskUsage(t *testing.T) {
-	log.Info("TestGetDiskUsage",
-		zap.Uint64("DiskUsage", GetDiskUsage()))
+func TestGetIOWait(t *testing.T) {
+	iowait, err := GetIOWait()
+	assert.NoError(t, err)
+	assert.GreaterOrEqual(t, iowait, 0.0)
 }
 
 func Test_GetMemoryUsageRatio(t *testing.T) {

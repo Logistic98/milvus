@@ -224,3 +224,29 @@ def equal_entities_list(exp, actual, primary_field, with_vec=False):
                 except Exception as ex:
                     log.error(ex)
     return True if len(exp) == 0 else False
+
+
+def output_field_value_check(search_res, original):
+    """
+    check if the value of output fields is correct, it only works on auto_id = False
+    :param search_res: the search result of specific output fields
+    :param original: the data in the collection
+    :return: True or False
+    """
+    limit = len(search_res[0])
+    for i in range(limit):
+        entity = eval(str(search_res[0][i]).split('entity: ', 1)[1])
+        _id = search_res[0][i].id
+        for field in entity.keys():
+            if isinstance(entity[field], list):
+                for order in range(0, len(entity[field]), 4):
+                    assert abs(original[field][_id][order] - entity[field][order]) < ct.epsilon
+            elif isinstance(entity[field], dict) and field != ct.default_json_field_name:
+                # sparse checking, sparse vector must be the last, this is a bit hacky,
+                # but sparse only supports list data type insertion for now
+                assert entity[field].keys() == original[-1][_id].keys()
+            else:
+                num = original[original[ct.default_int64_field_name] == _id].index.to_list()[0]
+                assert original[field][num] == entity[field]
+
+    return True

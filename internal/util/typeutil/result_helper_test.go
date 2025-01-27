@@ -3,18 +3,15 @@ package typeutil
 import (
 	"testing"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
-
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-
-	"github.com/milvus-io/milvus/internal/proto/segcorepb"
-
 	"github.com/stretchr/testify/assert"
 
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/pkg/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/proto/segcorepb"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 func fieldDataEmpty(data *schemapb.FieldData) bool {
@@ -66,6 +63,9 @@ func TestGenEmptyFieldData(t *testing.T) {
 	vectorTypes := []schemapb.DataType{
 		schemapb.DataType_BinaryVector,
 		schemapb.DataType_FloatVector,
+		schemapb.DataType_Float16Vector,
+		schemapb.DataType_BFloat16Vector,
+		schemapb.DataType_Int8Vector,
 	}
 
 	field := &schemapb.FieldSchema{Name: "field_name", FieldID: 100}
@@ -92,7 +92,7 @@ func TestGenEmptyFieldData(t *testing.T) {
 		assert.Error(t, err)
 	}
 
-	field.TypeParams = []*commonpb.KeyValuePair{{Key: "dim", Value: "128"}}
+	field.TypeParams = []*commonpb.KeyValuePair{{Key: common.DimKey, Value: "128"}}
 	for _, dataType := range vectorTypes {
 		field.DataType = dataType
 		fieldData, err := typeutil.GenEmptyFieldData(field)

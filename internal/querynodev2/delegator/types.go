@@ -6,7 +6,7 @@ import (
 
 	"github.com/cockroachdb/errors"
 
-	"github.com/milvus-io/milvus/internal/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
@@ -50,10 +50,8 @@ type TSafeUpdater interface {
 	UnregisterChannel(string) error
 }
 
-var (
-	// ErrTsLagTooLarge serviceable and guarantee lag too large.
-	ErrTsLagTooLarge = errors.New("Timestamp lag too large")
-)
+// ErrTsLagTooLarge serviceable and guarantee lag too large.
+var ErrTsLagTooLarge = errors.New("Timestamp lag too large")
 
 // WrapErrTsLagTooLarge wraps ErrTsLagTooLarge with lag and max value.
 func WrapErrTsLagTooLarge(duration time.Duration, maxLag time.Duration) error {

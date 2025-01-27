@@ -18,210 +18,162 @@ package grpcindexnodeclient
 
 import (
 	"context"
+	"math/rand"
+	"os"
+	"strings"
 	"testing"
-
-	"github.com/cockroachdb/errors"
-	"github.com/milvus-io/milvus/internal/util/dependency"
-	"github.com/milvus-io/milvus/internal/util/mock"
+	"time"
 
 	"github.com/stretchr/testify/assert"
-	"google.golang.org/grpc"
+	"github.com/stretchr/testify/mock"
+	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	grpcindexnode "github.com/milvus-io/milvus/internal/distributed/indexnode"
-	"github.com/milvus-io/milvus/internal/indexnode"
-	"github.com/milvus-io/milvus/internal/proto/indexpb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
+	"github.com/milvus-io/milvus/internal/mocks"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/proto/workerpb"
 	"github.com/milvus-io/milvus/pkg/util/etcd"
 	"github.com/milvus-io/milvus/pkg/util/metricsinfo"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
-func Test_NewClient(t *testing.T) {
+func TestMain(m *testing.M) {
+	// init embed etcd
+	embedetcdServer, tempDir, err := etcd.StartTestEmbedEtcdServer()
+	if err != nil {
+		log.Fatal("failed to start embed etcd server", zap.Error(err))
+	}
+	defer os.RemoveAll(tempDir)
+	defer embedetcdServer.Close()
+
+	addrs := etcd.GetEmbedEtcdEndpoints(embedetcdServer)
+
 	paramtable.Init()
+	paramtable.Get().Save(Params.EtcdCfg.Endpoints.Key, strings.Join(addrs, ","))
+
+	rand.Seed(time.Now().UnixNano())
+	os.Exit(m.Run())
+}
+
+func Test_NewClient(t *testing.T) {
 	ctx := context.Background()
-	client, err := NewClient(ctx, "", false)
+	client, err := NewClient(ctx, "", 1, false)
 	assert.Nil(t, client)
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 
-	client, err = NewClient(ctx, "test", false)
-	assert.Nil(t, err)
+	client, err = NewClient(ctx, "localhost:1234", 1, false)
 	assert.NotNil(t, client)
+	assert.NoError(t, err)
 
-	err = client.Init()
-	assert.Nil(t, err)
-
-	err = client.Start()
-	assert.Nil(t, err)
-
-	err = client.Register()
-	assert.Nil(t, err)
-
-	checkFunc := func(retNotNil bool) {
-		retCheck := func(notNil bool, ret interface{}, err error) {
-			if notNil {
-				assert.NotNil(t, ret)
-				assert.Nil(t, err)
-			} else {
-				assert.Nil(t, ret)
-				assert.NotNil(t, err)
-			}
-		}
-
-		r1, err := client.GetComponentStates(ctx)
-		retCheck(retNotNil, r1, err)
-
-		r3, err := client.GetStatisticsChannel(ctx)
-		retCheck(retNotNil, r3, err)
-
-		r4, err := client.CreateJob(ctx, nil)
-		retCheck(retNotNil, r4, err)
-
-		r5, err := client.GetMetrics(ctx, nil)
-		retCheck(retNotNil, r5, err)
-
-		r6, err := client.QueryJobs(ctx, nil)
-		retCheck(retNotNil, r6, err)
-
-		r7, err := client.DropJobs(ctx, nil)
-		retCheck(retNotNil, r7, err)
-	}
-
-	client.grpcClient = &mock.GRPCClientBase[indexpb.IndexNodeClient]{
-		GetGrpcClientErr: errors.New("dummy"),
-	}
-
-	newFunc1 := func(cc *grpc.ClientConn) indexpb.IndexNodeClient {
-		return &mock.GrpcIndexNodeClient{Err: nil}
-	}
-	client.grpcClient.SetNewGrpcClientFunc(newFunc1)
-
-	checkFunc(false)
-
-	client.grpcClient = &mock.GRPCClientBase[indexpb.IndexNodeClient]{
-		GetGrpcClientErr: nil,
-	}
-
-	newFunc2 := func(cc *grpc.ClientConn) indexpb.IndexNodeClient {
-		return &mock.GrpcIndexNodeClient{Err: errors.New("dummy")}
-	}
-	client.grpcClient.SetNewGrpcClientFunc(newFunc2)
-	checkFunc(false)
-
-	client.grpcClient = &mock.GRPCClientBase[indexpb.IndexNodeClient]{
-		GetGrpcClientErr: nil,
-	}
-
-	newFunc3 := func(cc *grpc.ClientConn) indexpb.IndexNodeClient {
-		return &mock.GrpcIndexNodeClient{Err: nil}
-	}
-	client.grpcClient.SetNewGrpcClientFunc(newFunc3)
-	checkFunc(true)
-
-	err = client.Stop()
-	assert.Nil(t, err)
+	err = client.Close()
+	assert.NoError(t, err)
 }
 
 func TestIndexNodeClient(t *testing.T) {
-	paramtable.Init()
 	ctx := context.Background()
-
-	factory := dependency.NewDefaultFactory(true)
-	ins, err := grpcindexnode.NewServer(ctx, factory)
-	assert.Nil(t, err)
-	assert.NotNil(t, ins)
-
-	inm := indexnode.NewIndexNodeMock()
-	etcdCli, err := etcd.GetEtcdClient(
-		Params.EtcdCfg.UseEmbedEtcd.GetAsBool(),
-		Params.EtcdCfg.EtcdUseSSL.GetAsBool(),
-		Params.EtcdCfg.Endpoints.GetAsStrings(),
-		Params.EtcdCfg.EtcdTLSCert.GetValue(),
-		Params.EtcdCfg.EtcdTLSKey.GetValue(),
-		Params.EtcdCfg.EtcdTLSCACert.GetValue(),
-		Params.EtcdCfg.EtcdTLSMinVersion.GetValue())
+	client, err := NewClient(ctx, "localhost:1234", 1, false)
 	assert.NoError(t, err)
-	inm.SetEtcdClient(etcdCli)
-	err = ins.SetClient(inm)
-	assert.Nil(t, err)
+	assert.NotNil(t, client)
 
-	err = ins.Run()
-	assert.Nil(t, err)
+	mockIN := mocks.NewMockIndexNodeClient(t)
 
-	inc, err := NewClient(ctx, "localhost:21121", false)
-	assert.Nil(t, err)
-	assert.NotNil(t, inc)
-
-	err = inc.Init()
-	assert.Nil(t, err)
-
-	err = inc.Start()
-	assert.Nil(t, err)
+	mockGrpcClient := mocks.NewMockGrpcClient[workerpb.IndexNodeClient](t)
+	mockGrpcClient.EXPECT().Close().Return(nil)
+	mockGrpcClient.EXPECT().ReCall(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, f func(nodeClient workerpb.IndexNodeClient) (interface{}, error)) (interface{}, error) {
+		return f(mockIN)
+	})
+	client.(*Client).grpcClient = mockGrpcClient
 
 	t.Run("GetComponentStates", func(t *testing.T) {
-		states, err := inc.GetComponentStates(ctx)
-		assert.Nil(t, err)
-		assert.Equal(t, commonpb.StateCode_Healthy, states.State.StateCode)
-		assert.Equal(t, commonpb.ErrorCode_Success, states.Status.ErrorCode)
+		mockIN.EXPECT().GetComponentStates(mock.Anything, mock.Anything).Return(nil, nil)
+		_, err := client.GetComponentStates(ctx, nil)
+		assert.NoError(t, err)
 	})
 
 	t.Run("GetStatisticsChannel", func(t *testing.T) {
-		resp, err := inc.GetStatisticsChannel(ctx)
-		assert.Nil(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		mockIN.EXPECT().GetStatisticsChannel(mock.Anything, mock.Anything).Return(nil, nil)
+		_, err := client.GetStatisticsChannel(ctx, nil)
+		assert.NoError(t, err)
 	})
 
 	t.Run("CreatJob", func(t *testing.T) {
-		req := &indexpb.CreateJobRequest{
+		mockIN.EXPECT().CreateJob(mock.Anything, mock.Anything).Return(nil, nil)
+
+		req := &workerpb.CreateJobRequest{
 			ClusterID: "0",
 			BuildID:   0,
 		}
-		resp, err := inc.CreateJob(ctx, req)
-		assert.Nil(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.ErrorCode)
+		_, err := client.CreateJob(ctx, req)
+		assert.NoError(t, err)
 	})
 
 	t.Run("QueryJob", func(t *testing.T) {
-		req := &indexpb.QueryJobsRequest{}
-		resp, err := inc.QueryJobs(ctx, req)
-		assert.Nil(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		mockIN.EXPECT().QueryJobs(mock.Anything, mock.Anything).Return(nil, nil)
+
+		req := &workerpb.QueryJobsRequest{}
+		_, err := client.QueryJobs(ctx, req)
+		assert.NoError(t, err)
 	})
 
 	t.Run("DropJob", func(t *testing.T) {
-		req := &indexpb.DropJobsRequest{}
-		resp, err := inc.DropJobs(ctx, req)
-		assert.Nil(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.ErrorCode)
+		mockIN.EXPECT().DropJobs(mock.Anything, mock.Anything).Return(nil, nil)
+
+		req := &workerpb.DropJobsRequest{}
+		_, err := client.DropJobs(ctx, req)
+		assert.NoError(t, err)
 	})
 
 	t.Run("ShowConfigurations", func(t *testing.T) {
+		mockIN.EXPECT().ShowConfigurations(mock.Anything, mock.Anything).Return(nil, nil)
+
 		req := &internalpb.ShowConfigurationsRequest{
 			Pattern: "",
 		}
-		resp, err := inc.ShowConfigurations(ctx, req)
-		assert.Nil(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		_, err := client.ShowConfigurations(ctx, req)
+		assert.NoError(t, err)
 	})
 
 	t.Run("GetMetrics", func(t *testing.T) {
+		mockIN.EXPECT().GetMetrics(mock.Anything, mock.Anything).Return(nil, nil)
+
 		req, err := metricsinfo.ConstructRequestByMetricType(metricsinfo.SystemInfoMetrics)
-		assert.Nil(t, err)
-		resp, err := inc.GetMetrics(ctx, req)
-		assert.Nil(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+		assert.NoError(t, err)
+		_, err = client.GetMetrics(ctx, req)
+		assert.NoError(t, err)
 	})
 
 	t.Run("GetJobStats", func(t *testing.T) {
-		req := &indexpb.GetJobStatsRequest{}
-		resp, err := inc.GetJobStats(ctx, req)
+		mockIN.EXPECT().GetJobStats(mock.Anything, mock.Anything).Return(nil, nil)
+
+		req := &workerpb.GetJobStatsRequest{}
+		_, err := client.GetJobStats(ctx, req)
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
 	})
 
-	err = ins.Stop()
-	assert.Nil(t, err)
+	t.Run("CreateJobV2", func(t *testing.T) {
+		mockIN.EXPECT().CreateJobV2(mock.Anything, mock.Anything).Return(nil, nil)
 
-	err = inc.Stop()
-	assert.Nil(t, err)
+		req := &workerpb.CreateJobV2Request{}
+		_, err := client.CreateJobV2(ctx, req)
+		assert.NoError(t, err)
+	})
+
+	t.Run("QueryJobsV2", func(t *testing.T) {
+		mockIN.EXPECT().QueryJobsV2(mock.Anything, mock.Anything).Return(nil, nil)
+
+		req := &workerpb.QueryJobsV2Request{}
+		_, err := client.QueryJobsV2(ctx, req)
+		assert.NoError(t, err)
+	})
+
+	t.Run("DropJobsV2", func(t *testing.T) {
+		mockIN.EXPECT().DropJobsV2(mock.Anything, mock.Anything).Return(nil, nil)
+
+		req := &workerpb.DropJobsV2Request{}
+		_, err := client.DropJobsV2(ctx, req)
+		assert.NoError(t, err)
+	})
+
+	err = client.Close()
+	assert.NoError(t, err)
 }

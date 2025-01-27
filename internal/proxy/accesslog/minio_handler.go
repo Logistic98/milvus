@@ -19,17 +19,19 @@ package accesslog
 import (
 	"context"
 	"fmt"
+	"os"
 	"path"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/retry"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/util/retry"
 )
 
 type config struct {
@@ -38,19 +40,22 @@ type config struct {
 	accessKeyID       string
 	secretAccessKeyID string
 	useSSL            bool
+	sslCACert         string
 	createBucket      bool
 	useIAM            bool
 	iamEndpoint       string
 }
 
-//minIO client for upload access log
-//TODO file retention on minio
+// minIO client for upload access log
+// TODO file retention on minio
+type (
+	RetentionFunc func(object minio.ObjectInfo) bool
+	task          struct {
+		objectName string
+		filePath   string
+	}
+)
 
-type RetentionFunc func(object minio.ObjectInfo) bool
-type task struct {
-	objectName string
-	filePath   string
-}
 type minioHandler struct {
 	bucketName string
 	rootPath   string
@@ -75,6 +80,7 @@ func NewMinioHandler(ctx context.Context, cfg *paramtable.MinioConfig, rootPath 
 		accessKeyID:       cfg.AccessKeyID.GetValue(),
 		secretAccessKeyID: cfg.SecretAccessKey.GetValue(),
 		useSSL:            cfg.UseSSL.GetAsBool(),
+		sslCACert:         cfg.SslCACert.GetValue(),
 		createBucket:      true,
 		useIAM:            cfg.UseIAM.GetAsBool(),
 		iamEndpoint:       cfg.IAMEndpoint.GetValue(),
@@ -101,6 +107,17 @@ func newMinioClient(ctx context.Context, cfg config) (*minio.Client, error) {
 	} else {
 		creds = credentials.NewStaticV4(cfg.accessKeyID, cfg.secretAccessKeyID, "")
 	}
+
+	// We must set the cert path by os environment variable "SSL_CERT_FILE",
+	// because the minio.DefaultTransport() need this path to read the file content,
+	// we shouldn't read this file by ourself.
+	if cfg.useSSL && len(cfg.sslCACert) > 0 {
+		err := os.Setenv("SSL_CERT_FILE", cfg.sslCACert)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	minioClient, err := minio.New(cfg.address, &minio.Options{
 		Creds:  creds,
 		Secure: cfg.useSSL,
@@ -109,6 +126,7 @@ func newMinioClient(ctx context.Context, cfg config) (*minio.Client, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	var bucketExists bool
 	// check valid in first query
 	checkBucketFn := func() error {
@@ -119,7 +137,7 @@ func newMinioClient(ctx context.Context, cfg config) (*minio.Client, error) {
 		}
 		if !bucketExists {
 			if cfg.createBucket {
-				log.Info("blob bucket not exist, create bucket.", zap.Any("bucket name", cfg.bucketName))
+				log.Info("blob bucket not exist, create bucket.", zap.String("bucket name", cfg.bucketName))
 				err := minioClient.MakeBucket(ctx, cfg.bucketName, minio.MakeBucketOptions{})
 				if err != nil {
 					log.Warn("failed to create blob bucket", zap.String("bucket", cfg.bucketName), zap.Error(err))
@@ -152,7 +170,6 @@ func (c *minioHandler) scheduler() {
 			log.Warn("close minio logger handler")
 			return
 		}
-
 	}
 }
 
@@ -179,7 +196,7 @@ func (c *minioHandler) Update(objectName string, filePath string) {
 
 // update log file to minio
 func (c *minioHandler) update(objectName string, filePath string) error {
-	path := Join(c.rootPath, filePath)
+	path := join(c.rootPath, filePath)
 	_, err := c.client.FPutObject(context.Background(), c.bucketName, path, objectName, minio.PutObjectOptions{})
 	return err
 }
@@ -264,7 +281,7 @@ func getTimeRetentionFunc(retentionTime int, prefix, ext string) RetentionFunc {
 			return false
 		}
 
-		nowWallTime, _ := time.Parse(timeFormat, time.Now().Format(timeFormat))
+		nowWallTime, _ := time.Parse(timeNameFormat, time.Now().Format(timeNameFormat))
 		intervalTime := nowWallTime.Sub(fileTime)
 		return intervalTime > (time.Duration(retentionTime) * time.Hour)
 	}

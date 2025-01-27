@@ -8,16 +8,32 @@
 # Unless required by applicable law or agreed to in writing, software distributed under the License
 # is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 # or implied. See the License for the specific language governing permissions and limitations under the License.
-ARG MILVUS_BASE_IMAGE_REPO="milvusdb/milvus-base"
-ARG MILVUS_BASE_IMAGE_TAG="20221114-b1a6660"
-FROM ${MILVUS_BASE_IMAGE_REPO}:${MILVUS_BASE_IMAGE_TAG}
 
-COPY ./bin/ /milvus/bin/
+FROM ubuntu:focal-20240530
 
-COPY ./configs/ /milvus/configs/
+ARG TARGETARCH
+ARG MILVUS_ASAN_LIB
 
-COPY ./lib/ /milvus/lib/
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl ca-certificates libaio-dev libgomp1 libopenblas-dev && \
+    apt-get remove --purge -y && \
+    rm -rf /var/lib/apt/lists/*
+
+# Add Tini
+RUN curl -L -o /tini https://github.com/krallin/tini/releases/download/v0.19.0/tini-$TARGETARCH && \
+    chmod +x /tini
+
+COPY --chown=root:root --chmod=774 ./bin/ /milvus/bin/
+
+COPY --chown=root:root --chmod=774 ./configs/ /milvus/configs/
+
+COPY --chown=root:root --chmod=774 ./lib/ /milvus/lib/
 
 ENV PATH=/milvus/bin:$PATH
 ENV LD_LIBRARY_PATH=/milvus/lib:$LD_LIBRARY_PATH:/usr/lib
-ENV LD_PRELOAD=/milvus/lib/libjemalloc.so
+ENV LD_PRELOAD=${MILVUS_ASAN_LIB}:/milvus/lib/libjemalloc.so
+ENV MALLOC_CONF=background_thread:true
+
+ENTRYPOINT ["/tini", "--"]
+
+WORKDIR /milvus/

@@ -18,11 +18,19 @@ package querynodev2
 
 import (
 	"context"
-	"time"
+	"fmt"
+	"math"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
+	"github.com/samber/lo"
+	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus/internal/json"
 	"github.com/milvus-io/milvus/internal/querynodev2/collector"
+	"github.com/milvus-io/milvus/internal/querynodev2/delegator"
+	"github.com/milvus-io/milvus/internal/querynodev2/segments"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/metrics"
 	"github.com/milvus-io/milvus/pkg/util/hardware"
 	"github.com/milvus-io/milvus/pkg/util/metricsinfo"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
@@ -46,46 +54,6 @@ func getRateMetric() ([]metricsinfo.RateMetric, error) {
 	return rms, nil
 }
 
-func getSearchNQInQueue() (metricsinfo.ReadInfoInQueue, error) {
-	average, err := collector.Average.Average(metricsinfo.SearchQueueMetric)
-	if err != nil {
-		return metricsinfo.ReadInfoInQueue{}, err
-	}
-
-	unsolvedQueueLabel := collector.ConstructLabel(metricsinfo.UnsolvedQueueType, metricsinfo.SearchQueueMetric)
-	readyQueueLabel := collector.ConstructLabel(metricsinfo.ReadyQueueType, metricsinfo.SearchQueueMetric)
-	receiveQueueLabel := collector.ConstructLabel(metricsinfo.ReceiveQueueType, metricsinfo.SearchQueueMetric)
-	executeQueueLabel := collector.ConstructLabel(metricsinfo.ExecuteQueueType, metricsinfo.SearchQueueMetric)
-
-	return metricsinfo.ReadInfoInQueue{
-		UnsolvedQueue:    collector.Counter.Get(unsolvedQueueLabel),
-		ReadyQueue:       collector.Counter.Get(readyQueueLabel),
-		ReceiveChan:      collector.Counter.Get(receiveQueueLabel),
-		ExecuteChan:      collector.Counter.Get(executeQueueLabel),
-		AvgQueueDuration: time.Duration(int64(average)),
-	}, nil
-}
-
-func getQueryTasksInQueue() (metricsinfo.ReadInfoInQueue, error) {
-	average, err := collector.Average.Average(metricsinfo.QueryQueueMetric)
-	if err != nil {
-		return metricsinfo.ReadInfoInQueue{}, err
-	}
-
-	unsolvedQueueLabel := collector.ConstructLabel(metricsinfo.UnsolvedQueueType, metricsinfo.QueryQueueMetric)
-	readyQueueLabel := collector.ConstructLabel(metricsinfo.ReadyQueueType, metricsinfo.QueryQueueMetric)
-	receiveQueueLabel := collector.ConstructLabel(metricsinfo.ReceiveQueueType, metricsinfo.QueryQueueMetric)
-	executeQueueLabel := collector.ConstructLabel(metricsinfo.ExecuteQueueType, metricsinfo.QueryQueueMetric)
-
-	return metricsinfo.ReadInfoInQueue{
-		UnsolvedQueue:    collector.Counter.Get(unsolvedQueueLabel),
-		ReadyQueue:       collector.Counter.Get(readyQueueLabel),
-		ReceiveChan:      collector.Counter.Get(receiveQueueLabel),
-		ExecuteChan:      collector.Counter.Get(executeQueueLabel),
-		AvgQueueDuration: time.Duration(int64(average)),
-	}, nil
-}
-
 // getQuotaMetrics returns QueryNodeQuotaMetrics.
 func getQuotaMetrics(node *QueryNode) (*metricsinfo.QueryNodeQuotaMetrics, error) {
 	rms, err := getRateMetric()
@@ -93,17 +61,97 @@ func getQuotaMetrics(node *QueryNode) (*metricsinfo.QueryNodeQuotaMetrics, error
 		return nil, err
 	}
 
-	sqms, err := getSearchNQInQueue()
-	if err != nil {
-		return nil, err
+	minTsafeChannel := ""
+	minTsafe := uint64(math.MaxUint64)
+	node.delegators.Range(func(channel string, delegator delegator.ShardDelegator) bool {
+		tsafe := delegator.GetTSafe()
+		if tsafe < minTsafe {
+			minTsafeChannel = channel
+			minTsafe = tsafe
+		}
+		return true
+	})
+
+	collections := node.manager.Collection.ListWithName()
+	nodeID := fmt.Sprint(node.GetNodeID())
+
+	metrics.QueryNodeNumEntities.Reset()
+	metrics.QueryNodeEntitiesSize.Reset()
+
+	var totalGrowingSize int64
+	growingSegments := node.manager.Segment.GetBy(segments.WithType(segments.SegmentTypeGrowing))
+	growingGroupByCollection := lo.GroupBy(growingSegments, func(seg segments.Segment) int64 {
+		return seg.Collection()
+	})
+	for collection := range collections {
+		segs := growingGroupByCollection[collection]
+		size := lo.SumBy(segs, func(seg segments.Segment) int64 {
+			return seg.MemSize()
+		})
+		totalGrowingSize += size
+		metrics.QueryNodeEntitiesSize.WithLabelValues(nodeID, fmt.Sprint(collection),
+			segments.SegmentTypeGrowing.String()).Set(float64(size))
+	}
+	growingGroupByPartition := lo.GroupBy(growingSegments, func(seg segments.Segment) int64 {
+		return seg.Partition()
+	})
+
+	for _, segs := range growingGroupByPartition {
+		numEntities := lo.SumBy(segs, func(seg segments.Segment) int64 {
+			return seg.RowNum()
+		})
+		segment := segs[0]
+		metrics.QueryNodeNumEntities.WithLabelValues(
+			segment.DatabaseName(),
+			collections[segment.Collection()],
+			nodeID,
+			fmt.Sprint(segment.Collection()),
+			fmt.Sprint(segment.Partition()),
+			segments.SegmentTypeGrowing.String(),
+		).Set(float64(numEntities))
 	}
 
-	qqms, err := getQueryTasksInQueue()
-	if err != nil {
-		return nil, err
+	sealedSegments := node.manager.Segment.GetBy(segments.WithType(segments.SegmentTypeSealed))
+	sealedGroupByCollection := lo.GroupBy(sealedSegments, func(seg segments.Segment) int64 {
+		return seg.Collection()
+	})
+	for collection := range collections {
+		segs := sealedGroupByCollection[collection]
+		size := lo.SumBy(segs, func(seg segments.Segment) int64 {
+			return seg.MemSize()
+		})
+		metrics.QueryNodeEntitiesSize.WithLabelValues(fmt.Sprint(node.GetNodeID()),
+			fmt.Sprint(collection), segments.SegmentTypeSealed.String()).Set(float64(size))
+	}
+	sealedGroupByPartition := lo.GroupBy(sealedSegments, func(seg segments.Segment) int64 {
+		return seg.Partition()
+	})
+	for _, segs := range sealedGroupByPartition {
+		numEntities := lo.SumBy(segs, func(seg segments.Segment) int64 {
+			return seg.RowNum()
+		})
+		segment := segs[0]
+		metrics.QueryNodeNumEntities.WithLabelValues(
+			segment.DatabaseName(),
+			collections[segment.Collection()],
+			nodeID,
+			fmt.Sprint(segment.Collection()),
+			fmt.Sprint(segment.Partition()),
+			segments.SegmentTypeSealed.String(),
+		).Set(float64(numEntities))
 	}
 
-	minTsafeChannel, minTsafe := node.tSafeManager.Min()
+	deleteBufferNum := make(map[int64]int64)
+	deleteBufferSize := make(map[int64]int64)
+
+	node.delegators.Range(func(_ string, sd delegator.ShardDelegator) bool {
+		collectionID := sd.Collection()
+		entryNum, memorySize := sd.GetDeleteBufferSize()
+		deleteBufferNum[collectionID] += entryNum
+		deleteBufferSize[collectionID] += memorySize
+		return true
+	})
+
 	return &metricsinfo.QueryNodeQuotaMetrics{
 		Hms: metricsinfo.HardwareMetrics{},
 		Rms: rms,
@@ -112,40 +160,123 @@ func getQuotaMetrics(node *QueryNode) (*metricsinfo.QueryNodeQuotaMetrics, error
 			MinFlowGraphTt:      minTsafe,
 			NumFlowGraph:        node.pipelineManager.Num(),
 		},
-		SearchQueue: sqms,
-		QueryQueue:  qqms,
+		GrowingSegmentsSize: totalGrowingSize,
+		Effect: metricsinfo.NodeEffect{
+			NodeID:        node.GetNodeID(),
+			CollectionIDs: lo.Keys(collections),
+		},
+		DeleteBufferInfo: metricsinfo.DeleteBufferInfo{
+			CollectionDeleteBufferNum:  deleteBufferNum,
+			CollectionDeleteBufferSize: deleteBufferSize,
+		},
 	}, nil
 }
 
+func getCollectionMetrics(node *QueryNode) (*metricsinfo.QueryNodeCollectionMetrics, error) {
+	allSegments := node.manager.Segment.GetBy()
+	ret := &metricsinfo.QueryNodeCollectionMetrics{
+		CollectionRows: make(map[int64]int64),
+	}
+	for _, segment := range allSegments {
+		collectionID := segment.Collection()
+		ret.CollectionRows[collectionID] += segment.RowNum()
+	}
+	return ret, nil
+}
+
+// getChannelJSON returns the JSON string of channels
+func getChannelJSON(node *QueryNode, collectionID int64) string {
+	stats := node.pipelineManager.GetChannelStats(collectionID)
+	ret, err := json.Marshal(stats)
+	if err != nil {
+		log.Warn("failed to marshal channels", zap.Error(err))
+		return ""
+	}
+	return string(ret)
+}
+
+// getSegmentJSON returns the JSON string of segments
+func getSegmentJSON(node *QueryNode, collectionID int64) string {
+	allSegments := node.manager.Segment.GetBy()
+	var ms []*metricsinfo.Segment
+	for _, s := range allSegments {
+		if collectionID > 0 && s.Collection() != collectionID {
+			continue
+		}
+
+		indexes := make([]*metricsinfo.IndexedField, 0, len(s.Indexes()))
+		for _, index := range s.Indexes() {
+			indexes = append(indexes, &metricsinfo.IndexedField{
+				IndexFieldID: index.IndexInfo.FieldID,
+				IndexID:      index.IndexInfo.IndexID,
+				IndexSize:    index.IndexInfo.IndexSize,
+				BuildID:      index.IndexInfo.BuildID,
+				IsLoaded:     index.IsLoaded,
+				HasRawData:   s.HasRawData(index.IndexInfo.FieldID),
+			})
+		}
+
+		ms = append(ms, &metricsinfo.Segment{
+			SegmentID:            s.ID(),
+			CollectionID:         s.Collection(),
+			PartitionID:          s.Partition(),
+			MemSize:              s.MemSize(),
+			IndexedFields:        indexes,
+			State:                s.Type().String(),
+			ResourceGroup:        s.ResourceGroup(),
+			LoadedInsertRowCount: s.InsertCount(),
+			NodeID:               node.GetNodeID(),
+		})
+	}
+
+	ret, err := json.Marshal(ms)
+	if err != nil {
+		log.Warn("failed to marshal segments", zap.Error(err))
+		return ""
+	}
+	return string(ret)
+}
+
 // getSystemInfoMetrics returns metrics info of QueryNode
-func getSystemInfoMetrics(ctx context.Context, req *milvuspb.GetMetricsRequest, node *QueryNode) (*milvuspb.GetMetricsResponse, error) {
+func getSystemInfoMetrics(ctx context.Context, req *milvuspb.GetMetricsRequest, node *QueryNode) (string, error) {
 	usedMem := hardware.GetUsedMemoryCount()
 	totalMem := hardware.GetMemoryCount()
 
 	quotaMetrics, err := getQuotaMetrics(node)
 	if err != nil {
-		return &milvuspb.GetMetricsResponse{
-			Status: &commonpb.Status{
-				ErrorCode: commonpb.ErrorCode_UnexpectedError,
-				Reason:    err.Error(),
-			},
-			ComponentName: metricsinfo.ConstructComponentName(typeutil.DataNodeRole, paramtable.GetNodeID()),
-		}, nil
+		return "", err
 	}
+
+	used, total, err := hardware.GetDiskUsage(paramtable.Get().LocalStorageCfg.Path.GetValue())
+	if err != nil {
+		log.Ctx(ctx).Warn("get disk usage failed", zap.Error(err))
+	}
+
+	ioWait, err := hardware.GetIOWait()
+	if err != nil {
+		log.Ctx(ctx).Warn("get iowait failed", zap.Error(err))
+	}
+
 	hardwareInfos := metricsinfo.HardwareMetrics{
-		IP:           node.session.Address,
-		CPUCoreCount: hardware.GetCPUNum(),
-		CPUCoreUsage: hardware.GetCPUUsage(),
-		Memory:       totalMem,
-		MemoryUsage:  usedMem,
-		Disk:         hardware.GetDiskCount(),
-		DiskUsage:    hardware.GetDiskUsage(),
+		IP:               node.session.Address,
+		CPUCoreCount:     hardware.GetCPUNum(),
+		CPUCoreUsage:     hardware.GetCPUUsage(),
+		Memory:           totalMem,
+		MemoryUsage:      usedMem,
+		Disk:             total,
+		DiskUsage:        used,
+		IOWaitPercentage: ioWait,
 	}
 	quotaMetrics.Hms = hardwareInfos
 
+	collectionMetrics, err := getCollectionMetrics(node)
+	if err != nil {
+		return "", err
+	}
+
 	nodeInfos := metricsinfo.QueryNodeInfos{
 		BaseComponentInfos: metricsinfo.BaseComponentInfos{
-			Name:          metricsinfo.ConstructComponentName(typeutil.QueryNodeRole, paramtable.GetNodeID()),
+			Name:          metricsinfo.ConstructComponentName(typeutil.QueryNodeRole, node.GetNodeID()),
 			HardwareInfos: hardwareInfos,
 			SystemInfo:    metricsinfo.DeployMetrics{},
 			CreatedTime:   paramtable.GetCreateTime().String(),
@@ -156,28 +287,10 @@ func getSystemInfoMetrics(ctx context.Context, req *milvuspb.GetMetricsRequest, 
 		SystemConfigurations: metricsinfo.QueryNodeConfiguration{
 			SimdType: paramtable.Get().CommonCfg.SimdType.GetValue(),
 		},
-		QuotaMetrics: quotaMetrics,
+		QuotaMetrics:      quotaMetrics,
+		CollectionMetrics: collectionMetrics,
 	}
 	metricsinfo.FillDeployMetricsWithEnv(&nodeInfos.SystemInfo)
 
-	resp, err := metricsinfo.MarshalComponentInfos(nodeInfos)
-	if err != nil {
-		return &milvuspb.GetMetricsResponse{
-			Status: &commonpb.Status{
-				ErrorCode: commonpb.ErrorCode_UnexpectedError,
-				Reason:    err.Error(),
-			},
-			Response:      "",
-			ComponentName: metricsinfo.ConstructComponentName(typeutil.QueryNodeRole, paramtable.GetNodeID()),
-		}, nil
-	}
-
-	return &milvuspb.GetMetricsResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-			Reason:    "",
-		},
-		Response:      resp,
-		ComponentName: metricsinfo.ConstructComponentName(typeutil.QueryNodeRole, paramtable.GetNodeID()),
-	}, nil
+	return metricsinfo.MarshalComponentInfos(nodeInfos)
 }

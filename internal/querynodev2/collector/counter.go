@@ -25,7 +25,7 @@ type counter struct {
 	values map[string]int64
 }
 
-func (c *counter) Inc(label string, value int64) {
+func (c *counter) Add(label string, value int64) {
 	c.Lock()
 	defer c.Unlock()
 
@@ -36,6 +36,20 @@ func (c *counter) Inc(label string, value int64) {
 		v += value
 		c.values[label] = v
 	}
+}
+
+func (c *counter) Inc(label string) {
+	c.Add(label, 1)
+}
+
+func (c *counter) Dec(label string) {
+	c.Add(label, -1)
+}
+
+func (c *counter) Set(label string, value int64) {
+	c.Lock()
+	defer c.Unlock()
+	c.values[label] = value
 }
 
 func (c *counter) Get(label string) int64 {

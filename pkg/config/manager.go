@@ -80,104 +80,169 @@ func filterate(key string, filters ...Filter) (string, bool) {
 }
 
 type Manager struct {
-	sync.RWMutex
 	Dispatcher    *EventDispatcher
-	sources       map[string]Source
-	keySourceMap  map[string]string // store the key to config source, example: key is A.B.C and source is file which means the A.B.C's value is from file
-	overlays      map[string]string // store the highest priority configs which modified at runtime
-	forbiddenKeys typeutil.Set[string]
+	sources       *typeutil.ConcurrentMap[string, Source]
+	keySourceMap  *typeutil.ConcurrentMap[string, string] // store the key to config source, example: key is A.B.C and source is file which means the A.B.C's value is from file
+	overlays      *typeutil.ConcurrentMap[string, string] // store the highest priority configs which modified at runtime
+	forbiddenKeys *typeutil.ConcurrentSet[string]
+
+	cacheMutex  sync.RWMutex
+	configCache map[string]any
+	// configCache *typeutil.ConcurrentMap[string, interface{}]
 }
 
 func NewManager() *Manager {
-	return &Manager{
+	manager := &Manager{
 		Dispatcher:    NewEventDispatcher(),
-		sources:       make(map[string]Source),
-		keySourceMap:  make(map[string]string),
-		overlays:      make(map[string]string),
-		forbiddenKeys: typeutil.NewSet[string](),
+		sources:       typeutil.NewConcurrentMap[string, Source](),
+		keySourceMap:  typeutil.NewConcurrentMap[string, string](),
+		overlays:      typeutil.NewConcurrentMap[string, string](),
+		forbiddenKeys: typeutil.NewConcurrentSet[string](),
+		configCache:   make(map[string]any),
 	}
+	resetConfigCacheFunc := NewHandler("reset.config.cache", func(event *Event) {
+		keyToRemove := strings.NewReplacer("/", ".").Replace(event.Key)
+		manager.EvictCachedValue(keyToRemove)
+	})
+	manager.Dispatcher.RegisterForKeyPrefix("", resetConfigCacheFunc)
+	return manager
+}
+
+func (m *Manager) GetCachedValue(key string) (interface{}, bool) {
+	m.cacheMutex.RLock()
+	defer m.cacheMutex.RUnlock()
+	value, ok := m.configCache[key]
+	return value, ok
+}
+
+func (m *Manager) CASCachedValue(key string, origin string, value interface{}) bool {
+	m.cacheMutex.Lock()
+	defer m.cacheMutex.Unlock()
+	current, err := m.GetConfig(key)
+	if errors.Is(err, ErrKeyNotFound) {
+		m.configCache[key] = value
+		return true
+	}
+	if err != nil {
+		return false
+	}
+	if current != origin {
+		return false
+	}
+	m.configCache[key] = value
+	return true
+}
+
+func (m *Manager) EvictCachedValue(key string) {
+	m.cacheMutex.Lock()
+	defer m.cacheMutex.Unlock()
+	// cause param'value may rely on other params, so we need to evict all the cached value when config is changed
+	clear(m.configCache)
+}
+
+func (m *Manager) EvictCacheValueByFormat(keys ...string) {
+	m.cacheMutex.Lock()
+	defer m.cacheMutex.Unlock()
+	// cause param'value may rely on other params, so we need to evict all the cached value when config is changed
+	clear(m.configCache)
 }
 
 func (m *Manager) GetConfig(key string) (string, error) {
-	m.RLock()
-	defer m.RUnlock()
 	realKey := formatKey(key)
-	v, ok := m.overlays[realKey]
+	v, ok := m.overlays.Get(realKey)
 	if ok {
 		if v == TombValue {
-			return "", fmt.Errorf("key not found %s", key)
+			return "", errors.Wrap(ErrKeyNotFound, key) // fmt.Errorf("key not found %s", key)
 		}
 		return v, nil
 	}
-	sourceName, ok := m.keySourceMap[realKey]
+	sourceName, ok := m.keySourceMap.Get(realKey)
 	if !ok {
-		return "", fmt.Errorf("key not found: %s", key)
+		return "", errors.Wrap(ErrKeyNotFound, key) // fmt.Errorf("key not found: %s", key)
 	}
 	return m.getConfigValueBySource(realKey, sourceName)
 }
 
 // GetConfigs returns all the key values
 func (m *Manager) GetConfigs() map[string]string {
-	m.RLock()
-	defer m.RUnlock()
 	config := make(map[string]string)
 
-	for key := range m.keySourceMap {
+	m.keySourceMap.Range(func(key, value string) bool {
 		sValue, err := m.GetConfig(key)
 		if err != nil {
-			continue
+			return true
 		}
+
 		config[key] = sValue
-	}
+		return true
+	})
+
+	m.overlays.Range(func(key, value string) bool {
+		config[key] = value
+		return true
+	})
 
 	return config
 }
 
 func (m *Manager) GetBy(filters ...Filter) map[string]string {
-	m.RLock()
-	defer m.RUnlock()
 	matchedConfig := make(map[string]string)
 
-	for key, value := range m.GetConfigs() {
+	m.keySourceMap.Range(func(key, value string) bool {
 		newkey, ok := filterate(key, filters...)
-		if ok {
-			matchedConfig[newkey] = value
+		if !ok {
+			return true
 		}
-	}
+		sValue, err := m.GetConfig(key)
+		if err != nil {
+			return true
+		}
+
+		matchedConfig[newkey] = sValue
+		return true
+	})
+
+	m.overlays.Range(func(key, value string) bool {
+		newkey, ok := filterate(key, filters...)
+		if !ok {
+			return true
+		}
+		matchedConfig[newkey] = value
+		return true
+	})
 
 	return matchedConfig
 }
 
 func (m *Manager) FileConfigs() map[string]string {
-	m.RLock()
-	defer m.RUnlock()
 	config := make(map[string]string)
-	for _, source := range m.sources {
-		if s, ok := source.(*FileSource); ok {
+	m.sources.Range(func(key string, value Source) bool {
+		if s, ok := value.(*FileSource); ok {
 			config, _ = s.GetConfigurations()
-			break
+			return false
 		}
-	}
+		return true
+	})
 	return config
 }
 
 func (m *Manager) Close() {
-	for _, s := range m.sources {
-		s.Close()
-	}
+	m.sources.Range(func(key string, value Source) bool {
+		value.Close()
+		return true
+	})
 }
 
 func (m *Manager) AddSource(source Source) error {
-	m.Lock()
-	defer m.Unlock()
 	sourceName := source.GetSourceName()
-	_, ok := m.sources[sourceName]
+	_, ok := m.sources.Get(sourceName)
 	if ok {
 		err := errors.New("duplicate source supplied")
 		return err
 	}
 
-	m.sources[sourceName] = source
+	source.SetManager(m)
+	m.sources.Insert(sourceName, source)
 
 	err := m.pullSourceConfigs(sourceName)
 	if err != nil {
@@ -193,62 +258,70 @@ func (m *Manager) AddSource(source Source) error {
 // Update config at runtime, which can be called by others
 // The most used scenario is UT
 func (m *Manager) SetConfig(key, value string) {
-	m.Lock()
-	defer m.Unlock()
-	m.overlays[formatKey(key)] = value
+	m.overlays.Insert(formatKey(key), value)
+}
+
+func (m *Manager) SetMapConfig(key, value string) {
+	m.overlays.Insert(strings.ToLower(key), value)
 }
 
 // Delete config at runtime, which has the highest priority to override all other sources
 func (m *Manager) DeleteConfig(key string) {
-	m.Lock()
-	defer m.Unlock()
-	m.overlays[formatKey(key)] = TombValue
+	m.overlays.Insert(formatKey(key), TombValue)
 }
 
 // Remove the config which set at runtime, use config from sources
 func (m *Manager) ResetConfig(key string) {
-	m.Lock()
-	defer m.Unlock()
-	delete(m.overlays, formatKey(key))
+	m.overlays.Remove(formatKey(key))
 }
 
 // Ignore any of update events, which means the config cannot auto refresh anymore
 func (m *Manager) ForbidUpdate(key string) {
-	m.Lock()
-	defer m.Unlock()
 	m.forbiddenKeys.Insert(formatKey(key))
+}
+
+func (m *Manager) UpdateSourceOptions(opts ...Option) {
+	var options Options
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	m.sources.Range(func(key string, value Source) bool {
+		value.UpdateOptions(options)
+		return true
+	})
 }
 
 // Do not use it directly, only used when add source and unittests.
 func (m *Manager) pullSourceConfigs(source string) error {
-	configSource, ok := m.sources[source]
+	configSource, ok := m.sources.Get(source)
 	if !ok {
 		return errors.New("invalid source or source not added")
 	}
 
 	configs, err := configSource.GetConfigurations()
 	if err != nil {
-		log.Error("Get configuration by items failed", zap.Error(err))
+		log.Info("Get configuration by items failed", zap.Error(err))
 		return err
 	}
 
 	sourcePriority := configSource.GetPriority()
 	for key := range configs {
-		sourceName, ok := m.keySourceMap[key]
+		sourceName, ok := m.keySourceMap.Get(key)
 		if !ok { // if key do not exist then add source
-			m.keySourceMap[key] = source
+			m.keySourceMap.Insert(key, source)
 			continue
 		}
 
-		currentSource, ok := m.sources[sourceName]
+		currentSource, ok := m.sources.Get(sourceName)
 		if !ok {
-			m.keySourceMap[key] = source
+			m.keySourceMap.Insert(key, source)
 			continue
 		}
 
 		currentSrcPriority := currentSource.GetPriority()
 		if currentSrcPriority > sourcePriority { // lesser value has high priority
-			m.keySourceMap[key] = source
+			m.keySourceMap.Insert(key, source)
 		}
 	}
 
@@ -256,7 +329,7 @@ func (m *Manager) pullSourceConfigs(source string) error {
 }
 
 func (m *Manager) getConfigValueBySource(configKey, sourceName string) (string, error) {
-	source, ok := m.sources[sourceName]
+	source, ok := m.sources.Get(sourceName)
 	if !ok {
 		return "", ErrKeyNotFound
 	}
@@ -266,15 +339,14 @@ func (m *Manager) getConfigValueBySource(configKey, sourceName string) (string, 
 
 func (m *Manager) updateEvent(e *Event) error {
 	// refresh all configuration one by one
-	log.Debug("receive update event", zap.Any("event", e))
 	if e.HasUpdated {
 		return nil
 	}
 	switch e.EventType {
 	case CreateType, UpdateType:
-		sourceName, ok := m.keySourceMap[e.Key]
+		sourceName, ok := m.keySourceMap.Get(e.Key)
 		if !ok {
-			m.keySourceMap[e.Key] = e.EventSource
+			m.keySourceMap.Insert(e.Key, e.EventSource)
 			e.EventType = CreateType
 		} else if sourceName == e.EventSource {
 			e.EventType = UpdateType
@@ -286,12 +358,12 @@ func (m *Manager) updateEvent(e *Event) error {
 					e.EventSource, sourceName))
 				return ErrIgnoreChange
 			}
-			m.keySourceMap[e.Key] = e.EventSource
+			m.keySourceMap.Insert(e.Key, e.EventSource)
 			e.EventType = UpdateType
 		}
 
 	case DeleteType:
-		sourceName, ok := m.keySourceMap[e.Key]
+		sourceName, ok := m.keySourceMap.Get(e.Key)
 		if !ok || sourceName != e.EventSource {
 			// if delete event generated from source not maintained ignore it
 			log.Info(fmt.Sprintf("the event source %s (expect %s) is not maintained, ignore",
@@ -301,22 +373,20 @@ func (m *Manager) updateEvent(e *Event) error {
 			// find less priority source or delete key
 			source := m.findNextBestSource(e.Key, sourceName)
 			if source == nil {
-				delete(m.keySourceMap, e.Key)
+				m.keySourceMap.Remove(e.Key)
 			} else {
-				m.keySourceMap[e.Key] = source.GetSourceName()
+				m.keySourceMap.Insert(e.Key, source.GetSourceName())
 			}
 		}
-
 	}
 
+	log.Info("receive update event", zap.Any("event", e))
 	e.HasUpdated = true
 	return nil
 }
 
 // OnEvent Triggers actions when an event is generated
 func (m *Manager) OnEvent(event *Event) {
-	m.Lock()
-	defer m.Unlock()
 	if m.forbiddenKeys.Contain(formatKey(event.Key)) {
 		log.Info("ignore event for forbidden key", zap.String("key", event.Key))
 		return
@@ -334,31 +404,32 @@ func (m *Manager) GetIdentifier() string {
 	return "Manager"
 }
 
-func (m *Manager) findNextBestSource(key string, sourceName string) Source {
+func (m *Manager) findNextBestSource(configKey string, sourceName string) Source {
 	var rSource Source
-	for _, source := range m.sources {
-		if source.GetSourceName() == sourceName {
-			continue
+	m.sources.Range(func(key string, value Source) bool {
+		if value.GetSourceName() == sourceName {
+			return true
 		}
-		_, err := source.GetConfigurationByKey(key)
+		_, err := value.GetConfigurationByKey(configKey)
 		if err != nil {
-			continue
+			return true
 		}
 		if rSource == nil {
-			rSource = source
-			continue
+			rSource = value
+			return true
 		}
-		if source.GetPriority() < rSource.GetPriority() { // less value has high priority
-			rSource = source
+		if value.GetPriority() < rSource.GetPriority() { // less value has high priority
+			rSource = value
 		}
-	}
+		return true
+	})
 
 	return rSource
 }
 
 func (m *Manager) getHighPrioritySource(srcNameA, srcNameB string) Source {
-	sourceA, okA := m.sources[srcNameA]
-	sourceB, okB := m.sources[srcNameB]
+	sourceA, okA := m.sources.Get(srcNameA)
+	sourceB, okB := m.sources.Get(srcNameB)
 
 	if !okA && !okB {
 		return nil
@@ -368,7 +439,7 @@ func (m *Manager) getHighPrioritySource(srcNameA, srcNameB string) Source {
 		return sourceA
 	}
 
-	if sourceA.GetPriority() < sourceB.GetPriority() { //less value has high priority
+	if sourceA.GetPriority() < sourceB.GetPriority() { // less value has high priority
 		return sourceA
 	}
 

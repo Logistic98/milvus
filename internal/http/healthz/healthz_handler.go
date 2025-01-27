@@ -18,14 +18,15 @@ package healthz
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
 	"go.uber.org/zap"
 
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus/internal/json"
 	"github.com/milvus-io/milvus/pkg/log"
 )
 
@@ -51,7 +52,12 @@ type HealthResponse struct {
 }
 
 type HealthHandler struct {
-	indicators []Indicator
+	indicators   []Indicator
+	indicatorNum int
+
+	// unregister role when call stop by restful api
+	unregisterLock    sync.RWMutex
+	unregisteredRoles map[string]struct{}
 }
 
 var _ http.Handler = (*HealthHandler)(nil)
@@ -62,6 +68,20 @@ func Register(indicator Indicator) {
 	defaultHandler.indicators = append(defaultHandler.indicators, indicator)
 }
 
+func SetComponentNum(num int) {
+	defaultHandler.indicatorNum = num
+}
+
+func UnRegister(role string) {
+	defaultHandler.unregisterLock.Lock()
+	defer defaultHandler.unregisterLock.Unlock()
+
+	if defaultHandler.unregisteredRoles == nil {
+		defaultHandler.unregisteredRoles = make(map[string]struct{})
+	}
+	defaultHandler.unregisteredRoles[role] = struct{}{}
+}
+
 func Handler() *HealthHandler {
 	return &defaultHandler
 }
@@ -70,16 +90,30 @@ func (handler *HealthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	resp := &HealthResponse{
 		State: "OK",
 	}
+
+	unhealthyComponent := make([]string, 0)
 	ctx := context.Background()
 	for _, in := range handler.indicators {
+		handler.unregisterLock.RLock()
+		_, unregistered := handler.unregisteredRoles[in.GetName()]
+		handler.unregisterLock.RUnlock()
+		if unregistered {
+			continue
+		}
 		code := in.Health(ctx)
 		resp.Detail = append(resp.Detail, &IndicatorState{
 			Name: in.GetName(),
 			Code: code,
 		})
+
 		if code != commonpb.StateCode_Healthy && code != commonpb.StateCode_StandBy {
-			resp.State = fmt.Sprintf("component %s state is %s", in.GetName(), code.String())
+			unhealthyComponent = append(unhealthyComponent, in.GetName())
 		}
+	}
+
+	if len(unhealthyComponent) > 0 {
+		resp.State = fmt.Sprintf("Not all components are healthy, %d/%d", handler.indicatorNum-len(unhealthyComponent), handler.indicatorNum)
+		log.Info("check health failed", zap.Strings("UnhealthyComponent", unhealthyComponent))
 	}
 
 	if resp.State == "OK" {

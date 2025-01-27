@@ -17,66 +17,71 @@
 package pipeline
 
 import (
-	"go.uber.org/zap"
-
-	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/querynodev2/delegator"
 	base "github.com/milvus-io/milvus/internal/util/pipeline"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/metrics"
+	"github.com/milvus-io/milvus/pkg/common"
 	"github.com/milvus-io/milvus/pkg/mq/msgdispatcher"
+	"github.com/milvus-io/milvus/pkg/mq/msgstream"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
-//pipeline used for querynode
+// pipeline used for querynode
 type Pipeline interface {
 	base.StreamPipeline
-	ExcludedSegments(segInfos ...*datapb.SegmentInfo)
+	GetCollectionID() UniqueID
 }
 
 type pipeline struct {
 	base.StreamPipeline
 
-	excludedSegments *typeutil.ConcurrentMap[int64, *datapb.SegmentInfo]
-	collectionID     UniqueID
+	collectionID  UniqueID
+	embeddingNode embeddingNode
 }
 
-func (p *pipeline) ExcludedSegments(segInfos ...*datapb.SegmentInfo) {
-	for _, segInfo := range segInfos {
-		log.Debug("pipeline add exclude info",
-			zap.Int64("segmentID", segInfo.GetID()),
-			zap.Uint64("ts", segInfo.GetDmlPosition().GetTimestamp()),
-		)
-		p.excludedSegments.Insert(segInfo.GetID(), segInfo)
-	}
+func (p *pipeline) GetCollectionID() UniqueID {
+	return p.collectionID
 }
 
 func (p *pipeline) Close() {
 	p.StreamPipeline.Close()
-	metrics.CleanupQueryNodeCollectionMetrics(paramtable.GetNodeID(), p.collectionID)
 }
 
 func NewPipeLine(
-	collectionID UniqueID,
+	collection *Collection,
 	channel string,
 	manager *DataManager,
-	tSafeManager TSafeManager,
 	dispatcher msgdispatcher.Client,
 	delegator delegator.ShardDelegator,
 ) (Pipeline, error) {
+	collectionID := collection.ID()
+	replicateID, _ := common.GetReplicateID(collection.Schema().GetProperties())
+	if replicateID == "" {
+		replicateID, _ = common.GetReplicateID(collection.GetDBProperties())
+	}
+	replicateConfig := msgstream.GetReplicateConfig(replicateID, collection.GetDBName(), collection.Schema().Name)
 	pipelineQueueLength := paramtable.Get().QueryNodeCfg.FlowGraphMaxQueueLength.GetAsInt32()
-	excludedSegments := typeutil.NewConcurrentMap[int64, *datapb.SegmentInfo]()
 
 	p := &pipeline{
-		collectionID:     collectionID,
-		excludedSegments: excludedSegments,
-		StreamPipeline:   base.NewPipelineWithStream(dispatcher, nodeCtxTtInterval, enableTtChecker, channel),
+		collectionID:   collectionID,
+		StreamPipeline: base.NewPipelineWithStream(dispatcher, nodeCtxTtInterval, enableTtChecker, channel, replicateConfig),
 	}
 
-	filterNode := newFilterNode(collectionID, channel, manager, excludedSegments, pipelineQueueLength)
+	filterNode := newFilterNode(collectionID, channel, manager, delegator, pipelineQueueLength)
+
+	embeddingNode, err := newEmbeddingNode(collectionID, channel, manager, pipelineQueueLength)
+	if err != nil {
+		return nil, err
+	}
+
 	insertNode := newInsertNode(collectionID, channel, manager, delegator, pipelineQueueLength)
-	deleteNode := newDeleteNode(collectionID, channel, manager, tSafeManager, delegator, pipelineQueueLength)
-	p.Add(filterNode, insertNode, deleteNode)
+	deleteNode := newDeleteNode(collectionID, channel, manager, delegator, pipelineQueueLength)
+
+	// skip add embedding node when collection has no function.
+	if embeddingNode != nil {
+		p.Add(filterNode, embeddingNode, insertNode, deleteNode)
+	} else {
+		p.Add(filterNode, insertNode, deleteNode)
+	}
+
 	return p, nil
 }

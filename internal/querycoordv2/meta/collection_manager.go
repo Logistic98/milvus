@@ -18,19 +18,27 @@ package meta
 
 import (
 	"context"
+	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
-	"github.com/golang/protobuf/proto"
+	"github.com/cockroachdb/errors"
 	"github.com/samber/lo"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/milvus-io/milvus/internal/proto/querypb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/metastore"
+	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/pkg/eventlog"
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/metrics"
+	"github.com/milvus-io/milvus/pkg/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
-	. "github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 type Collection struct {
@@ -41,13 +49,14 @@ type Collection struct {
 
 	mut             sync.RWMutex
 	refreshNotifier chan struct{}
+	LoadSpan        trace.Span
 }
 
-func (collection *Collection) SetRefreshNotifier(notifer chan struct{}) {
+func (collection *Collection) SetRefreshNotifier(notifier chan struct{}) {
 	collection.mut.Lock()
 	defer collection.mut.Unlock()
 
-	collection.refreshNotifier = notifer
+	collection.refreshNotifier = notifier
 }
 
 func (collection *Collection) IsRefreshed() bool {
@@ -61,12 +70,6 @@ func (collection *Collection) IsRefreshed() bool {
 
 	select {
 	case <-notifier:
-		collection.mut.Lock()
-		defer collection.mut.Unlock()
-		// Only clear the notifier if the current notifier is which we got
-		if collection.refreshNotifier == notifier {
-			collection.refreshNotifier = nil
-		}
 		return true
 
 	default:
@@ -81,6 +84,7 @@ func (collection *Collection) Clone() *Collection {
 		CreatedAt:          collection.CreatedAt,
 		UpdatedAt:          collection.UpdatedAt,
 		refreshNotifier:    collection.refreshNotifier,
+		LoadSpan:           collection.LoadSpan,
 	}
 }
 
@@ -100,146 +104,163 @@ func (partition *Partition) Clone() *Partition {
 type CollectionManager struct {
 	rwmutex sync.RWMutex
 
-	collections map[UniqueID]*Collection
-	partitions  map[UniqueID]*Partition
-	store       Store
+	collections map[typeutil.UniqueID]*Collection
+	partitions  map[typeutil.UniqueID]*Partition
+
+	collectionPartitions map[typeutil.UniqueID]typeutil.Set[typeutil.UniqueID]
+	catalog              metastore.QueryCoordCatalog
 }
 
-func NewCollectionManager(store Store) *CollectionManager {
+func NewCollectionManager(catalog metastore.QueryCoordCatalog) *CollectionManager {
 	return &CollectionManager{
-		collections: make(map[int64]*Collection),
-		partitions:  make(map[int64]*Partition),
-		store:       store,
+		collections:          make(map[int64]*Collection),
+		partitions:           make(map[int64]*Partition),
+		collectionPartitions: make(map[int64]typeutil.Set[typeutil.UniqueID]),
+		catalog:              catalog,
 	}
 }
 
 // Recover recovers collections from kv store,
 // panics if failed
-func (m *CollectionManager) Recover(broker Broker) error {
-	collections, err := m.store.GetCollections()
+func (m *CollectionManager) Recover(ctx context.Context, broker Broker) error {
+	start := time.Now()
+	collections, err := m.catalog.GetCollections(ctx)
 	if err != nil {
 		return err
 	}
-	partitions, err := m.store.GetPartitions()
+	log.Ctx(ctx).Info("recover collections from kv store", zap.Duration("dur", time.Since(start)))
+
+	start = time.Now()
+	partitions, err := m.catalog.GetPartitions(ctx, lo.Map(collections, func(collection *querypb.CollectionLoadInfo, _ int) int64 {
+		return collection.GetCollectionID()
+	}))
 	if err != nil {
 		return err
 	}
 
+	ctx = log.WithTraceID(ctx, strconv.FormatInt(time.Now().UnixNano(), 10))
+	ctxLog := log.Ctx(ctx)
+	ctxLog.Info("recover partitions from kv store", zap.Duration("dur", time.Since(start)))
+
 	for _, collection := range collections {
-		// Collections not loaded done should be deprecated
-		if collection.GetStatus() != querypb.LoadStatus_Loaded || collection.GetReplicaNumber() <= 0 {
-			log.Info("skip recovery and release collection",
+		if collection.GetReplicaNumber() <= 0 {
+			ctxLog.Info("skip recovery and release collection due to invalid replica number",
 				zap.Int64("collectionID", collection.GetCollectionID()),
-				zap.String("status", collection.GetStatus().String()),
-				zap.Int32("replicaNumber", collection.GetReplicaNumber()),
-			)
-			m.store.ReleaseCollection(collection.GetCollectionID())
+				zap.Int32("replicaNumber", collection.GetReplicaNumber()))
+			m.catalog.ReleaseCollection(ctx, collection.GetCollectionID())
 			continue
 		}
-		m.collections[collection.CollectionID] = &Collection{
-			CollectionLoadInfo: collection,
+
+		if collection.GetStatus() != querypb.LoadStatus_Loaded {
+			if collection.RecoverTimes >= paramtable.Get().QueryCoordCfg.CollectionRecoverTimesLimit.GetAsInt32() {
+				m.catalog.ReleaseCollection(ctx, collection.CollectionID)
+				ctxLog.Info("recover loading collection times reach limit, release collection",
+					zap.Int64("collectionID", collection.CollectionID),
+					zap.Int32("recoverTimes", collection.RecoverTimes))
+				break
+			}
+			// update recoverTimes meta in etcd
+			collection.RecoverTimes += 1
+			m.putCollection(ctx, true, &Collection{CollectionLoadInfo: collection})
+			continue
 		}
+
+		err := m.upgradeLoadFields(ctx, collection, broker)
+		if err != nil {
+			if errors.Is(err, merr.ErrCollectionNotFound) {
+				log.Warn("collection not found, skip upgrade logic and wait for release")
+			} else {
+				log.Warn("upgrade load field failed", zap.Error(err))
+				return err
+			}
+		}
+
+		// update collection's CreateAt and UpdateAt to now after qc restart
+		m.putCollection(ctx, false, &Collection{
+			CollectionLoadInfo: collection,
+			CreatedAt:          time.Now(),
+		})
 	}
 
 	for collection, partitions := range partitions {
-		sawLoaded := false
 		for _, partition := range partitions {
 			// Partitions not loaded done should be deprecated
-			if partition.GetStatus() != querypb.LoadStatus_Loaded || partition.GetReplicaNumber() <= 0 {
-				log.Info("skip recovery and release partition",
-					zap.Int64("collectionID", collection),
-					zap.Int64("partitionID", partition.GetPartitionID()),
-					zap.String("status", partition.GetStatus().String()),
-					zap.Int32("replicaNumber", partition.GetReplicaNumber()),
-				)
-				m.store.ReleasePartition(collection, partition.GetPartitionID())
+			if partition.GetStatus() != querypb.LoadStatus_Loaded {
+				if partition.RecoverTimes >= paramtable.Get().QueryCoordCfg.CollectionRecoverTimesLimit.GetAsInt32() {
+					m.catalog.ReleaseCollection(ctx, collection)
+					ctxLog.Info("recover loading partition times reach limit, release collection",
+						zap.Int64("collectionID", collection),
+						zap.Int32("recoverTimes", partition.RecoverTimes))
+					break
+				}
+
+				partition.RecoverTimes += 1
+				m.putPartition(ctx, []*Partition{
+					{
+						PartitionLoadInfo: partition,
+						CreatedAt:         time.Now(),
+					},
+				}, true)
 				continue
 			}
 
-			sawLoaded = true
-			m.partitions[partition.PartitionID] = &Partition{
-				PartitionLoadInfo: partition,
-			}
-		}
-
-		if !sawLoaded {
-			m.store.ReleaseCollection(collection)
+			m.putPartition(ctx, []*Partition{
+				{
+					PartitionLoadInfo: partition,
+					CreatedAt:         time.Now(),
+				},
+			}, false)
 		}
 	}
 
-	err = m.upgradeRecover(broker)
-	if err != nil {
-		log.Error("upgrade recover failed", zap.Error(err))
+	return nil
+}
+
+func (m *CollectionManager) upgradeLoadFields(ctx context.Context, collection *querypb.CollectionLoadInfo, broker Broker) error {
+	// only fill load fields when value is nil
+	if collection.LoadFields != nil {
+		return nil
+	}
+
+	// invoke describe collection to get collection schema
+	resp, err := broker.DescribeCollection(context.Background(), collection.CollectionID)
+	if err := merr.CheckRPCCall(resp, err); err != nil {
 		return err
 	}
+
+	// fill all field id as legacy default behavior
+	collection.LoadFields = lo.FilterMap(resp.GetSchema().GetFields(), func(fieldSchema *schemapb.FieldSchema, _ int) (int64, bool) {
+		// load fields list excludes system fields
+		return fieldSchema.GetFieldID(), !common.IsSystemField(fieldSchema.GetFieldID())
+	})
+
+	// put updated meta back to store
+	err = m.putCollection(ctx, true, &Collection{
+		CollectionLoadInfo: collection,
+		LoadPercentage:     100,
+	})
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
-// upgradeRecover recovers from old version <= 2.2.x for compatibility.
-func (m *CollectionManager) upgradeRecover(broker Broker) error {
-	for _, collection := range m.GetAllCollections() {
-		// It's a workaround to check if it is old CollectionLoadInfo because there's no
-		// loadType in old version, maybe we should use version instead.
-		if collection.GetLoadType() == querypb.LoadType_UnKnownType {
-			partitionIDs, err := broker.GetPartitions(context.Background(), collection.GetCollectionID())
-			if err != nil {
-				return err
-			}
-			partitions := lo.Map(partitionIDs, func(partitionID int64, _ int) *Partition {
-				return &Partition{
-					PartitionLoadInfo: &querypb.PartitionLoadInfo{
-						CollectionID:  collection.GetCollectionID(),
-						PartitionID:   partitionID,
-						ReplicaNumber: collection.GetReplicaNumber(),
-						Status:        querypb.LoadStatus_Loaded,
-						FieldIndexID:  collection.GetFieldIndexID(),
-					},
-					LoadPercentage: 100,
-				}
-			})
-			err = m.putPartition(partitions, true)
-			if err != nil {
-				return err
-			}
-		}
-	}
-	for _, partition := range m.GetAllPartitions() {
-		// In old version, collection would NOT be stored if the partition existed.
-		if _, ok := m.collections[partition.GetCollectionID()]; !ok {
-			col := &Collection{
-				CollectionLoadInfo: &querypb.CollectionLoadInfo{
-					CollectionID:  partition.GetCollectionID(),
-					ReplicaNumber: partition.GetReplicaNumber(),
-					Status:        partition.GetStatus(),
-					FieldIndexID:  partition.GetFieldIndexID(),
-					LoadType:      querypb.LoadType_LoadPartition,
-				},
-				LoadPercentage: 100,
-			}
-			err := m.PutCollection(col)
-			if err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func (m *CollectionManager) GetCollection(collectionID UniqueID) *Collection {
+func (m *CollectionManager) GetCollection(ctx context.Context, collectionID typeutil.UniqueID) *Collection {
 	m.rwmutex.RLock()
 	defer m.rwmutex.RUnlock()
 
 	return m.collections[collectionID]
 }
 
-func (m *CollectionManager) GetPartition(partitionID UniqueID) *Partition {
+func (m *CollectionManager) GetPartition(ctx context.Context, partitionID typeutil.UniqueID) *Partition {
 	m.rwmutex.RLock()
 	defer m.rwmutex.RUnlock()
 
 	return m.partitions[partitionID]
 }
 
-func (m *CollectionManager) GetLoadType(collectionID UniqueID) querypb.LoadType {
+func (m *CollectionManager) GetLoadType(ctx context.Context, collectionID typeutil.UniqueID) querypb.LoadType {
 	m.rwmutex.RLock()
 	defer m.rwmutex.RUnlock()
 
@@ -250,7 +271,7 @@ func (m *CollectionManager) GetLoadType(collectionID UniqueID) querypb.LoadType 
 	return querypb.LoadType_UnKnownType
 }
 
-func (m *CollectionManager) GetReplicaNumber(collectionID UniqueID) int32 {
+func (m *CollectionManager) GetReplicaNumber(ctx context.Context, collectionID typeutil.UniqueID) int32 {
 	m.rwmutex.RLock()
 	defer m.rwmutex.RUnlock()
 
@@ -262,15 +283,15 @@ func (m *CollectionManager) GetReplicaNumber(collectionID UniqueID) int32 {
 }
 
 // CalculateLoadPercentage checks if collection is currently fully loaded.
-func (m *CollectionManager) CalculateLoadPercentage(collectionID UniqueID) int32 {
+func (m *CollectionManager) CalculateLoadPercentage(ctx context.Context, collectionID typeutil.UniqueID) int32 {
 	m.rwmutex.RLock()
 	defer m.rwmutex.RUnlock()
 
 	return m.calculateLoadPercentage(collectionID)
 }
 
-func (m *CollectionManager) calculateLoadPercentage(collectionID UniqueID) int32 {
-	collection, ok := m.collections[collectionID]
+func (m *CollectionManager) calculateLoadPercentage(collectionID typeutil.UniqueID) int32 {
+	_, ok := m.collections[collectionID]
 	if ok {
 		partitions := m.getPartitionsByCollection(collectionID)
 		if len(partitions) > 0 {
@@ -278,15 +299,11 @@ func (m *CollectionManager) calculateLoadPercentage(collectionID UniqueID) int32
 				return partition.LoadPercentage
 			}) / int32(len(partitions))
 		}
-		if collection.GetLoadType() == querypb.LoadType_LoadCollection {
-			// no partition exists
-			return 100
-		}
 	}
 	return -1
 }
 
-func (m *CollectionManager) GetPartitionLoadPercentage(partitionID UniqueID) int32 {
+func (m *CollectionManager) GetPartitionLoadPercentage(ctx context.Context, partitionID typeutil.UniqueID) int32 {
 	m.rwmutex.RLock()
 	defer m.rwmutex.RUnlock()
 
@@ -297,7 +314,7 @@ func (m *CollectionManager) GetPartitionLoadPercentage(partitionID UniqueID) int
 	return -1
 }
 
-func (m *CollectionManager) CalculateLoadStatus(collectionID UniqueID) querypb.LoadStatus {
+func (m *CollectionManager) CalculateLoadStatus(ctx context.Context, collectionID typeutil.UniqueID) querypb.LoadStatus {
 	m.rwmutex.RLock()
 	defer m.rwmutex.RUnlock()
 
@@ -320,7 +337,7 @@ func (m *CollectionManager) CalculateLoadStatus(collectionID UniqueID) querypb.L
 	return querypb.LoadStatus_Invalid
 }
 
-func (m *CollectionManager) GetFieldIndex(collectionID UniqueID) map[int64]int64 {
+func (m *CollectionManager) GetFieldIndex(ctx context.Context, collectionID typeutil.UniqueID) map[int64]int64 {
 	m.rwmutex.RLock()
 	defer m.rwmutex.RUnlock()
 
@@ -331,7 +348,18 @@ func (m *CollectionManager) GetFieldIndex(collectionID UniqueID) map[int64]int64
 	return nil
 }
 
-func (m *CollectionManager) Exist(collectionID UniqueID) bool {
+func (m *CollectionManager) GetLoadFields(ctx context.Context, collectionID typeutil.UniqueID) []int64 {
+	m.rwmutex.RLock()
+	defer m.rwmutex.RUnlock()
+
+	collection, ok := m.collections[collectionID]
+	if ok {
+		return collection.GetLoadFields()
+	}
+	return nil
+}
+
+func (m *CollectionManager) Exist(ctx context.Context, collectionID typeutil.UniqueID) bool {
 	m.rwmutex.RLock()
 	defer m.rwmutex.RUnlock()
 
@@ -340,7 +368,7 @@ func (m *CollectionManager) Exist(collectionID UniqueID) bool {
 }
 
 // GetAll returns the collection ID of all loaded collections
-func (m *CollectionManager) GetAll() []int64 {
+func (m *CollectionManager) GetAll(ctx context.Context) []int64 {
 	m.rwmutex.RLock()
 	defer m.rwmutex.RUnlock()
 
@@ -351,57 +379,51 @@ func (m *CollectionManager) GetAll() []int64 {
 	return ids.Collect()
 }
 
-func (m *CollectionManager) GetAllCollections() []*Collection {
+func (m *CollectionManager) GetAllCollections(ctx context.Context) []*Collection {
 	m.rwmutex.RLock()
 	defer m.rwmutex.RUnlock()
 
 	return lo.Values(m.collections)
 }
 
-func (m *CollectionManager) GetAllPartitions() []*Partition {
+func (m *CollectionManager) GetAllPartitions(ctx context.Context) []*Partition {
 	m.rwmutex.RLock()
 	defer m.rwmutex.RUnlock()
 
 	return lo.Values(m.partitions)
 }
 
-func (m *CollectionManager) GetPartitionsByCollection(collectionID UniqueID) []*Partition {
+func (m *CollectionManager) GetPartitionsByCollection(ctx context.Context, collectionID typeutil.UniqueID) []*Partition {
 	m.rwmutex.RLock()
 	defer m.rwmutex.RUnlock()
 
 	return m.getPartitionsByCollection(collectionID)
 }
 
-func (m *CollectionManager) getPartitionsByCollection(collectionID UniqueID) []*Partition {
-	partitions := make([]*Partition, 0)
-	for _, partition := range m.partitions {
-		if partition.CollectionID == collectionID {
-			partitions = append(partitions, partition)
-		}
-	}
-	return partitions
+func (m *CollectionManager) getPartitionsByCollection(collectionID typeutil.UniqueID) []*Partition {
+	return lo.Map(m.collectionPartitions[collectionID].Collect(), func(partitionID int64, _ int) *Partition { return m.partitions[partitionID] })
 }
 
-func (m *CollectionManager) PutCollection(collection *Collection, partitions ...*Partition) error {
+func (m *CollectionManager) PutCollection(ctx context.Context, collection *Collection, partitions ...*Partition) error {
 	m.rwmutex.Lock()
 	defer m.rwmutex.Unlock()
 
-	return m.putCollection(true, collection, partitions...)
+	return m.putCollection(ctx, true, collection, partitions...)
 }
 
-func (m *CollectionManager) PutCollectionWithoutSave(collection *Collection) error {
+func (m *CollectionManager) PutCollectionWithoutSave(ctx context.Context, collection *Collection) error {
 	m.rwmutex.Lock()
 	defer m.rwmutex.Unlock()
 
-	return m.putCollection(false, collection)
+	return m.putCollection(ctx, false, collection)
 }
 
-func (m *CollectionManager) putCollection(withSave bool, collection *Collection, partitions ...*Partition) error {
+func (m *CollectionManager) putCollection(ctx context.Context, withSave bool, collection *Collection, partitions ...*Partition) error {
 	if withSave {
 		partitionInfos := lo.Map(partitions, func(partition *Partition, _ int) *querypb.PartitionLoadInfo {
 			return partition.PartitionLoadInfo
 		})
-		err := m.store.SaveCollection(collection.CollectionLoadInfo, partitionInfos...)
+		err := m.catalog.SaveCollection(ctx, collection.CollectionLoadInfo, partitionInfos...)
 		if err != nil {
 			return err
 		}
@@ -409,6 +431,13 @@ func (m *CollectionManager) putCollection(withSave bool, collection *Collection,
 	for _, partition := range partitions {
 		partition.UpdatedAt = time.Now()
 		m.partitions[partition.GetPartitionID()] = partition
+
+		partitions := m.collectionPartitions[collection.CollectionID]
+		if partitions == nil {
+			partitions = make(typeutil.Set[int64])
+			m.collectionPartitions[collection.CollectionID] = partitions
+		}
+		partitions.Insert(partition.GetPartitionID())
 	}
 	collection.UpdatedAt = time.Now()
 	m.collections[collection.CollectionID] = collection
@@ -416,26 +445,26 @@ func (m *CollectionManager) putCollection(withSave bool, collection *Collection,
 	return nil
 }
 
-func (m *CollectionManager) PutPartition(partitions ...*Partition) error {
+func (m *CollectionManager) PutPartition(ctx context.Context, partitions ...*Partition) error {
 	m.rwmutex.Lock()
 	defer m.rwmutex.Unlock()
 
-	return m.putPartition(partitions, true)
+	return m.putPartition(ctx, partitions, true)
 }
 
-func (m *CollectionManager) PutPartitionWithoutSave(partitions ...*Partition) error {
+func (m *CollectionManager) PutPartitionWithoutSave(ctx context.Context, partitions ...*Partition) error {
 	m.rwmutex.Lock()
 	defer m.rwmutex.Unlock()
 
-	return m.putPartition(partitions, false)
+	return m.putPartition(ctx, partitions, false)
 }
 
-func (m *CollectionManager) putPartition(partitions []*Partition, withSave bool) error {
+func (m *CollectionManager) putPartition(ctx context.Context, partitions []*Partition, withSave bool) error {
 	if withSave {
 		loadInfos := lo.Map(partitions, func(partition *Partition, _ int) *querypb.PartitionLoadInfo {
 			return partition.PartitionLoadInfo
 		})
-		err := m.store.SavePartition(loadInfos...)
+		err := m.catalog.SavePartition(ctx, loadInfos...)
 		if err != nil {
 			return err
 		}
@@ -443,21 +472,30 @@ func (m *CollectionManager) putPartition(partitions []*Partition, withSave bool)
 	for _, partition := range partitions {
 		partition.UpdatedAt = time.Now()
 		m.partitions[partition.GetPartitionID()] = partition
+		collID := partition.GetCollectionID()
+
+		partitions := m.collectionPartitions[collID]
+		if partitions == nil {
+			partitions = make(typeutil.Set[int64])
+			m.collectionPartitions[collID] = partitions
+		}
+		partitions.Insert(partition.GetPartitionID())
 	}
 	return nil
 }
 
-func (m *CollectionManager) UpdateLoadPercent(partitionID int64, loadPercent int32) (int32, error) {
+func (m *CollectionManager) updateLoadMetrics() {
+	metrics.QueryCoordNumCollections.WithLabelValues().Set(float64(len(lo.Filter(lo.Values(m.collections), func(coll *Collection, _ int) bool { return coll.LoadPercentage == 100 }))))
+	metrics.QueryCoordNumPartitions.WithLabelValues().Set(float64(len(lo.Filter(lo.Values(m.partitions), func(part *Partition, _ int) bool { return part.LoadPercentage == 100 }))))
+}
+
+func (m *CollectionManager) UpdatePartitionLoadPercent(ctx context.Context, partitionID int64, loadPercent int32) error {
 	m.rwmutex.Lock()
 	defer m.rwmutex.Unlock()
 
 	oldPartition, ok := m.partitions[partitionID]
 	if !ok {
-		return 0, merr.WrapErrPartitionNotFound(partitionID)
-	}
-
-	if loadPercent <= oldPartition.LoadPercentage {
-		return m.calculateLoadPercentage(oldPartition.GetCollectionID()), nil
+		return merr.WrapErrPartitionNotFound(partitionID)
 	}
 
 	// update partition load percentage
@@ -465,78 +503,116 @@ func (m *CollectionManager) UpdateLoadPercent(partitionID int64, loadPercent int
 	newPartition.LoadPercentage = loadPercent
 	savePartition := false
 	if loadPercent == 100 {
-		savePartition = true
+		savePartition = newPartition.Status != querypb.LoadStatus_Loaded || newPartition.RecoverTimes != 0
 		newPartition.Status = querypb.LoadStatus_Loaded
+		// if partition becomes loaded, clear it's recoverTimes in load info
+		newPartition.RecoverTimes = 0
 		elapsed := time.Since(newPartition.CreatedAt)
 		metrics.QueryCoordLoadLatency.WithLabelValues().Observe(float64(elapsed.Milliseconds()))
+		eventlog.Record(eventlog.NewRawEvt(eventlog.Level_Info, fmt.Sprintf("Partition %d loaded", partitionID)))
 	}
-	err := m.putPartition([]*Partition{newPartition}, savePartition)
-	if err != nil {
-		return 0, err
-	}
+	return m.putPartition(ctx, []*Partition{newPartition}, savePartition)
+}
+
+func (m *CollectionManager) UpdateCollectionLoadPercent(ctx context.Context, collectionID int64) (int32, error) {
+	m.rwmutex.Lock()
+	defer m.rwmutex.Unlock()
 
 	// update collection load percentage
-	oldCollection, ok := m.collections[newPartition.CollectionID]
+	oldCollection, ok := m.collections[collectionID]
 	if !ok {
-		return 0, merr.WrapErrCollectionNotFound(newPartition.CollectionID)
+		return 0, merr.WrapErrCollectionNotFound(collectionID)
 	}
 	collectionPercent := m.calculateLoadPercentage(oldCollection.CollectionID)
-	if collectionPercent <= oldCollection.LoadPercentage {
-		return m.calculateLoadPercentage(oldPartition.GetCollectionID()), nil
-	}
 	newCollection := oldCollection.Clone()
 	newCollection.LoadPercentage = collectionPercent
 	saveCollection := false
 	if collectionPercent == 100 {
-		saveCollection = true
+		saveCollection = newCollection.Status != querypb.LoadStatus_Loaded || newCollection.RecoverTimes != 0
+		if newCollection.LoadSpan != nil {
+			newCollection.LoadSpan.End()
+			newCollection.LoadSpan = nil
+		}
 		newCollection.Status = querypb.LoadStatus_Loaded
+
+		// if collection becomes loaded, clear it's recoverTimes in load info
+		newCollection.RecoverTimes = 0
+
+		defer m.updateLoadMetrics()
 		elapsed := time.Since(newCollection.CreatedAt)
 		metrics.QueryCoordLoadLatency.WithLabelValues().Observe(float64(elapsed.Milliseconds()))
+		eventlog.Record(eventlog.NewRawEvt(eventlog.Level_Info, fmt.Sprintf("Collection %d loaded", newCollection.CollectionID)))
 	}
-	return collectionPercent, m.putCollection(saveCollection, newCollection)
+	return collectionPercent, m.putCollection(ctx, saveCollection, newCollection)
 }
 
 // RemoveCollection removes collection and its partitions.
-func (m *CollectionManager) RemoveCollection(collectionID UniqueID) error {
+func (m *CollectionManager) RemoveCollection(ctx context.Context, collectionID typeutil.UniqueID) error {
 	m.rwmutex.Lock()
 	defer m.rwmutex.Unlock()
 
 	_, ok := m.collections[collectionID]
 	if ok {
-		err := m.store.ReleaseCollection(collectionID)
+		err := m.catalog.ReleaseCollection(ctx, collectionID)
 		if err != nil {
 			return err
 		}
 		delete(m.collections, collectionID)
-		for partID, partition := range m.partitions {
-			if partition.CollectionID == collectionID {
-				delete(m.partitions, partID)
-			}
+		for _, partition := range m.collectionPartitions[collectionID].Collect() {
+			delete(m.partitions, partition)
 		}
+		delete(m.collectionPartitions, collectionID)
 	}
+	metrics.CleanQueryCoordMetricsWithCollectionID(collectionID)
+	m.updateLoadMetrics()
 	return nil
 }
 
-func (m *CollectionManager) RemovePartition(ids ...UniqueID) error {
-	if len(ids) == 0 {
+func (m *CollectionManager) RemovePartition(ctx context.Context, collectionID typeutil.UniqueID, partitionIDs ...typeutil.UniqueID) error {
+	if len(partitionIDs) == 0 {
 		return nil
 	}
 
 	m.rwmutex.Lock()
 	defer m.rwmutex.Unlock()
 
-	return m.removePartition(ids...)
+	err := m.removePartition(ctx, collectionID, partitionIDs...)
+	return err
 }
 
-func (m *CollectionManager) removePartition(ids ...UniqueID) error {
-	partition := m.partitions[ids[0]]
-	err := m.store.ReleasePartition(partition.CollectionID, ids...)
+func (m *CollectionManager) removePartition(ctx context.Context, collectionID typeutil.UniqueID, partitionIDs ...typeutil.UniqueID) error {
+	err := m.catalog.ReleasePartition(ctx, collectionID, partitionIDs...)
 	if err != nil {
 		return err
 	}
-	for _, id := range ids {
+	partitions := m.collectionPartitions[collectionID]
+	for _, id := range partitionIDs {
 		delete(m.partitions, id)
+		delete(partitions, id)
 	}
+	m.updateLoadMetrics()
 
 	return nil
+}
+
+func (m *CollectionManager) UpdateReplicaNumber(ctx context.Context, collectionID typeutil.UniqueID, replicaNumber int32) error {
+	m.rwmutex.Lock()
+	defer m.rwmutex.Unlock()
+
+	collection, ok := m.collections[collectionID]
+	if !ok {
+		return merr.WrapErrCollectionNotFound(collectionID)
+	}
+	newCollection := collection.Clone()
+	newCollection.ReplicaNumber = replicaNumber
+
+	partitions := m.getPartitionsByCollection(collectionID)
+	newPartitions := make([]*Partition, 0, len(partitions))
+	for _, partition := range partitions {
+		newPartition := partition.Clone()
+		newPartition.ReplicaNumber = replicaNumber
+		newPartitions = append(newPartitions, newPartition)
+	}
+
+	return m.putCollection(ctx, true, newCollection, newPartitions...)
 }

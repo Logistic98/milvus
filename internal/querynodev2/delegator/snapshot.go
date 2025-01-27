@@ -23,6 +23,7 @@ import (
 	"go.uber.org/atomic"
 
 	"github.com/milvus-io/milvus/pkg/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 // SnapshotItem group segmentEntry slice
@@ -36,8 +37,10 @@ type snapshotCleanup func()
 
 // snapshot records segment distribution with ref count.
 type snapshot struct {
-	dist    []SnapshotItem
-	growing []SegmentEntry
+	partitions    typeutil.Set[int64]
+	dist          []SnapshotItem
+	growing       []SegmentEntry
+	targetVersion int64
 
 	// version ID for tracking
 	version int64
@@ -53,23 +56,25 @@ type snapshot struct {
 	inUse atomic.Int64
 
 	// expired flag
-	expired bool
+	expired atomic.Bool
 }
 
 // NewSnapshot returns a prepared snapshot with channel initialized.
-func NewSnapshot(sealed []SnapshotItem, growing []SegmentEntry, last *snapshot, version int64) *snapshot {
+func NewSnapshot(sealed []SnapshotItem, growing []SegmentEntry, last *snapshot, version int64, targetVersion int64) *snapshot {
 	return &snapshot{
-		version: version,
-		growing: growing,
-		dist:    sealed,
-		last:    last,
-		cleared: make(chan struct{}),
+		partitions:    typeutil.NewSet[int64](),
+		version:       version,
+		growing:       growing,
+		dist:          sealed,
+		last:          last,
+		cleared:       make(chan struct{}),
+		targetVersion: targetVersion,
 	}
 }
 
 // Expire sets expired flag to true.
 func (s *snapshot) Expire(cleanup snapshotCleanup) {
-	s.expired = true
+	s.expired.Store(true)
 	s.checkCleared(cleanup)
 }
 
@@ -78,6 +83,10 @@ func (s *snapshot) Get(partitions ...int64) (sealed []SnapshotItem, growing []Se
 	s.inUse.Inc()
 
 	return s.filter(partitions...)
+}
+
+func (s *snapshot) GetTargetVersion() int64 {
+	return s.targetVersion
 }
 
 // Peek returns segment distributions without increasing inUse.
@@ -112,7 +121,7 @@ func (s *snapshot) Done(cleanup snapshotCleanup) {
 
 // checkCleared performs safety check for snapshot closing the cleared signal.
 func (s *snapshot) checkCleared(cleanup snapshotCleanup) {
-	if s.expired && s.inUse.Load() == 0 {
+	if s.expired.Load() && s.inUse.Load() == 0 {
 		s.once.Do(func() {
 			// first snapshot
 			if s.last == nil {

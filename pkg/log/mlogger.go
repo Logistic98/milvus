@@ -21,6 +21,7 @@ import (
 
 	"github.com/uber/jaeger-client-go/utils"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 // MLogger is a wrapper type of zap.Logger.
@@ -32,7 +33,9 @@ type MLogger struct {
 // With encapsulates zap.Logger With method to return MLogger instance.
 func (l *MLogger) With(fields ...zap.Field) *MLogger {
 	nl := &MLogger{
-		Logger: l.Logger.With(fields...),
+		Logger: l.Logger.WithOptions(zap.WrapCore(func(core zapcore.Core) zapcore.Core {
+			return NewLazyWith(core, fields)
+		})),
 	}
 	return nl
 }
@@ -60,7 +63,7 @@ func (l *MLogger) r() utils.RateLimiter {
 // RatedDebug calls log.Debug with RateLimiter.
 func (l *MLogger) RatedDebug(cost float64, msg string, fields ...zap.Field) bool {
 	if l.r().CheckCredit(cost) {
-		l.Debug(msg, fields...)
+		l.WithOptions(zap.AddCallerSkip(1)).Debug(msg, fields...)
 		return true
 	}
 	return false
@@ -69,7 +72,7 @@ func (l *MLogger) RatedDebug(cost float64, msg string, fields ...zap.Field) bool
 // RatedInfo calls log.Info with RateLimiter.
 func (l *MLogger) RatedInfo(cost float64, msg string, fields ...zap.Field) bool {
 	if l.r().CheckCredit(cost) {
-		l.Info(msg, fields...)
+		l.WithOptions(zap.AddCallerSkip(1)).Info(msg, fields...)
 		return true
 	}
 	return false
@@ -78,7 +81,7 @@ func (l *MLogger) RatedInfo(cost float64, msg string, fields ...zap.Field) bool 
 // RatedWarn calls log.Warn with RateLimiter.
 func (l *MLogger) RatedWarn(cost float64, msg string, fields ...zap.Field) bool {
 	if l.r().CheckCredit(cost) {
-		l.Warn(msg, fields...)
+		l.WithOptions(zap.AddCallerSkip(1)).Warn(msg, fields...)
 		return true
 	}
 	return false

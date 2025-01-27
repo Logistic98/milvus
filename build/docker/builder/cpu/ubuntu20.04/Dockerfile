@@ -9,56 +9,53 @@
 # is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 # or implied. See the License for the specific language governing permissions and limitations under the License.
 
-FROM milvusdb/openblas:ubuntu20.04-20220914-179ea77
+FROM ubuntu:focal-20220426
 
-RUN apt-get update && apt-get install -y --no-install-recommends wget curl ca-certificates gnupg2 && \
-    wget -qO- "https://cmake.org/files/v3.24/cmake-3.24.0-linux-x86_64.tar.gz" | tar --strip-components=1 -xz -C /usr/local && \
-    apt-get update && apt-get install -y --no-install-recommends \
-    g++ gcc gfortran git make ccache libssl-dev zlib1g-dev unzip \
-    clang-format-10 clang-tidy-10 lcov libtool m4 autoconf automake python3 python3-pip \
-    pkg-config uuid-dev libaio-dev libgoogle-perftools-dev && \
+ARG TARGETARCH
+
+RUN apt-get update && apt-get install -y --no-install-recommends wget curl ca-certificates gnupg2 \
+    g++ gcc gdb gdbserver ninja-build git make ccache libssl-dev zlib1g-dev zip unzip \
+    clang-format-12 clang-tidy-12 lcov libtool m4 autoconf automake python3 python3-pip \
+    pkg-config uuid-dev libaio-dev libopenblas-dev && \
     apt-get remove --purge -y && \
     rm -rf /var/lib/apt/lists/*
 
-RUN pip3 install conan==1.58.0
+RUN pip3 install conan==1.64.1
+
+RUN echo "target arch $TARGETARCH"
+RUN wget -qO- "https://cmake.org/files/v3.27/cmake-3.27.5-linux-`uname -m`.tar.gz" | tar --strip-components=1 -xz -C /usr/local
+
+RUN mkdir /opt/vcpkg &&  \
+    wget -qO- vcpkg.tar.gz https://github.com/microsoft/vcpkg/archive/master.tar.gz | tar --strip-components=1 -xz -C /opt/vcpkg && \
+    rm -rf vcpkg.tar.gz
+
+ENV VCPKG_FORCE_SYSTEM_BINARIES 1
+
+RUN /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics && ln -s /opt/vcpkg/vcpkg /usr/local/bin/vcpkg && vcpkg version
+
+RUN vcpkg install azure-identity-cpp azure-storage-blobs-cpp gtest
 
 # Install Go
 ENV GOPATH /go
 ENV GOROOT /usr/local/go
 ENV GO111MODULE on
 ENV PATH $GOPATH/bin:$GOROOT/bin:$PATH
-RUN mkdir -p /usr/local/go && wget -qO- "https://golang.org/dl/go1.18.3.linux-amd64.tar.gz" | tar --strip-components=1 -xz -C /usr/local/go && \
+RUN mkdir -p /usr/local/go && wget -qO- "https://go.dev/dl/go1.21.11.linux-$TARGETARCH.tar.gz" | tar --strip-components=1 -xz -C /usr/local/go && \
     mkdir -p "$GOPATH/src" "$GOPATH/bin" && \
-    curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b ${GOPATH}/bin v1.46.2 && \
-    # export GO111MODULE=on && go get github.com/quasilyte/go-ruleguard/cmd/ruleguard@v0.2.1 && \
-    go install github.com/ramya-rao-a/go-outline@latest && \
-    go install golang.org/x/tools/gopls@latest && \
-    go install github.com/uudashr/gopkgs/v2/cmd/gopkgs@latest && \
-    go install github.com/go-delve/delve/cmd/dlv@latest && \
-    go install honnef.co/go/tools/cmd/staticcheck@2022.1 && \
     go clean --modcache && \
     chmod -R 777 "$GOPATH" && chmod -R a+w $(go env GOTOOLDIR)
 
-RUN ln -s /go/bin/dlv /go/bin/dlv-dap
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gdb gdbserver && \
-    apt-get remove --purge -y && \
-    rm -rf /var/lib/apt/lists/*
-
-RUN echo 'root:root' | chpasswd
-
 # refer: https://code.visualstudio.com/docs/remote/containers-advanced#_avoiding-extension-reinstalls-on-container-rebuild
 RUN mkdir -p /home/milvus/.vscode-server/extensions \
-        /home/milvus/.vscode-server-insiders/extensions \
+    /home/milvus/.vscode-server-insiders/extensions \
     && chmod -R 777 /home/milvus
 
 COPY --chown=0:0 build/docker/builder/entrypoint.sh /
 
-RUN wget -qO- "https://github.com/jeffoverflow/autouseradd/releases/download/1.2.0/autouseradd-1.2.0-amd64.tar.gz" | tar xz -C / --strip-components 1
+RUN curl https://sh.rustup.rs -sSf | \
+    sh -s -- --default-toolchain=1.83 -y
 
-RUN wget -O /tini https://github.com/krallin/tini/releases/download/v0.19.0/tini && \
-    chmod +x /tini
+ENV PATH=/root/.cargo/bin:$PATH
 
-ENTRYPOINT [ "/tini", "--", "autouseradd", "--user", "milvus", "--", "/entrypoint.sh" ]
+ENTRYPOINT [ "/entrypoint.sh" ]
 CMD ["tail", "-f", "/dev/null"]

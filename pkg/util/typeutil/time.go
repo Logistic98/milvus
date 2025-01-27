@@ -32,7 +32,7 @@ var ZeroTimestamp = Timestamp(0)
 
 // ParseTimestamp returns a timestamp for a given byte slice.
 func ParseTimestamp(data []byte) (time.Time, error) {
-	//we use big endian here for compatibility issues
+	// we use big endian here for compatibility issues
 	nano, err := BigEndianBytesToUint64(data)
 	if err != nil {
 		return ZeroTime, err
@@ -44,4 +44,12 @@ func ParseTimestamp(data []byte) (time.Time, error) {
 // SubTimeByWallClock returns the duration between two different timestamps.
 func SubTimeByWallClock(after, before time.Time) time.Duration {
 	return time.Duration(after.UnixNano() - before.UnixNano())
+}
+
+func TimestampToString(ts uint64) string {
+	if ts <= 0 {
+		return ""
+	}
+	ut := time.UnixMilli(int64(ts))
+	return ut.Format(time.DateTime)
 }

@@ -21,10 +21,11 @@ import (
 
 	"google.golang.org/grpc"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus/internal/util/streamrpc"
+	"github.com/milvus-io/milvus/pkg/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/proto/querypb"
 )
 
 var _ querypb.QueryNodeClient = &GrpcQueryNodeClient{}
@@ -81,8 +82,24 @@ func (m *GrpcQueryNodeClient) Search(ctx context.Context, in *querypb.SearchRequ
 	return &internalpb.SearchResults{}, m.Err
 }
 
+func (m *GrpcQueryNodeClient) SearchSegments(ctx context.Context, in *querypb.SearchRequest, opts ...grpc.CallOption) (*internalpb.SearchResults, error) {
+	return &internalpb.SearchResults{}, m.Err
+}
+
 func (m *GrpcQueryNodeClient) Query(ctx context.Context, in *querypb.QueryRequest, opts ...grpc.CallOption) (*internalpb.RetrieveResults, error) {
 	return &internalpb.RetrieveResults{}, m.Err
+}
+
+func (m *GrpcQueryNodeClient) QueryStream(ctx context.Context, in *querypb.QueryRequest, opts ...grpc.CallOption) (querypb.QueryNode_QueryStreamClient, error) {
+	return &streamrpc.LocalQueryClient{}, m.Err
+}
+
+func (m *GrpcQueryNodeClient) QuerySegments(ctx context.Context, in *querypb.QueryRequest, opts ...grpc.CallOption) (*internalpb.RetrieveResults, error) {
+	return &internalpb.RetrieveResults{}, m.Err
+}
+
+func (m *GrpcQueryNodeClient) QueryStreamSegments(ctx context.Context, in *querypb.QueryRequest, opts ...grpc.CallOption) (querypb.QueryNode_QueryStreamSegmentsClient, error) {
+	return &streamrpc.LocalQueryClient{}, m.Err
 }
 
 func (m *GrpcQueryNodeClient) SyncReplicaSegments(ctx context.Context, in *querypb.SyncReplicaSegmentsRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
@@ -111,4 +128,12 @@ func (m *GrpcQueryNodeClient) UnsubDmChannel(ctx context.Context, req *querypb.U
 
 func (m *GrpcQueryNodeClient) Delete(ctx context.Context, in *querypb.DeleteRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	return &commonpb.Status{}, m.Err
+}
+
+func (m *GrpcQueryNodeClient) DeleteBatch(ctx context.Context, in *querypb.DeleteBatchRequest, opts ...grpc.CallOption) (*querypb.DeleteBatchResponse, error) {
+	return &querypb.DeleteBatchResponse{}, m.Err
+}
+
+func (m *GrpcQueryNodeClient) Close() error {
+	return m.Err
 }

@@ -27,6 +27,8 @@ import (
 	"github.com/milvus-io/milvus/internal/allocator"
 	"github.com/milvus-io/milvus/internal/tso"
 	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/lock"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 type IScheduler interface {
@@ -45,24 +47,44 @@ type scheduler struct {
 	tsoAllocator tso.Allocator
 
 	taskChan chan task
+	taskHeap typeutil.Heap[task]
 
 	lock sync.Mutex
 
-	minDdlTs atomic.Uint64
+	minDdlTs       atomic.Uint64
+	clusterLock    *lock.KeyLock[string]
+	databaseLock   *lock.KeyLock[string]
+	collectionLock *lock.KeyLock[string]
+	lockMapping    map[LockLevel]*lock.KeyLock[string]
+}
+
+func GetTaskHeapOrder(t task) Timestamp {
+	return t.GetTs()
 }
 
 func newScheduler(ctx context.Context, idAllocator allocator.Interface, tsoAllocator tso.Allocator) *scheduler {
 	ctx1, cancel := context.WithCancel(ctx)
 	// TODO
 	n := 1024 * 10
-	return &scheduler{
-		ctx:          ctx1,
-		cancel:       cancel,
-		idAllocator:  idAllocator,
-		tsoAllocator: tsoAllocator,
-		taskChan:     make(chan task, n),
-		minDdlTs:     *atomic.NewUint64(0),
+	taskArr := make([]task, 0)
+	s := &scheduler{
+		ctx:            ctx1,
+		cancel:         cancel,
+		idAllocator:    idAllocator,
+		tsoAllocator:   tsoAllocator,
+		taskChan:       make(chan task, n),
+		taskHeap:       typeutil.NewObjectArrayBasedMinimumHeap[task, Timestamp](taskArr, GetTaskHeapOrder),
+		minDdlTs:       *atomic.NewUint64(0),
+		clusterLock:    lock.NewKeyLock[string](),
+		databaseLock:   lock.NewKeyLock[string](),
+		collectionLock: lock.NewKeyLock[string](),
 	}
+	s.lockMapping = map[LockLevel]*lock.KeyLock[string]{
+		ClusterLock:    s.clusterLock,
+		DatabaseLock:   s.databaseLock,
+		CollectionLock: s.collectionLock,
+	}
+	return s
 }
 
 func (s *scheduler) Start() {
@@ -79,7 +101,8 @@ func (s *scheduler) Stop() {
 }
 
 func (s *scheduler) execute(task task) {
-	defer s.setMinDdlTs(task.GetTs()) // we should update ts, whatever task succeeds or not.
+	defer s.setMinDdlTs() // we should update ts, whatever task succeeds or not.
+	task.SetInQueueDuration()
 	if err := task.Prepare(task.GetCtx()); err != nil {
 		task.NotifyDone(err)
 		return
@@ -138,6 +161,7 @@ func (s *scheduler) setTs(task task) error {
 		return err
 	}
 	task.SetTs(ts)
+	s.taskHeap.Push(task)
 	return nil
 }
 
@@ -146,6 +170,13 @@ func (s *scheduler) enqueue(task task) {
 }
 
 func (s *scheduler) AddTask(task task) error {
+	if Params.RootCoordCfg.UseLockScheduler.GetAsBool() {
+		lockKey := task.GetLockerKey()
+		if lockKey != nil {
+			return s.executeTaskWithLock(task, lockKey)
+		}
+	}
+
 	// make sure that setting ts and enqueue is atomic.
 	s.lock.Lock()
 	defer s.lock.Unlock()
@@ -164,6 +195,37 @@ func (s *scheduler) GetMinDdlTs() Timestamp {
 	return s.minDdlTs.Load()
 }
 
-func (s *scheduler) setMinDdlTs(ts Timestamp) {
-	s.minDdlTs.Store(ts)
+func (s *scheduler) setMinDdlTs() {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	for s.taskHeap.Len() > 0 && s.taskHeap.Peek().IsFinished() {
+		t := s.taskHeap.Pop()
+		s.minDdlTs.Store(t.GetTs())
+	}
+}
+
+func (s *scheduler) executeTaskWithLock(task task, lockerKey LockerKey) error {
+	if lockerKey == nil {
+		if err := s.setID(task); err != nil {
+			return err
+		}
+		s.lock.Lock()
+		if err := s.setTs(task); err != nil {
+			s.lock.Unlock()
+			return err
+		}
+		s.lock.Unlock()
+		s.execute(task)
+		return nil
+	}
+	taskLock := s.lockMapping[lockerKey.Level()]
+	if lockerKey.IsWLock() {
+		taskLock.Lock(lockerKey.LockKey())
+		defer taskLock.Unlock(lockerKey.LockKey())
+	} else {
+		taskLock.RLock(lockerKey.LockKey())
+		defer taskLock.RUnlock(lockerKey.LockKey())
+	}
+	return s.executeTaskWithLock(task, lockerKey.Next())
 }

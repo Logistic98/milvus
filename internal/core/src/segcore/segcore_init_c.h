@@ -11,6 +11,9 @@
 
 #pragma once
 
+#include <stdbool.h>
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -20,6 +23,9 @@ SegcoreInit(const char*);
 
 void
 SegcoreSetChunkRows(const int64_t);
+
+void
+SegcoreSetEnableTempSegmentIndex(const bool);
 
 void
 SegcoreSetNlist(const int64_t);
@@ -32,7 +38,29 @@ char*
 SegcoreSetSimdType(const char*);
 
 void
-SegcoreSetKnowhereThreadPoolNum(const uint32_t num_threads);
+SegcoreEnableKnowhereScoreConsistency();
+
+void
+SegcoreSetKnowhereBuildThreadPoolNum(const uint32_t num_threads);
+
+void
+SegcoreSetKnowhereSearchThreadPoolNum(const uint32_t num_threads);
+
+void
+SegcoreSetKnowhereGpuMemoryPoolSize(const uint32_t init_size,
+                                    const uint32_t max_size);
+
+void
+SegcoreCloseGlog();
+
+int32_t
+GetCurrentIndexVersion();
+
+int32_t
+GetMinimalIndexVersion();
+
+void
+SetThreadName(const char*);
 
 #ifdef __cplusplus
 }

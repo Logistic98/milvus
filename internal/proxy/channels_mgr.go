@@ -19,29 +19,27 @@ package proxy
 import (
 	"context"
 	"fmt"
-	"runtime"
 	"strconv"
 	"sync"
 
-	"github.com/cockroachdb/errors"
+	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/metrics"
 	"github.com/milvus-io/milvus/pkg/mq/msgstream"
 	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/util/merr"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
-
-	"go.uber.org/zap"
 )
 
 // channelsMgr manages the pchans, vchans and related message stream of collections.
 type channelsMgr interface {
 	getChannels(collectionID UniqueID) ([]pChan, error)
 	getVChannels(collectionID UniqueID) ([]vChan, error)
-	getOrCreateDmlStream(collectionID UniqueID) (msgstream.MsgStream, error)
+	getOrCreateDmlStream(ctx context.Context, collectionID UniqueID) (msgstream.MsgStream, error)
 	removeDMLStream(collectionID UniqueID)
 	removeAllDMLStream()
 }
@@ -71,9 +69,8 @@ func removeDuplicate(ss []string) []string {
 
 func newChannels(vchans []vChan, pchans []pChan) (channelInfos, error) {
 	if len(vchans) != len(pchans) {
-		err := fmt.Errorf("physical channels mismatch virtual channels, len(VirtualChannelNames): %v, len(PhysicalChannelNames): %v", len(vchans), len(pchans))
-		log.Error(err.Error())
-		return channelInfos{}, err
+		log.Error("physical channels mismatch virtual channels", zap.Int("len(VirtualChannelNames)", len(vchans)), zap.Int("len(PhysicalChannelNames)", len(pchans)))
+		return channelInfos{}, fmt.Errorf("physical channels mismatch virtual channels, len(VirtualChannelNames): %v, len(PhysicalChannelNames): %v", len(vchans), len(pchans))
 	}
 	/*
 		// remove duplicate physical channels.
@@ -89,7 +86,7 @@ type getChannelsFuncType = func(collectionID UniqueID) (channelInfos, error)
 type repackFuncType = func(tsMsgs []msgstream.TsMsg, hashKeys [][]int32) (map[int32]*msgstream.MsgPack, error)
 
 // getDmlChannelsFunc returns a function about how to get dml channels of a collection.
-func getDmlChannelsFunc(ctx context.Context, rc types.RootCoord) getChannelsFuncType {
+func getDmlChannelsFunc(ctx context.Context, rc types.RootCoordClient) getChannelsFuncType {
 	return func(collectionID UniqueID) (channelInfos, error) {
 		req := &milvuspb.DescribeCollectionRequest{
 			Base:         commonpbutil.NewMsgBase(commonpbutil.WithMsgType(commonpb.MsgType_DescribeCollection)),
@@ -106,20 +103,12 @@ func getDmlChannelsFunc(ctx context.Context, rc types.RootCoord) getChannelsFunc
 			log.Error("failed to describe collection",
 				zap.String("error_code", resp.GetStatus().GetErrorCode().String()),
 				zap.String("reason", resp.GetStatus().GetReason()))
-			return channelInfos{}, errors.New(resp.GetStatus().GetReason())
+			return channelInfos{}, merr.Error(resp.GetStatus())
 		}
 
 		return newChannels(resp.GetVirtualChannelNames(), resp.GetPhysicalChannelNames())
 	}
 }
-
-// streamType indicates which type of message stream should be created.
-type streamType int
-
-const (
-	dmlStreamType streamType = iota
-	dqlStreamType
-)
 
 type singleTypeChannelsMgr struct {
 	infos map[UniqueID]streamInfos // collection id -> stream infos
@@ -127,7 +116,6 @@ type singleTypeChannelsMgr struct {
 
 	getChannelsFunc  getChannelsFuncType
 	repackFunc       repackFuncType
-	singleStreamType streamType
 	msgStreamFactory msgstream.Factory
 }
 
@@ -184,28 +172,19 @@ func (mgr *singleTypeChannelsMgr) streamExistPrivate(collectionID UniqueID) bool
 	return ok && streamInfos.stream != nil
 }
 
-func createStream(factory msgstream.Factory, streamType streamType, pchans []pChan, repack repackFuncType) (msgstream.MsgStream, error) {
+func createStream(ctx context.Context, factory msgstream.Factory, pchans []pChan, repack repackFuncType) (msgstream.MsgStream, error) {
 	var stream msgstream.MsgStream
 	var err error
 
-	if streamType == dqlStreamType {
-		stream, err = factory.NewQueryMsgStream(context.Background())
-	} else {
-		stream, err = factory.NewMsgStream(context.Background())
-	}
-
+	stream, err = factory.NewMsgStream(context.Background())
 	if err != nil {
 		return nil, err
 	}
 
-	stream.AsProducer(pchans)
+	stream.AsProducer(ctx, pchans)
 	if repack != nil {
 		stream.SetRepackFunc(repack)
 	}
-	runtime.SetFinalizer(stream, func(stream msgstream.MsgStream) {
-		stream.Close()
-	})
-
 	return stream, nil
 }
 
@@ -223,7 +202,7 @@ func decPChanMetrics(pchans []pChan) {
 
 // createMsgStream create message stream for specified collection. Idempotent.
 // If stream already exists, directly return it and no error will be returned.
-func (mgr *singleTypeChannelsMgr) createMsgStream(collectionID UniqueID) (msgstream.MsgStream, error) {
+func (mgr *singleTypeChannelsMgr) createMsgStream(ctx context.Context, collectionID UniqueID) (msgstream.MsgStream, error) {
 	mgr.mu.RLock()
 	infos, ok := mgr.infos[collectionID]
 	if ok && infos.stream != nil {
@@ -240,7 +219,7 @@ func (mgr *singleTypeChannelsMgr) createMsgStream(collectionID UniqueID) (msgstr
 		return nil, err
 	}
 
-	stream, err := createStream(mgr.msgStreamFactory, mgr.singleStreamType, channelInfos.pchans, mgr.repackFunc)
+	stream, err := createStream(ctx, mgr.msgStreamFactory, channelInfos.pchans, mgr.repackFunc)
 	if err != nil {
 		// What if stream created by other goroutines?
 		log.Error("failed to create message stream", zap.Error(err), zap.Int64("collection", collectionID))
@@ -255,6 +234,8 @@ func (mgr *singleTypeChannelsMgr) createMsgStream(collectionID UniqueID) (msgstr
 			zap.Strings("physical_channels", channelInfos.pchans))
 		mgr.infos[collectionID] = streamInfos{channelInfos: channelInfos, stream: stream}
 		incPChansMetrics(channelInfos.pchans)
+	} else {
+		stream.Close()
 	}
 
 	return mgr.infos[collectionID].stream, nil
@@ -271,13 +252,13 @@ func (mgr *singleTypeChannelsMgr) lockGetStream(collectionID UniqueID) (msgstrea
 }
 
 // getOrCreateStream get message stream of specified collection.
-// If stream don't exists, call createMsgStream to create for it.
-func (mgr *singleTypeChannelsMgr) getOrCreateStream(collectionID UniqueID) (msgstream.MsgStream, error) {
+// If stream doesn't exist, call createMsgStream to create for it.
+func (mgr *singleTypeChannelsMgr) getOrCreateStream(ctx context.Context, collectionID UniqueID) (msgstream.MsgStream, error) {
 	if stream, err := mgr.lockGetStream(collectionID); err == nil {
 		return stream, nil
 	}
 
-	return mgr.createMsgStream(collectionID)
+	return mgr.createMsgStream(ctx, collectionID)
 }
 
 // removeStream remove the corresponding stream of the specified collection. Idempotent.
@@ -309,13 +290,11 @@ func newSingleTypeChannelsMgr(
 	getChannelsFunc getChannelsFuncType,
 	msgStreamFactory msgstream.Factory,
 	repackFunc repackFuncType,
-	singleStreamType streamType,
 ) *singleTypeChannelsMgr {
 	return &singleTypeChannelsMgr{
 		infos:            make(map[UniqueID]streamInfos),
 		getChannelsFunc:  getChannelsFunc,
 		repackFunc:       repackFunc,
-		singleStreamType: singleStreamType,
 		msgStreamFactory: msgStreamFactory,
 	}
 }
@@ -336,8 +315,8 @@ func (mgr *channelsMgrImpl) getVChannels(collectionID UniqueID) ([]vChan, error)
 	return mgr.dmlChannelsMgr.getVChannels(collectionID)
 }
 
-func (mgr *channelsMgrImpl) getOrCreateDmlStream(collectionID UniqueID) (msgstream.MsgStream, error) {
-	return mgr.dmlChannelsMgr.getOrCreateStream(collectionID)
+func (mgr *channelsMgrImpl) getOrCreateDmlStream(ctx context.Context, collectionID UniqueID) (msgstream.MsgStream, error) {
+	return mgr.dmlChannelsMgr.getOrCreateStream(ctx, collectionID)
 }
 
 func (mgr *channelsMgrImpl) removeDMLStream(collectionID UniqueID) {
@@ -355,6 +334,6 @@ func newChannelsMgrImpl(
 	msgStreamFactory msgstream.Factory,
 ) *channelsMgrImpl {
 	return &channelsMgrImpl{
-		dmlChannelsMgr: newSingleTypeChannelsMgr(getDmlChannelsFunc, msgStreamFactory, dmlRepackFunc, dmlStreamType),
+		dmlChannelsMgr: newSingleTypeChannelsMgr(getDmlChannelsFunc, msgStreamFactory, dmlRepackFunc),
 	}
 }

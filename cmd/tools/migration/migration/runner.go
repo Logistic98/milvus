@@ -7,20 +7,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/milvus-io/milvus/internal/util/sessionutil"
+	"github.com/blang/semver/v4"
+	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/atomic"
 
-	"github.com/milvus-io/milvus/cmd/tools/migration/versions"
-
-	"github.com/blang/semver/v4"
-
-	"github.com/milvus-io/milvus/cmd/tools/migration/configs"
-
-	"github.com/milvus-io/milvus/cmd/tools/migration/console"
-
 	"github.com/milvus-io/milvus/cmd/tools/migration/backend"
-	clientv3 "go.etcd.io/etcd/client/v3"
-
+	"github.com/milvus-io/milvus/cmd/tools/migration/configs"
+	"github.com/milvus-io/milvus/cmd/tools/migration/console"
+	"github.com/milvus-io/milvus/cmd/tools/migration/versions"
+	"github.com/milvus-io/milvus/internal/util/sessionutil"
 	"github.com/milvus-io/milvus/pkg/util/etcd"
 )
 
@@ -73,8 +68,11 @@ func (r *Runner) WatchSessions() {
 }
 
 func (r *Runner) initEtcdCli() {
-	cli, err := etcd.GetEtcdClient(
+	cli, err := etcd.CreateEtcdClient(
 		r.cfg.EtcdCfg.UseEmbedEtcd.GetAsBool(),
+		r.cfg.EtcdCfg.EtcdEnableAuth.GetAsBool(),
+		r.cfg.EtcdCfg.EtcdAuthUserName.GetValue(),
+		r.cfg.EtcdCfg.EtcdAuthPassword.GetValue(),
 		r.cfg.EtcdCfg.EtcdUseSSL.GetAsBool(),
 		r.cfg.EtcdCfg.Endpoints.GetAsStrings(),
 		r.cfg.EtcdCfg.EtcdTLSCert.GetValue(),
@@ -87,8 +85,7 @@ func (r *Runner) initEtcdCli() {
 
 func (r *Runner) init() {
 	r.initEtcdCli()
-
-	r.session = sessionutil.NewSession(
+	r.session = sessionutil.NewSessionWithEtcd(
 		r.ctx,
 		r.cfg.EtcdCfg.MetaRootPath.GetValue(),
 		r.etcdCli,

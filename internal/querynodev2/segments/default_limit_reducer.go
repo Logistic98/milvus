@@ -3,10 +3,11 @@ package segments
 import (
 	"context"
 
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/internal/proto/segcorepb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/util/reduce"
+	"github.com/milvus-io/milvus/pkg/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/proto/segcorepb"
 )
 
 type defaultLimitReducer struct {
@@ -14,8 +15,26 @@ type defaultLimitReducer struct {
 	schema *schemapb.CollectionSchema
 }
 
+type mergeParam struct {
+	limit          int64
+	outputFieldsId []int64
+	schema         *schemapb.CollectionSchema
+	reduceType     reduce.IReduceType
+}
+
+func NewMergeParam(limit int64, outputFieldsId []int64, schema *schemapb.CollectionSchema, reduceType reduce.IReduceType) *mergeParam {
+	return &mergeParam{
+		limit:          limit,
+		outputFieldsId: outputFieldsId,
+		schema:         schema,
+		reduceType:     reduceType,
+	}
+}
+
 func (r *defaultLimitReducer) Reduce(ctx context.Context, results []*internalpb.RetrieveResults) (*internalpb.RetrieveResults, error) {
-	return mergeInternalRetrieveResultsAndFillIfEmpty(ctx, results, r.req.GetReq().GetLimit(), r.req.GetReq().GetOutputFieldsId(), r.schema)
+	reduceParam := NewMergeParam(r.req.GetReq().GetLimit(), r.req.GetReq().GetOutputFieldsId(),
+		r.schema, reduce.ToReduceType(r.req.GetReq().GetReduceType()))
+	return mergeInternalRetrieveResultsAndFillIfEmpty(ctx, results, reduceParam)
 }
 
 func newDefaultLimitReducer(req *querypb.QueryRequest, schema *schemapb.CollectionSchema) *defaultLimitReducer {
@@ -26,17 +45,20 @@ func newDefaultLimitReducer(req *querypb.QueryRequest, schema *schemapb.Collecti
 }
 
 type defaultLimitReducerSegcore struct {
-	req    *querypb.QueryRequest
-	schema *schemapb.CollectionSchema
+	req     *querypb.QueryRequest
+	schema  *schemapb.CollectionSchema
+	manager *Manager
 }
 
-func (r *defaultLimitReducerSegcore) Reduce(ctx context.Context, results []*segcorepb.RetrieveResults) (*segcorepb.RetrieveResults, error) {
-	return mergeSegcoreRetrieveResultsAndFillIfEmpty(ctx, results, r.req.GetReq().GetLimit(), r.req.GetReq().GetOutputFieldsId(), r.schema)
+func (r *defaultLimitReducerSegcore) Reduce(ctx context.Context, results []*segcorepb.RetrieveResults, segments []Segment, plan *RetrievePlan) (*segcorepb.RetrieveResults, error) {
+	mergeParam := NewMergeParam(r.req.GetReq().GetLimit(), r.req.GetReq().GetOutputFieldsId(), r.schema, reduce.ToReduceType(r.req.GetReq().GetReduceType()))
+	return mergeSegcoreRetrieveResultsAndFillIfEmpty(ctx, results, mergeParam, segments, plan, r.manager)
 }
 
-func newDefaultLimitReducerSegcore(req *querypb.QueryRequest, schema *schemapb.CollectionSchema) *defaultLimitReducerSegcore {
+func newDefaultLimitReducerSegcore(req *querypb.QueryRequest, schema *schemapb.CollectionSchema, manager *Manager) *defaultLimitReducerSegcore {
 	return &defaultLimitReducerSegcore{
-		req:    req,
-		schema: schema,
+		req:     req,
+		schema:  schema,
+		manager: manager,
 	}
 }

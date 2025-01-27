@@ -21,16 +21,20 @@
 #include <utility>
 #include <vector>
 #include <string>
+#include <map>
+
 #include "index/IndexStructure.h"
 #include "index/ScalarIndex.h"
+#include "storage/MemFileManagerImpl.h"
 
 namespace milvus::index {
 
 template <typename T>
 class ScalarIndexSort : public ScalarIndex<T> {
  public:
-    ScalarIndexSort();
-    ScalarIndexSort(size_t n, const T* values);
+    explicit ScalarIndexSort(
+        const storage::FileManagerContext& file_manager_context =
+            storage::FileManagerContext());
 
     BinarySet
     Serialize(const Config& config) override;
@@ -38,36 +42,68 @@ class ScalarIndexSort : public ScalarIndex<T> {
     void
     Load(const BinarySet& index_binary, const Config& config = {}) override;
 
+    void
+    Load(milvus::tracer::TraceContext ctx, const Config& config = {}) override;
+
     int64_t
     Count() override {
-        return data_.size();
+        return total_num_rows_;
+    }
+
+    ScalarIndexType
+    GetIndexType() const override {
+        return ScalarIndexType::STLSORT;
     }
 
     void
-    Build(size_t n, const T* values) override;
+    Build(size_t n, const T* values, const bool* valid_data = nullptr) override;
 
-    const TargetBitmapPtr
+    void
+    Build(const Config& config = {}) override;
+
+    const TargetBitmap
     In(size_t n, const T* values) override;
 
-    const TargetBitmapPtr
+    const TargetBitmap
     NotIn(size_t n, const T* values) override;
 
-    const TargetBitmapPtr
+    const TargetBitmap
+    IsNull() override;
+
+    const TargetBitmap
+    IsNotNull() override;
+
+    const TargetBitmap
     Range(T value, OpType op) override;
 
-    const TargetBitmapPtr
+    const TargetBitmap
     Range(T lower_bound_value,
           bool lb_inclusive,
           T upper_bound_value,
           bool ub_inclusive) override;
 
-    T
+    std::optional<T>
     Reverse_Lookup(size_t offset) const override;
 
     int64_t
     Size() override {
         return (int64_t)data_.size();
     }
+
+    IndexStatsPtr
+    Upload(const Config& config = {}) override;
+
+    const bool
+    HasRawData() const override {
+        return true;
+    }
+
+    void
+    BuildWithFieldData(const std::vector<FieldDataPtr>& datas) override;
+
+ private:
+    bool
+    ShouldSkip(const T lower_value, const T upper_value, const OpType op);
 
  public:
     const std::vector<IndexStructure<T>>&
@@ -80,11 +116,19 @@ class ScalarIndexSort : public ScalarIndex<T> {
         return is_built_;
     }
 
+    void
+    LoadWithoutAssemble(const BinarySet& binary_set,
+                        const Config& config) override;
+
  private:
     bool is_built_;
     Config config_;
     std::vector<int32_t> idx_to_offsets_;  // used to retrieve.
     std::vector<IndexStructure<T>> data_;
+    std::shared_ptr<storage::MemFileManagerImpl> file_manager_;
+    size_t total_num_rows_{0};
+    // generate valid_bitset_ to speed up NotIn and IsNull and IsNotNull operate
+    TargetBitmap valid_bitset_;
 };
 
 template <typename T>
@@ -92,12 +136,11 @@ using ScalarIndexSortPtr = std::unique_ptr<ScalarIndexSort<T>>;
 
 }  // namespace milvus::index
 
-#include "index/ScalarIndexSort-inl.h"
-
 namespace milvus::index {
 template <typename T>
 inline ScalarIndexSortPtr<T>
-CreateScalarIndexSort() {
-    return std::make_unique<ScalarIndexSort<T>>();
+CreateScalarIndexSort(const storage::FileManagerContext& file_manager_context =
+                          storage::FileManagerContext()) {
+    return std::make_unique<ScalarIndexSort<T>>(file_manager_context);
 }
 }  // namespace milvus::index

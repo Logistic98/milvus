@@ -17,41 +17,46 @@
 package indexnode
 
 /*
-#cgo pkg-config: milvus_common milvus_indexbuilder
+#cgo pkg-config: milvus_core
 
 #include <stdlib.h>
 #include <stdint.h>
 #include "common/init_c.h"
+#include "segcore/segcore_init_c.h"
 #include "indexbuilder/init_c.h"
 */
 import "C"
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"os"
 	"path"
+	"path/filepath"
 	"sync"
-	"syscall"
 	"time"
 	"unsafe"
 
 	"github.com/cockroachdb/errors"
-	"github.com/milvus-io/milvus/internal/util/sessionutil"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus/internal/flushcommon/io"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/dependency"
 	"github.com/milvus-io/milvus/internal/util/initcore"
+	"github.com/milvus-io/milvus/internal/util/sessionutil"
 	"github.com/milvus-io/milvus/pkg/common"
 	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/metrics"
+	"github.com/milvus-io/milvus/pkg/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/util/expr"
 	"github.com/milvus-io/milvus/pkg/util/hardware"
 	"github.com/milvus-io/milvus/pkg/util/lifetime"
+	"github.com/milvus-io/milvus/pkg/util/merr"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
@@ -69,9 +74,25 @@ var _ types.IndexNodeComponent = (*IndexNode)(nil)
 // Params is a GlobalParamTable singleton of indexnode
 var Params *paramtable.ComponentParam = paramtable.Get()
 
+func getCurrentIndexVersion(v int32) int32 {
+	cCurrent := int32(C.GetCurrentIndexVersion())
+	if cCurrent < v {
+		return cCurrent
+	}
+	return v
+}
+
+func getCurrentScalarIndexVersion(v int32) int32 {
+	cCurrent := common.CurrentScalarIndexEngineVersion
+	if cCurrent < v {
+		return cCurrent
+	}
+	return v
+}
+
 type taskKey struct {
 	ClusterID string
-	BuildID   UniqueID
+	TaskID    UniqueID
 }
 
 // IndexNode is a component that executes the task of building indexes.
@@ -93,27 +114,34 @@ type IndexNode struct {
 	etcdCli *clientv3.Client
 	address string
 
-	initOnce  sync.Once
-	stateLock sync.Mutex
-	tasks     map[taskKey]*taskInfo
+	binlogIO io.BinlogIO
+
+	initOnce     sync.Once
+	stateLock    sync.Mutex
+	indexTasks   map[taskKey]*indexTaskInfo
+	analyzeTasks map[taskKey]*analyzeTaskInfo
+	statsTasks   map[taskKey]*statsTaskInfo
 }
 
 // NewIndexNode creates a new IndexNode component.
 func NewIndexNode(ctx context.Context, factory dependency.Factory) *IndexNode {
-	log.Debug("New IndexNode ...")
+	log.Ctx(ctx).Debug("New IndexNode ...")
 	rand.Seed(time.Now().UnixNano())
 	ctx1, cancel := context.WithCancel(ctx)
 	b := &IndexNode{
 		loopCtx:        ctx1,
 		loopCancel:     cancel,
 		factory:        factory,
-		storageFactory: &chunkMgr{},
-		tasks:          map[taskKey]*taskInfo{},
+		storageFactory: NewChunkMgrFactory(),
+		indexTasks:     make(map[taskKey]*indexTaskInfo),
+		analyzeTasks:   make(map[taskKey]*analyzeTaskInfo),
+		statsTasks:     make(map[taskKey]*statsTaskInfo),
 		lifetime:       lifetime.NewLifetime(commonpb.StateCode_Abnormal),
 	}
 	sc := NewTaskScheduler(b.loopCtx)
 
 	b.sched = sc
+	expr.Register("indexnode", b)
 	return b
 }
 
@@ -121,26 +149,19 @@ func NewIndexNode(ctx context.Context, factory dependency.Factory) *IndexNode {
 func (i *IndexNode) Register() error {
 	i.session.Register()
 
-	//start liveness check
+	metrics.NumNodes.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), typeutil.IndexNodeRole).Inc()
+	// start liveness check
 	i.session.LivenessCheck(i.loopCtx, func() {
-		log.Error("Index Node disconnected from etcd, process will exit", zap.Int64("Server Id", i.session.ServerID))
-		if err := i.Stop(); err != nil {
-			log.Fatal("failed to stop server", zap.Error(err))
-		}
-		// manually send signal to starter goroutine
-		if i.session.TriggerKill {
-			if p, err := os.FindProcess(os.Getpid()); err == nil {
-				p.Signal(syscall.SIGINT)
-			}
-		}
+		log.Ctx(i.loopCtx).Error("Index Node disconnected from etcd, process will exit", zap.Int64("Server Id", i.session.ServerID))
+		os.Exit(1)
 	})
 	return nil
 }
 
-func (i *IndexNode) initKnowhere() {
-	cEasyloggingYaml := C.CString(path.Join(Params.BaseTable.GetConfigDir(), paramtable.DefaultEasyloggingYaml))
-	C.IndexBuilderInit(cEasyloggingYaml)
-	C.free(unsafe.Pointer(cEasyloggingYaml))
+func (i *IndexNode) initSegcore() {
+	cGlogConf := C.CString(path.Join(paramtable.GetBaseTable().GetConfigDir(), paramtable.DefaultGlogConf))
+	C.IndexBuilderInit(cGlogConf)
+	C.free(unsafe.Pointer(cGlogConf))
 
 	// override index builder SIMD type
 	cSimdType := C.CString(Params.CommonCfg.SimdType.GetValue())
@@ -151,21 +172,45 @@ func (i *IndexNode) initKnowhere() {
 	cIndexSliceSize := C.int64_t(Params.CommonCfg.IndexSliceSize.GetAsInt64())
 	C.InitIndexSliceSize(cIndexSliceSize)
 
-	cThreadCoreCoefficient := C.int64_t(Params.CommonCfg.ThreadCoreCoefficient.GetAsInt64())
-	C.InitThreadCoreCoefficient(cThreadCoreCoefficient)
+	// set up thread pool for different priorities
+	cHighPriorityThreadCoreCoefficient := C.int64_t(paramtable.Get().CommonCfg.HighPriorityThreadCoreCoefficient.GetAsInt64())
+	C.InitHighPriorityThreadCoreCoefficient(cHighPriorityThreadCoreCoefficient)
+	cMiddlePriorityThreadCoreCoefficient := C.int64_t(paramtable.Get().CommonCfg.MiddlePriorityThreadCoreCoefficient.GetAsInt64())
+	C.InitMiddlePriorityThreadCoreCoefficient(cMiddlePriorityThreadCoreCoefficient)
+	cLowPriorityThreadCoreCoefficient := C.int64_t(paramtable.Get().CommonCfg.LowPriorityThreadCoreCoefficient.GetAsInt64())
+	C.InitLowPriorityThreadCoreCoefficient(cLowPriorityThreadCoreCoefficient)
 
 	cCPUNum := C.int(hardware.GetCPUNum())
 	C.InitCpuNum(cCPUNum)
 
-	initcore.InitLocalStorageConfig(Params)
+	cKnowhereThreadPoolSize := C.uint32_t(hardware.GetCPUNum() * paramtable.DefaultKnowhereThreadPoolNumRatioInBuild)
+	if paramtable.GetRole() == typeutil.StandaloneRole {
+		threadPoolSize := int(float64(hardware.GetCPUNum()) * Params.CommonCfg.BuildIndexThreadPoolRatio.GetAsFloat())
+		if threadPoolSize < 1 {
+			threadPoolSize = 1
+		}
+		cKnowhereThreadPoolSize = C.uint32_t(threadPoolSize)
+	}
+	C.SegcoreSetKnowhereBuildThreadPoolNum(cKnowhereThreadPoolSize)
+
+	localDataRootPath := filepath.Join(Params.LocalStorageCfg.Path.GetValue(), typeutil.IndexNodeRole)
+	initcore.InitLocalChunkManager(localDataRootPath)
+	cGpuMemoryPoolInitSize := C.uint32_t(paramtable.Get().GpuConfig.InitSize.GetAsUint32())
+	cGpuMemoryPoolMaxSize := C.uint32_t(paramtable.Get().GpuConfig.MaxSize.GetAsUint32())
+	C.SegcoreSetKnowhereGpuMemoryPoolSize(cGpuMemoryPoolInitSize, cGpuMemoryPoolMaxSize)
+}
+
+func (i *IndexNode) CloseSegcore() {
+	initcore.CleanGlogManager()
 }
 
 func (i *IndexNode) initSession() error {
-	i.session = sessionutil.NewSession(i.loopCtx, Params.EtcdCfg.MetaRootPath.GetValue(), i.etcdCli)
+	i.session = sessionutil.NewSession(i.loopCtx, sessionutil.WithEnableDisk(Params.IndexNodeCfg.EnableDisk.GetAsBool()))
 	if i.session == nil {
 		return errors.New("failed to initialize session")
 	}
 	i.session.Init(typeutil.IndexNodeRole, i.address, false, true)
+	sessionutil.SaveServerInfo(typeutil.IndexNodeRole, i.session.ServerID)
 	return nil
 }
 
@@ -177,25 +222,16 @@ func (i *IndexNode) Init() error {
 		log.Info("IndexNode init", zap.String("state", i.lifetime.GetState().String()))
 		err := i.initSession()
 		if err != nil {
-			log.Error(err.Error())
+			log.Error("failed to init session", zap.Error(err))
 			initErr = err
 			return
 		}
 		log.Info("IndexNode init session successful", zap.Int64("serverID", i.session.ServerID))
 
-		if err != nil {
-			log.Error("IndexNode NewMinIOKV failed", zap.Error(err))
-			initErr = err
-			return
-		}
-
-		log.Info("IndexNode NewMinIOKV succeeded")
-
-		i.initKnowhere()
+		i.initSegcore()
 	})
 
-	log.Info("Init IndexNode finished", zap.Error(initErr))
-
+	log.Info("init index node done", zap.Int64("nodeID", paramtable.GetNodeID()), zap.String("Address", i.address))
 	return initErr
 }
 
@@ -206,11 +242,32 @@ func (i *IndexNode) Start() error {
 		startErr = i.sched.Start()
 
 		i.UpdateStateCode(commonpb.StateCode_Healthy)
-		log.Info("IndexNode", zap.Any("State", i.lifetime.GetState().String()))
+		log.Info("IndexNode", zap.String("State", i.lifetime.GetState().String()))
 	})
 
 	log.Info("IndexNode start finished", zap.Error(startErr))
 	return startErr
+}
+
+func (i *IndexNode) deleteAllTasks() {
+	deletedIndexTasks := i.deleteAllIndexTasks()
+	for _, t := range deletedIndexTasks {
+		if t.cancel != nil {
+			t.cancel()
+		}
+	}
+	deletedAnalyzeTasks := i.deleteAllAnalyzeTasks()
+	for _, t := range deletedAnalyzeTasks {
+		if t.cancel != nil {
+			t.cancel()
+		}
+	}
+	deletedStatsTasks := i.deleteAllStatsTasks()
+	for _, t := range deletedStatsTasks {
+		if t.cancel != nil {
+			t.cancel()
+		}
+	}
 }
 
 // Stop closes the server.
@@ -230,13 +287,8 @@ func (i *IndexNode) Stop() error {
 		i.lifetime.Wait()
 		log.Info("Index node abnormal")
 		// cleanup all running tasks
-		deletedTasks := i.deleteAllTasks()
-		for _, task := range deletedTasks {
-			if task.cancel != nil {
-				task.cancel()
-			}
-		}
-		i.loopCancel()
+		i.deleteAllTasks()
+
 		if i.sched != nil {
 			i.sched.Close()
 		}
@@ -244,6 +296,8 @@ func (i *IndexNode) Stop() error {
 			i.session.Stop()
 		}
 
+		i.CloseSegcore()
+		i.loopCancel()
 		log.Info("Index node stopped.")
 	})
 	return nil
@@ -260,7 +314,7 @@ func (i *IndexNode) SetEtcdClient(client *clientv3.Client) {
 }
 
 // GetComponentStates gets the component states of IndexNode.
-func (i *IndexNode) GetComponentStates(ctx context.Context) (*milvuspb.ComponentStates, error) {
+func (i *IndexNode) GetComponentStates(ctx context.Context, req *milvuspb.GetComponentStatesRequest) (*milvuspb.ComponentStates, error) {
 	log.RatedInfo(10, "get IndexNode components states ...")
 	nodeID := common.NotRegisteredID
 	if i.session != nil && i.session.Registered() {
@@ -276,9 +330,7 @@ func (i *IndexNode) GetComponentStates(ctx context.Context) (*milvuspb.Component
 	ret := &milvuspb.ComponentStates{
 		State:              stateInfo,
 		SubcomponentStates: nil, // todo add subcomponents states
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-		},
+		Status:             merr.Success(),
 	}
 
 	log.RatedInfo(10, "IndexNode Component states",
@@ -289,23 +341,19 @@ func (i *IndexNode) GetComponentStates(ctx context.Context) (*milvuspb.Component
 }
 
 // GetTimeTickChannel gets the time tick channel of IndexNode.
-func (i *IndexNode) GetTimeTickChannel(ctx context.Context) (*milvuspb.StringResponse, error) {
+func (i *IndexNode) GetTimeTickChannel(ctx context.Context, req *internalpb.GetTimeTickChannelRequest) (*milvuspb.StringResponse, error) {
 	log.RatedInfo(10, "get IndexNode time tick channel ...")
 
 	return &milvuspb.StringResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-		},
+		Status: merr.Success(),
 	}, nil
 }
 
 // GetStatisticsChannel gets the statistics channel of IndexNode.
-func (i *IndexNode) GetStatisticsChannel(ctx context.Context) (*milvuspb.StringResponse, error) {
+func (i *IndexNode) GetStatisticsChannel(ctx context.Context, req *internalpb.GetStatisticsChannelRequest) (*milvuspb.StringResponse, error) {
 	log.RatedInfo(10, "get IndexNode statistics channel ...")
 	return &milvuspb.StringResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-		},
+		Status: merr.Success(),
 	}, nil
 }
 
@@ -315,20 +363,18 @@ func (i *IndexNode) GetNodeID() int64 {
 
 // ShowConfigurations returns the configurations of indexNode matching req.Pattern
 func (i *IndexNode) ShowConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error) {
-	if !i.lifetime.Add(commonpbutil.IsHealthyOrStopping) {
+	if err := i.lifetime.Add(merr.IsHealthyOrStopping); err != nil {
 		log.Warn("IndexNode.ShowConfigurations failed",
 			zap.Int64("nodeId", paramtable.GetNodeID()),
 			zap.String("req", req.Pattern),
-			zap.Error(errIndexNodeIsUnhealthy(paramtable.GetNodeID())))
+			zap.Error(err))
 
 		return &internalpb.ShowConfigurationsResponse{
-			Status: &commonpb.Status{
-				ErrorCode: commonpb.ErrorCode_UnexpectedError,
-				Reason:    msgIndexNodeIsUnhealthy(paramtable.GetNodeID()),
-			},
+			Status:        merr.Status(err),
 			Configuations: nil,
 		}, nil
 	}
+	defer i.lifetime.Done()
 
 	configList := make([]*commonpb.KeyValuePair, 0)
 	for key, value := range Params.GetComponentConfigurations("indexnode", req.Pattern) {
@@ -340,10 +386,7 @@ func (i *IndexNode) ShowConfigurations(ctx context.Context, req *internalpb.Show
 	}
 
 	return &internalpb.ShowConfigurationsResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-			Reason:    "",
-		},
+		Status:        merr.Success(),
 		Configuations: configList,
 	}, nil
 }

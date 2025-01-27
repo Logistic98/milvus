@@ -6,20 +6,19 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/milvus-io/milvus/cmd/tools/migration/legacy/legacypb"
+	"go.uber.org/zap"
 
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus/cmd/tools/migration/allocator"
-
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
+	"github.com/milvus-io/milvus/cmd/tools/migration/legacy/legacypb"
 	"github.com/milvus-io/milvus/cmd/tools/migration/versions"
 	"github.com/milvus-io/milvus/internal/metastore/model"
-	pb "github.com/milvus-io/milvus/internal/proto/etcdpb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/common"
 	"github.com/milvus-io/milvus/pkg/log"
+	pb "github.com/milvus-io/milvus/pkg/proto/etcdpb"
+	"github.com/milvus-io/milvus/pkg/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
-	"go.uber.org/zap"
 )
 
 func alias210ToAlias220(record *pb.CollectionInfo, ts Timestamp) *model.Alias {
@@ -183,7 +182,7 @@ func combineToCollectionIndexesMeta220(fieldIndexes FieldIndexes210, collectionI
 				newIndexName = "_default_idx_" + strconv.FormatInt(index.GetFiledID(), 10)
 			}
 			record := &model.Index{
-				TenantID:        "", // TODO: how to set this if we support mysql later?
+				TenantID:        "",
 				CollectionID:    collectionID,
 				FieldID:         index.GetFiledID(),
 				IndexID:         index.GetIndexID(),
@@ -252,21 +251,21 @@ func combineToSegmentIndexesMeta220(segmentIndexes SegmentIndexesMeta210, indexB
 			}
 
 			segmentIndexModel := &model.SegmentIndex{
-				SegmentID:     segID,
-				CollectionID:  record.GetCollectionID(),
-				PartitionID:   record.GetPartitionID(),
-				NumRows:       buildMeta.GetReq().GetNumRows(),
-				IndexID:       indexID,
-				BuildID:       record.GetBuildID(),
-				NodeID:        buildMeta.GetNodeID(),
-				IndexVersion:  buildMeta.GetIndexVersion(),
-				IndexState:    buildMeta.GetState(),
-				FailReason:    buildMeta.GetFailReason(),
-				IsDeleted:     buildMeta.GetMarkDeleted(),
-				CreateTime:    record.GetCreateTime(),
-				IndexFileKeys: fileKeys,
-				IndexSize:     buildMeta.GetSerializeSize(),
-				WriteHandoff:  buildMeta.GetState() == commonpb.IndexState_Finished,
+				SegmentID:           segID,
+				CollectionID:        record.GetCollectionID(),
+				PartitionID:         record.GetPartitionID(),
+				NumRows:             buildMeta.GetReq().GetNumRows(),
+				IndexID:             indexID,
+				BuildID:             record.GetBuildID(),
+				NodeID:              buildMeta.GetNodeID(),
+				IndexVersion:        buildMeta.GetIndexVersion(),
+				IndexState:          buildMeta.GetState(),
+				FailReason:          buildMeta.GetFailReason(),
+				IsDeleted:           buildMeta.GetMarkDeleted(),
+				CreatedUTCTime:      record.GetCreateTime(),
+				IndexFileKeys:       fileKeys,
+				IndexSerializedSize: buildMeta.GetSerializeSize(),
+				WriteHandoff:        buildMeta.GetState() == commonpb.IndexState_Finished,
 			}
 			segmentIndexModels.AddRecord(segID, indexID, segmentIndexModel)
 		}

@@ -12,7 +12,7 @@
 #-------------------------------------------------------------------------------
 # Using default c and cxx compiler in our build tree
 # Thirdpart cxx and c flags
-append_flags(CMAKE_CXX_FLAGS FLAGS "-O3 -fPIC -Wno-error -fopenmp")
+append_flags(CMAKE_CXX_FLAGS FLAGS "-O3 -fPIC -Wno-error -fopenmp -Wno-macro-redefined")
 
 if (NOT KNOWHERE_VERBOSE_THIRDPARTY_BUILD)
     set(EP_LOG_OPTIONS LOG_CONFIGURE 1 LOG_BUILD 1 LOG_INSTALL 1 LOG_DOWNLOAD 1)
@@ -26,15 +26,7 @@ include(FetchContent)
 set(FETCHCONTENT_BASE_DIR  ${MILVUS_BINARY_DIR}/3rdparty_download)
 set(FETCHCONTENT_QUIET     OFF)
 
-if(CUSTOM_THIRDPARTY_DOWNLOAD_PATH)
-    set(THIRDPARTY_DOWNLOAD_PATH ${CUSTOM_THIRDPARTY_DOWNLOAD_PATH})
-else()
-    set(THIRDPARTY_DOWNLOAD_PATH ${CMAKE_BINARY_DIR}/3rdparty_download/download)
-endif()
-message(STATUS "Thirdparty downloaded file path: ${THIRDPARTY_DOWNLOAD_PATH}")
-# ----------------------------------------------------------------------
 # Find pthreads
-
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
@@ -42,7 +34,15 @@ add_subdirectory(knowhere)
 
 add_subdirectory(boost_ext)
 add_subdirectory(rocksdb)
+add_subdirectory(rdkafka)
+add_subdirectory(simdjson)
+if (USE_OPENDAL)
+    add_subdirectory(opendal)
+endif()
+add_subdirectory(tantivy)
 
 if (LINUX)
     add_subdirectory(jemalloc)
 endif()
+
+add_subdirectory(milvus-storage)

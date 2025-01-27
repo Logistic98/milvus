@@ -23,18 +23,27 @@ const (
 	LowPriority    = NormalPriority + 10
 )
 
+type ConfigManager interface {
+	EvictCacheValueByFormat(keys ...string)
+}
+
 type Source interface {
 	GetConfigurations() (map[string]string, error)
 	GetConfigurationByKey(string) (string, error)
 	GetPriority() int
 	GetSourceName() string
 	SetEventHandler(eh EventHandler)
+	SetManager(m ConfigManager)
+	UpdateOptions(opt Options)
 	Close()
 }
 
 // EtcdInfo has attribute for config center source initialization
 type EtcdInfo struct {
 	UseEmbed   bool
+	EnableAuth bool
+	UserName   string
+	PassWord   string
 	UseSSL     bool
 	Endpoints  []string
 	KeyPrefix  string
@@ -43,7 +52,7 @@ type EtcdInfo struct {
 	CaCertFile string
 	MinVersion string
 
-	//Pull Configuration interval, unit is second
+	// Pull Configuration interval, unit is second
 	RefreshInterval time.Duration
 }
 

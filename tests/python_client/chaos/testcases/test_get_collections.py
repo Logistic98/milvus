@@ -2,9 +2,10 @@ import time
 import json
 from collections import defaultdict
 import pytest
-
+from pymilvus import Collection
 from base.client_base import TestcaseBase
 from deploy.common import get_chaos_test_collections
+from chaos import constants
 from common.common_type import CaseLabel
 from utils.util_log import test_log as log
 
@@ -16,9 +17,11 @@ class TestGetCollections(TestcaseBase):
     def test_get_collections_by_prefix(self,):
         self._connect()
         all_collections = self.utility_wrap.list_collections()[0]
-        all_collections = [c_name for c_name in all_collections if "Checker" in c_name]
+        all_collections = [c_name for c_name in all_collections if c_name.startswith("Checker")]
         selected_collections_map = {}
         for c_name in all_collections:
+            if Collection(name=c_name).num_entities < constants.ENTITIES_FOR_SEARCH:
+                continue
             prefix = c_name.split("_")[0]
             if prefix not in selected_collections_map:
                 selected_collections_map[prefix] = [c_name]

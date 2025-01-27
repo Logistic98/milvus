@@ -21,15 +21,23 @@
 #include <string>
 #include <vector>
 #include <boost/dynamic_bitset.hpp>
-#include "knowhere/factory.h"
+#include "common/Types.h"
+#include "knowhere/index/index_factory.h"
 #include "index/VectorIndex.h"
+#include "storage/MemFileManagerImpl.h"
+#include "index/IndexInfo.h"
 
 namespace milvus::index {
 
+template <typename T>
 class VectorMemIndex : public VectorIndex {
  public:
-    explicit VectorMemIndex(const IndexType& index_type,
-                            const MetricType& metric_type);
+    explicit VectorMemIndex(
+        const IndexType& index_type,
+        const MetricType& metric_type,
+        const IndexVersion& version,
+        const storage::FileManagerContext& file_manager_context =
+            storage::FileManagerContext());
 
     BinarySet
     Serialize(const Config& config) override;
@@ -38,23 +46,62 @@ class VectorMemIndex : public VectorIndex {
     Load(const BinarySet& binary_set, const Config& config = {}) override;
 
     void
+    Load(milvus::tracer::TraceContext ctx, const Config& config = {}) override;
+
+    void
     BuildWithDataset(const DatasetPtr& dataset,
                      const Config& config = {}) override;
+
+    void
+    Build(const Config& config = {}) override;
+
+    void
+    AddWithDataset(const DatasetPtr& dataset, const Config& config) override;
 
     int64_t
     Count() override {
         return index_.Count();
     }
 
-    std::unique_ptr<SearchResult>
+    void
     Query(const DatasetPtr dataset,
           const SearchInfo& search_info,
-          const BitsetView& bitset) override;
+          const BitsetView& bitset,
+          SearchResult& search_result) const override;
+
+    const bool
+    HasRawData() const override;
+
+    std::vector<uint8_t>
+    GetVector(const DatasetPtr dataset) const override;
+
+    std::unique_ptr<const knowhere::sparse::SparseRow<float>[]>
+    GetSparseVector(const DatasetPtr dataset) const override;
+
+    IndexStatsPtr
+    Upload(const Config& config = {}) override;
+
+    knowhere::expected<std::vector<knowhere::IndexNode::IteratorPtr>>
+    VectorIterators(const DatasetPtr dataset,
+                    const knowhere::Json& json,
+                    const BitsetView& bitset) const override;
+
+ protected:
+    virtual void
+    LoadWithoutAssemble(const BinarySet& binary_set, const Config& config);
+
+ private:
+    void
+    LoadFromFile(const Config& config);
 
  protected:
     Config config_;
     knowhere::Index<knowhere::IndexNode> index_;
+    std::shared_ptr<storage::MemFileManagerImpl> file_manager_;
+
+    CreateIndexInfo create_index_info_;
 };
 
-using VectorMemIndexPtr = std::unique_ptr<VectorMemIndex>;
+template <typename T>
+using VectorMemIndexPtr = std::unique_ptr<VectorMemIndex<T>>;
 }  // namespace milvus::index

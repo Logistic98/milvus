@@ -11,14 +11,24 @@
 
 #pragma once
 
+#include <stdint.h>
+#include "common/type_c.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 typedef void* CCollection;
 
-CCollection
-NewCollection(const char* schema_proto_blob);
+CStatus
+NewCollection(const void* schema_proto_blob,
+              const int64_t length,
+              CCollection* collection);
+
+CStatus
+SetIndexMeta(CCollection collection,
+             const void* proto_blob,
+             const int64_t length);
 
 void
 DeleteCollection(CCollection collection);

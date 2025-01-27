@@ -20,17 +20,15 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/milvus-io/milvus/pkg/log"
 	"go.uber.org/zap"
 
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus/internal/metastore/model"
-
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	pb "github.com/milvus-io/milvus/internal/proto/etcdpb"
-
+	"github.com/milvus-io/milvus/internal/util/proxyutil"
 	"github.com/milvus-io/milvus/pkg/common"
-
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
+	"github.com/milvus-io/milvus/pkg/log"
+	pb "github.com/milvus-io/milvus/pkg/proto/etcdpb"
 )
 
 type dropPartitionTask struct {
@@ -46,7 +44,7 @@ func (t *dropPartitionTask) Prepare(ctx context.Context) error {
 	if t.Req.GetPartitionName() == Params.CommonCfg.DefaultPartitionName.GetValue() {
 		return fmt.Errorf("default partition cannot be deleted")
 	}
-	collMeta, err := t.core.meta.GetCollectionByName(ctx, t.Req.GetCollectionName(), t.GetTs())
+	collMeta, err := t.core.meta.GetCollectionByName(ctx, t.Req.GetDbName(), t.Req.GetCollectionName(), t.GetTs())
 	if err != nil {
 		// Is this idempotent?
 		return err
@@ -64,51 +62,75 @@ func (t *dropPartitionTask) Execute(ctx context.Context) error {
 		}
 	}
 	if partID == common.InvalidPartitionID {
-		log.Warn("drop an non-existent partition", zap.String("collection", t.Req.GetCollectionName()), zap.String("partition", t.Req.GetPartitionName()))
+		log.Ctx(ctx).Warn("drop an non-existent partition", zap.String("collection", t.Req.GetCollectionName()), zap.String("partition", t.Req.GetPartitionName()))
 		// make dropping partition idempotent.
 		return nil
 	}
 
-	redoTask := newBaseRedoTask(t.core.stepExecutor)
+	return executeDropPartitionTaskSteps(ctx, t.core,
+		t.Req.GetPartitionName(), partID,
+		t.collMeta, t.Req.GetDbName(),
+		t.Req.GetBase().GetReplicateInfo().GetIsReplicate(), t.GetTs())
+}
+
+func (t *dropPartitionTask) GetLockerKey() LockerKey {
+	collection := t.core.getCollectionIDStr(t.ctx, t.Req.GetDbName(), t.Req.GetCollectionName(), 0)
+	return NewLockerKeyChain(
+		NewClusterLockerKey(false),
+		NewDatabaseLockerKey(t.Req.GetDbName(), false),
+		NewCollectionLockerKey(collection, true),
+	)
+}
+
+func executeDropPartitionTaskSteps(ctx context.Context,
+	core *Core,
+	partitionName string,
+	partitionID UniqueID,
+	col *model.Collection,
+	dbName string,
+	isReplicate bool,
+	ts Timestamp,
+) error {
+	redoTask := newBaseRedoTask(core.stepExecutor)
 
 	redoTask.AddSyncStep(&expireCacheStep{
-		baseStep:        baseStep{core: t.core},
-		collectionNames: []string{t.collMeta.Name},
-		collectionID:    t.collMeta.CollectionID,
-		ts:              t.GetTs(),
+		baseStep:        baseStep{core: core},
+		dbName:          dbName,
+		collectionNames: []string{col.Name},
+		collectionID:    col.CollectionID,
+		partitionName:   partitionName,
+		ts:              ts,
+		opts:            []proxyutil.ExpireCacheOpt{proxyutil.SetMsgType(commonpb.MsgType_DropPartition)},
 	})
 	redoTask.AddSyncStep(&changePartitionStateStep{
-		baseStep:     baseStep{core: t.core},
-		collectionID: t.collMeta.CollectionID,
-		partitionID:  partID,
+		baseStep:     baseStep{core: core},
+		collectionID: col.CollectionID,
+		partitionID:  partitionID,
 		state:        pb.PartitionState_PartitionDropping,
-		ts:           t.GetTs(),
-	})
-
-	redoTask.AddAsyncStep(&releasePartitionsStep{
-		baseStep:     baseStep{core: t.core},
-		collectionID: t.collMeta.CollectionID,
-		partitionIDs: []int64{partID},
+		ts:           ts,
 	})
 
 	redoTask.AddAsyncStep(&deletePartitionDataStep{
-		baseStep: baseStep{core: t.core},
-		pchans:   t.collMeta.PhysicalChannelNames,
+		baseStep: baseStep{core: core},
+		pchans:   col.PhysicalChannelNames,
+		vchans:   col.VirtualChannelNames,
 		partition: &model.Partition{
-			PartitionID:   partID,
-			PartitionName: t.Req.GetPartitionName(),
-			CollectionID:  t.collMeta.CollectionID,
+			PartitionID:   partitionID,
+			PartitionName: partitionName,
+			CollectionID:  col.CollectionID,
 		},
+		isSkip: isReplicate,
 	})
-	redoTask.AddAsyncStep(newConfirmGCStep(t.core, t.collMeta.CollectionID, partID))
+	redoTask.AddAsyncStep(newConfirmGCStep(core, col.CollectionID, partitionID))
 	redoTask.AddAsyncStep(&removePartitionMetaStep{
-		baseStep:     baseStep{core: t.core},
-		collectionID: t.collMeta.CollectionID,
-		partitionID:  partID,
+		baseStep:     baseStep{core: core},
+		dbID:         col.DBID,
+		collectionID: col.CollectionID,
+		partitionID:  partitionID,
 		// This ts is less than the ts when we notify data nodes to drop partition, but it's OK since we have already
 		// marked this partition as deleted. If we want to make this ts greater than the notification's ts, we should
 		// wrap a step who will have these children and connect them with ts.
-		ts: t.GetTs(),
+		ts: ts,
 	})
 
 	return redoTask.Execute(ctx)

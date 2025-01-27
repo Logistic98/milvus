@@ -20,42 +20,41 @@ import (
 	"context"
 	"testing"
 
-	"github.com/milvus-io/milvus/internal/util/sessionutil"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/uniquegenerator"
-
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus/internal/util/sessionutil"
+	"github.com/milvus-io/milvus/pkg/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/util/merr"
 	"github.com/milvus-io/milvus/pkg/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/util/uniquegenerator"
 )
 
 func TestProxy_metrics(t *testing.T) {
 	var err error
 
 	ctx := context.Background()
+	req, _ := metricsinfo.ConstructRequestByMetricType(metricsinfo.SystemInfoMetrics)
+	resp, err := getSystemInfoMetrics(ctx, req, getMockProxyRequestMetrics())
+	assert.NoError(t, err)
+	assert.NotNil(t, resp)
+}
 
+func getMockProxyRequestMetrics() *Proxy {
 	rc := NewRootCoordMock()
-	rc.Start()
-	defer rc.Stop()
+	defer rc.Close()
 
-	qc := getQueryCoord()
-	qc.Start()
-	defer qc.Stop()
-
+	qc := getQueryCoordClient()
 	dc := NewDataCoordMock()
-	dc.Start()
-	defer dc.Stop()
+	defer dc.Close()
 
 	proxy := &Proxy{
 		rootCoord:  rc,
 		queryCoord: qc,
 		dataCoord:  dc,
-		session:    &sessionutil.Session{Address: funcutil.GenRandomStr()},
+		session:    &sessionutil.Session{SessionRaw: sessionutil.SessionRaw{Address: funcutil.GenRandomStr()}},
 	}
 
 	rc.getMetricsFunc = func(ctx context.Context, request *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error) {
@@ -90,10 +89,7 @@ func TestProxy_metrics(t *testing.T) {
 		resp, _ := metricsinfo.MarshalTopology(rootCoordTopology)
 
 		return &milvuspb.GetMetricsResponse{
-			Status: &commonpb.Status{
-				ErrorCode: commonpb.ErrorCode_Success,
-				Reason:    "",
-			},
+			Status:        merr.Success(),
 			Response:      resp,
 			ComponentName: metricsinfo.ConstructComponentName(typeutil.RootCoordRole, id),
 		}, nil
@@ -142,10 +138,7 @@ func TestProxy_metrics(t *testing.T) {
 		resp, _ := metricsinfo.MarshalTopology(coordTopology)
 
 		return &milvuspb.GetMetricsResponse{
-			Status: &commonpb.Status{
-				ErrorCode: commonpb.ErrorCode_Success,
-				Reason:    "",
-			},
+			Status:        merr.Success(),
 			Response:      resp,
 			ComponentName: metricsinfo.ConstructComponentName(typeutil.QueryCoordRole, id),
 		}, nil
@@ -202,21 +195,10 @@ func TestProxy_metrics(t *testing.T) {
 		resp, _ := metricsinfo.MarshalTopology(coordTopology)
 
 		return &milvuspb.GetMetricsResponse{
-			Status: &commonpb.Status{
-				ErrorCode: commonpb.ErrorCode_Success,
-				Reason:    "",
-			},
+			Status:        merr.Success(),
 			Response:      resp,
 			ComponentName: metricsinfo.ConstructComponentName(typeutil.DataCoordRole, id),
 		}, nil
-
 	}
-
-	req, _ := metricsinfo.ConstructRequestByMetricType(metricsinfo.SystemInfoMetrics)
-	resp, err := getSystemInfoMetrics(ctx, req, proxy)
-	assert.NoError(t, err)
-	assert.NotNil(t, resp)
-
-	rc.getMetricsFunc = nil
-	dc.getMetricsFunc = nil
+	return proxy
 }

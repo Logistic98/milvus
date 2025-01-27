@@ -20,10 +20,11 @@ import (
 	"context"
 	"testing"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/msgpb"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 )
 
 func TestBaseMsg(t *testing.T) {
@@ -57,14 +58,14 @@ func Test_convertToByteArray(t *testing.T) {
 		bytes := []byte{1, 2, 3}
 		byteArray, err := convertToByteArray(bytes)
 		assert.Equal(t, bytes, byteArray)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 	}
 
 	{
 		bytes := 4
 		byteArray, err := convertToByteArray(bytes)
 		assert.Equal(t, ([]byte)(nil), byteArray)
-		assert.NotNil(t, err)
+		assert.Error(t, err)
 	}
 }
 
@@ -82,7 +83,7 @@ func generateBaseMsg() BaseMsg {
 func TestInsertMsg(t *testing.T) {
 	insertMsg := &InsertMsg{
 		BaseMsg: generateBaseMsg(),
-		InsertRequest: msgpb.InsertRequest{
+		InsertRequest: &msgpb.InsertRequest{
 			Base: &commonpb.MsgBase{
 				MsgType:   commonpb.MsgType_Insert,
 				MsgID:     1,
@@ -114,10 +115,10 @@ func TestInsertMsg(t *testing.T) {
 	assert.Equal(t, int64(3), insertMsg.SourceID())
 
 	bytes, err := insertMsg.Marshal(insertMsg)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	tsMsg, err := insertMsg.Unmarshal(bytes)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	insertMsg2, ok := tsMsg.(*InsertMsg)
 	assert.True(t, ok)
@@ -129,13 +130,13 @@ func TestInsertMsg(t *testing.T) {
 func TestInsertMsg_Unmarshal_IllegalParameter(t *testing.T) {
 	insertMsg := &InsertMsg{}
 	tsMsg, err := insertMsg.Unmarshal(10)
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 	assert.Nil(t, tsMsg)
 }
 
 func TestInsertMsg_RowBasedFormat(t *testing.T) {
 	msg := &InsertMsg{
-		InsertRequest: msgpb.InsertRequest{
+		InsertRequest: &msgpb.InsertRequest{
 			Version: msgpb.InsertDataVersion_RowBased,
 		},
 	}
@@ -144,7 +145,7 @@ func TestInsertMsg_RowBasedFormat(t *testing.T) {
 
 func TestInsertMsg_ColumnBasedFormat(t *testing.T) {
 	msg := &InsertMsg{
-		InsertRequest: msgpb.InsertRequest{
+		InsertRequest: &msgpb.InsertRequest{
 			Version: msgpb.InsertDataVersion_ColumnBased,
 		},
 	}
@@ -153,7 +154,7 @@ func TestInsertMsg_ColumnBasedFormat(t *testing.T) {
 
 func TestInsertMsg_NRows(t *testing.T) {
 	msg1 := &InsertMsg{
-		InsertRequest: msgpb.InsertRequest{
+		InsertRequest: &msgpb.InsertRequest{
 			RowData: []*commonpb.Blob{
 				{},
 				{},
@@ -164,7 +165,7 @@ func TestInsertMsg_NRows(t *testing.T) {
 	}
 	assert.Equal(t, uint64(2), msg1.NRows())
 	msg2 := &InsertMsg{
-		InsertRequest: msgpb.InsertRequest{
+		InsertRequest: &msgpb.InsertRequest{
 			RowData: nil,
 			FieldsData: []*schemapb.FieldData{
 				{},
@@ -178,7 +179,7 @@ func TestInsertMsg_NRows(t *testing.T) {
 
 func TestInsertMsg_CheckAligned(t *testing.T) {
 	msg1 := &InsertMsg{
-		InsertRequest: msgpb.InsertRequest{
+		InsertRequest: &msgpb.InsertRequest{
 			Timestamps: []uint64{1},
 			RowIDs:     []int64{1},
 			RowData: []*commonpb.Blob{
@@ -216,7 +217,7 @@ func TestInsertMsg_IndexMsg(t *testing.T) {
 			BeginTimestamp: 1,
 			EndTimestamp:   2,
 		},
-		InsertRequest: msgpb.InsertRequest{
+		InsertRequest: &msgpb.InsertRequest{
 			Base: &commonpb.MsgBase{
 				MsgType:   commonpb.MsgType_Insert,
 				MsgID:     3,
@@ -271,7 +272,7 @@ func TestInsertMsg_IndexMsg(t *testing.T) {
 func TestDeleteMsg(t *testing.T) {
 	deleteMsg := &DeleteMsg{
 		BaseMsg: generateBaseMsg(),
-		DeleteRequest: msgpb.DeleteRequest{
+		DeleteRequest: &msgpb.DeleteRequest{
 			Base: &commonpb.MsgBase{
 				MsgType:   commonpb.MsgType_Delete,
 				MsgID:     1,
@@ -298,10 +299,10 @@ func TestDeleteMsg(t *testing.T) {
 	assert.Equal(t, int64(3), deleteMsg.SourceID())
 
 	bytes, err := deleteMsg.Marshal(deleteMsg)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	tsMsg, err := deleteMsg.Unmarshal(bytes)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	deleteMsg2, ok := tsMsg.(*DeleteMsg)
 	assert.True(t, ok)
@@ -313,14 +314,14 @@ func TestDeleteMsg(t *testing.T) {
 func TestDeleteMsg_Unmarshal_IllegalParameter(t *testing.T) {
 	deleteMsg := &DeleteMsg{}
 	tsMsg, err := deleteMsg.Unmarshal(10)
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 	assert.Nil(t, tsMsg)
 }
 
 func TestTimeTickMsg(t *testing.T) {
 	timeTickMsg := &TimeTickMsg{
 		BaseMsg: generateBaseMsg(),
-		TimeTickMsg: msgpb.TimeTickMsg{
+		TimeTickMsg: &msgpb.TimeTickMsg{
 			Base: &commonpb.MsgBase{
 				MsgType:   commonpb.MsgType_TimeTick,
 				MsgID:     1,
@@ -341,10 +342,10 @@ func TestTimeTickMsg(t *testing.T) {
 	assert.Equal(t, int64(3), timeTickMsg.SourceID())
 
 	bytes, err := timeTickMsg.Marshal(timeTickMsg)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	tsMsg, err := timeTickMsg.Unmarshal(bytes)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	timeTickMsg2, ok := tsMsg.(*TimeTickMsg)
 	assert.True(t, ok)
@@ -356,14 +357,14 @@ func TestTimeTickMsg(t *testing.T) {
 func TestTimeTickMsg_Unmarshal_IllegalParameter(t *testing.T) {
 	timeTickMsg := &TimeTickMsg{}
 	tsMsg, err := timeTickMsg.Unmarshal(10)
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 	assert.Nil(t, tsMsg)
 }
 
 func TestCreateCollectionMsg(t *testing.T) {
 	createCollectionMsg := &CreateCollectionMsg{
 		BaseMsg: generateBaseMsg(),
-		CreateCollectionRequest: msgpb.CreateCollectionRequest{
+		CreateCollectionRequest: &msgpb.CreateCollectionRequest{
 			Base: &commonpb.MsgBase{
 				MsgType:   commonpb.MsgType_CreateCollection,
 				MsgID:     1,
@@ -393,10 +394,10 @@ func TestCreateCollectionMsg(t *testing.T) {
 	assert.Equal(t, int64(3), createCollectionMsg.SourceID())
 
 	bytes, err := createCollectionMsg.Marshal(createCollectionMsg)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	tsMsg, err := createCollectionMsg.Unmarshal(bytes)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	createCollectionMsg2, ok := tsMsg.(*CreateCollectionMsg)
 	assert.True(t, ok)
@@ -408,14 +409,14 @@ func TestCreateCollectionMsg(t *testing.T) {
 func TestCreateCollectionMsg_Unmarshal_IllegalParameter(t *testing.T) {
 	createCollectionMsg := &CreateCollectionMsg{}
 	tsMsg, err := createCollectionMsg.Unmarshal(10)
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 	assert.Nil(t, tsMsg)
 }
 
 func TestDropCollectionMsg(t *testing.T) {
 	dropCollectionMsg := &DropCollectionMsg{
 		BaseMsg: generateBaseMsg(),
-		DropCollectionRequest: msgpb.DropCollectionRequest{
+		DropCollectionRequest: &msgpb.DropCollectionRequest{
 			Base: &commonpb.MsgBase{
 				MsgType:   commonpb.MsgType_DropCollection,
 				MsgID:     1,
@@ -440,10 +441,10 @@ func TestDropCollectionMsg(t *testing.T) {
 	assert.Equal(t, int64(3), dropCollectionMsg.SourceID())
 
 	bytes, err := dropCollectionMsg.Marshal(dropCollectionMsg)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	tsMsg, err := dropCollectionMsg.Unmarshal(bytes)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	dropCollectionMsg2, ok := tsMsg.(*DropCollectionMsg)
 	assert.True(t, ok)
@@ -455,14 +456,14 @@ func TestDropCollectionMsg(t *testing.T) {
 func TestDropCollectionMsg_Unmarshal_IllegalParameter(t *testing.T) {
 	dropCollectionMsg := &DropCollectionMsg{}
 	tsMsg, err := dropCollectionMsg.Unmarshal(10)
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 	assert.Nil(t, tsMsg)
 }
 
 func TestCreatePartitionMsg(t *testing.T) {
 	createPartitionMsg := &CreatePartitionMsg{
 		BaseMsg: generateBaseMsg(),
-		CreatePartitionRequest: msgpb.CreatePartitionRequest{
+		CreatePartitionRequest: &msgpb.CreatePartitionRequest{
 			Base: &commonpb.MsgBase{
 				MsgType:   commonpb.MsgType_CreatePartition,
 				MsgID:     1,
@@ -489,10 +490,10 @@ func TestCreatePartitionMsg(t *testing.T) {
 	assert.Equal(t, int64(3), createPartitionMsg.SourceID())
 
 	bytes, err := createPartitionMsg.Marshal(createPartitionMsg)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	tsMsg, err := createPartitionMsg.Unmarshal(bytes)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	createPartitionMsg2, ok := tsMsg.(*CreatePartitionMsg)
 	assert.True(t, ok)
@@ -504,14 +505,14 @@ func TestCreatePartitionMsg(t *testing.T) {
 func TestCreatePartitionMsg_Unmarshal_IllegalParameter(t *testing.T) {
 	createPartitionMsg := &CreatePartitionMsg{}
 	tsMsg, err := createPartitionMsg.Unmarshal(10)
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 	assert.Nil(t, tsMsg)
 }
 
 func TestDropPartitionMsg(t *testing.T) {
 	dropPartitionMsg := &DropPartitionMsg{
 		BaseMsg: generateBaseMsg(),
-		DropPartitionRequest: msgpb.DropPartitionRequest{
+		DropPartitionRequest: &msgpb.DropPartitionRequest{
 			Base: &commonpb.MsgBase{
 				MsgType:   commonpb.MsgType_DropPartition,
 				MsgID:     1,
@@ -538,10 +539,10 @@ func TestDropPartitionMsg(t *testing.T) {
 	assert.Equal(t, int64(3), dropPartitionMsg.SourceID())
 
 	bytes, err := dropPartitionMsg.Marshal(dropPartitionMsg)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	tsMsg, err := dropPartitionMsg.Unmarshal(bytes)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	dropPartitionMsg2, ok := tsMsg.(*DropPartitionMsg)
 	assert.True(t, ok)
@@ -553,14 +554,14 @@ func TestDropPartitionMsg(t *testing.T) {
 func TestDropPartitionMsg_Unmarshal_IllegalParameter(t *testing.T) {
 	dropPartitionMsg := &DropPartitionMsg{}
 	tsMsg, err := dropPartitionMsg.Unmarshal(10)
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 	assert.Nil(t, tsMsg)
 }
 
 func TestDataNodeTtMsg(t *testing.T) {
 	dataNodeTtMsg := &DataNodeTtMsg{
 		BaseMsg: generateBaseMsg(),
-		DataNodeTtMsg: msgpb.DataNodeTtMsg{
+		DataNodeTtMsg: &msgpb.DataNodeTtMsg{
 			Base: &commonpb.MsgBase{
 				MsgType:   commonpb.MsgType_DataNodeTt,
 				MsgID:     1,
@@ -583,10 +584,10 @@ func TestDataNodeTtMsg(t *testing.T) {
 	assert.Equal(t, int64(3), dataNodeTtMsg.SourceID())
 
 	bytes, err := dataNodeTtMsg.Marshal(dataNodeTtMsg)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	tsMsg, err := dataNodeTtMsg.Unmarshal(bytes)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	dataNodeTtMsg2, ok := tsMsg.(*DataNodeTtMsg)
 	assert.True(t, ok)
@@ -598,6 +599,6 @@ func TestDataNodeTtMsg(t *testing.T) {
 func TestDataNodeTtMsg_Unmarshal_IllegalParameter(t *testing.T) {
 	dataNodeTtMsg := &DataNodeTtMsg{}
 	tsMsg, err := dataNodeTtMsg.Unmarshal(10)
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 	assert.Nil(t, tsMsg)
 }

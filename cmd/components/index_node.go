@@ -18,48 +18,57 @@ package components
 
 import (
 	"context"
+	"time"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
+	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	grpcindexnode "github.com/milvus-io/milvus/internal/distributed/indexnode"
 	"github.com/milvus-io/milvus/internal/util/dependency"
 	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 // IndexNode implements IndexNode grpc server
 type IndexNode struct {
+	ctx context.Context
 	svr *grpcindexnode.Server
 }
 
 // NewIndexNode creates a new IndexNode
 func NewIndexNode(ctx context.Context, factory dependency.Factory) (*IndexNode, error) {
 	var err error
-	n := &IndexNode{}
+	n := &IndexNode{
+		ctx: ctx,
+	}
 	svr, err := grpcindexnode.NewServer(ctx, factory)
 	if err != nil {
 		return nil, err
 	}
 	n.svr = svr
 	return n, nil
+}
 
+func (n *IndexNode) Prepare() error {
+	return n.svr.Prepare()
 }
 
 // Run starts service
 func (n *IndexNode) Run() error {
 	if err := n.svr.Run(); err != nil {
+		log.Ctx(n.ctx).Error("IndexNode starts error", zap.Error(err))
 		return err
 	}
-	log.Debug("IndexNode successfully started")
+	log.Ctx(n.ctx).Info("IndexNode successfully started")
 	return nil
 }
 
 // Stop terminates service
 func (n *IndexNode) Stop() error {
-	if err := n.svr.Stop(); err != nil {
-		return err
-	}
-	return nil
+	timeout := paramtable.Get().IndexNodeCfg.GracefulStopTimeout.GetAsDuration(time.Second)
+	return exitWhenStopTimeout(n.svr.Stop, timeout)
 }
 
 // GetComponentStates returns IndexNode's states

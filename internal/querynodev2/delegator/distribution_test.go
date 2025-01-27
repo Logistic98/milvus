@@ -30,6 +30,7 @@ type DistributionSuite struct {
 
 func (s *DistributionSuite) SetupTest() {
 	s.dist = NewDistribution()
+	s.Equal(initialTargetVersion, s.dist.getTargetVersion())
 }
 
 func (s *DistributionSuite) TearDownTest() {
@@ -63,12 +64,40 @@ func (s *DistributionSuite) TestAddDistribution() {
 					NodeID: 1,
 					Segments: []SegmentEntry{
 						{
-							NodeID:    1,
-							SegmentID: 1,
+							NodeID:        1,
+							SegmentID:     1,
+							TargetVersion: unreadableTargetVersion,
 						},
 						{
-							NodeID:    1,
-							SegmentID: 2,
+							NodeID:        1,
+							SegmentID:     2,
+							TargetVersion: unreadableTargetVersion,
+						},
+					},
+				},
+			},
+			expectedSignalClosed: true,
+		},
+		{
+			tag: "duplicate segment",
+			input: []SegmentEntry{
+				{
+					NodeID:    1,
+					SegmentID: 1,
+				},
+				{
+					NodeID:    1,
+					SegmentID: 1,
+				},
+			},
+			expected: []SnapshotItem{
+				{
+					NodeID: 1,
+					Segments: []SegmentEntry{
+						{
+							NodeID:        1,
+							SegmentID:     1,
+							TargetVersion: unreadableTargetVersion,
 						},
 					},
 				},
@@ -96,13 +125,15 @@ func (s *DistributionSuite) TestAddDistribution() {
 					NodeID: 1,
 					Segments: []SegmentEntry{
 						{
-							NodeID:    1,
-							SegmentID: 1,
+							NodeID:        1,
+							SegmentID:     1,
+							TargetVersion: unreadableTargetVersion,
 						},
 
 						{
-							NodeID:    1,
-							SegmentID: 3,
+							NodeID:        1,
+							SegmentID:     3,
+							TargetVersion: unreadableTargetVersion,
 						},
 					},
 				},
@@ -110,8 +141,9 @@ func (s *DistributionSuite) TestAddDistribution() {
 					NodeID: 2,
 					Segments: []SegmentEntry{
 						{
-							NodeID:    2,
-							SegmentID: 2,
+							NodeID:        2,
+							SegmentID:     2,
+							TargetVersion: unreadableTargetVersion,
 						},
 					},
 				},
@@ -131,8 +163,8 @@ func (s *DistributionSuite) TestAddDistribution() {
 				{
 					NodeID: 1,
 					Segments: []SegmentEntry{
-						{NodeID: 1, SegmentID: 1},
-						{NodeID: 1, SegmentID: 2},
+						{NodeID: 1, SegmentID: 1, TargetVersion: unreadableTargetVersion},
+						{NodeID: 1, SegmentID: 2, TargetVersion: unreadableTargetVersion},
 					},
 				},
 			},
@@ -145,12 +177,12 @@ func (s *DistributionSuite) TestAddDistribution() {
 			s.SetupTest()
 			defer s.TearDownTest()
 			s.dist.AddGrowing(tc.growing...)
-			_, _, version := s.dist.GetCurrent()
-			_, signal := s.dist.AddDistributions(tc.input...)
-			sealed, _ := s.dist.Peek()
+			_, _, version, err := s.dist.PinReadableSegments()
+			s.Require().NoError(err)
+			s.dist.AddDistributions(tc.input...)
+			sealed, _ := s.dist.PeekSegments(false)
 			s.compareSnapshotItems(tc.expected, sealed)
-			s.Equal(tc.expectedSignalClosed, s.isClosedCh(signal))
-			s.dist.FinishUsage(version)
+			s.dist.Unpin(version)
 		})
 	}
 }
@@ -185,9 +217,10 @@ func (s *DistributionSuite) compareSnapshotItems(target, value []SnapshotItem) {
 
 func (s *DistributionSuite) TestAddGrowing() {
 	type testCase struct {
-		tag      string
-		input    []SegmentEntry
-		expected []SegmentEntry
+		tag          string
+		workingParts []int64
+		input        []SegmentEntry
+		expected     []SegmentEntry
 	}
 
 	cases := []testCase{
@@ -197,14 +230,26 @@ func (s *DistributionSuite) TestAddGrowing() {
 			expected: []SegmentEntry{},
 		},
 		{
-			tag: "normal case",
+			tag: "normal_case",
 			input: []SegmentEntry{
 				{SegmentID: 1, PartitionID: 1},
 				{SegmentID: 2, PartitionID: 2},
 			},
+			workingParts: []int64{1, 2},
 			expected: []SegmentEntry{
+				{SegmentID: 1, PartitionID: 1, TargetVersion: 1000},
+				{SegmentID: 2, PartitionID: 2, TargetVersion: 1000},
+			},
+		},
+		{
+			tag: "partial_partition_working",
+			input: []SegmentEntry{
 				{SegmentID: 1, PartitionID: 1},
 				{SegmentID: 2, PartitionID: 2},
+			},
+			workingParts: []int64{1},
+			expected: []SegmentEntry{
+				{SegmentID: 1, PartitionID: 1, TargetVersion: 1000},
 			},
 		},
 	}
@@ -215,8 +260,10 @@ func (s *DistributionSuite) TestAddGrowing() {
 			defer s.TearDownTest()
 
 			s.dist.AddGrowing(tc.input...)
-			_, growing, version := s.dist.GetCurrent()
-			defer s.dist.FinishUsage(version)
+			s.dist.SyncTargetVersion(1000, tc.workingParts, []int64{1, 2}, nil, nil)
+			_, growing, version, err := s.dist.PinReadableSegments()
+			s.Require().NoError(err)
+			defer s.dist.Unpin(version)
 
 			s.ElementsMatch(tc.expected, growing)
 		})
@@ -262,17 +309,17 @@ func (s *DistributionSuite) TestRemoveDistribution() {
 				{
 					NodeID: 1,
 					Segments: []SegmentEntry{
-						{NodeID: 1, SegmentID: 3},
+						{NodeID: 1, SegmentID: 3, TargetVersion: unreadableTargetVersion},
 					},
 				},
 				{
 					NodeID: 2,
 					Segments: []SegmentEntry{
-						{NodeID: 2, SegmentID: 2},
+						{NodeID: 2, SegmentID: 2, TargetVersion: unreadableTargetVersion},
 					},
 				},
 			},
-			expectGrowing: []SegmentEntry{{SegmentID: 4}},
+			expectGrowing: []SegmentEntry{{SegmentID: 4, TargetVersion: unreadableTargetVersion}},
 		},
 		{
 			tag: "remove with wrong nodeID",
@@ -297,18 +344,18 @@ func (s *DistributionSuite) TestRemoveDistribution() {
 				{
 					NodeID: 1,
 					Segments: []SegmentEntry{
-						{NodeID: 1, SegmentID: 1},
-						{NodeID: 1, SegmentID: 3},
+						{NodeID: 1, SegmentID: 1, TargetVersion: unreadableTargetVersion},
+						{NodeID: 1, SegmentID: 3, TargetVersion: unreadableTargetVersion},
 					},
 				},
 				{
 					NodeID: 2,
 					Segments: []SegmentEntry{
-						{NodeID: 2, SegmentID: 2},
+						{NodeID: 2, SegmentID: 2, TargetVersion: unreadableTargetVersion},
 					},
 				},
 			},
-			expectGrowing: []SegmentEntry{{SegmentID: 4}, {SegmentID: 5}},
+			expectGrowing: []SegmentEntry{{SegmentID: 4, TargetVersion: unreadableTargetVersion}, {SegmentID: 5, TargetVersion: unreadableTargetVersion}},
 		},
 		{
 			tag: "remove with wildcardNodeID",
@@ -333,17 +380,17 @@ func (s *DistributionSuite) TestRemoveDistribution() {
 				{
 					NodeID: 1,
 					Segments: []SegmentEntry{
-						{NodeID: 1, SegmentID: 3},
+						{NodeID: 1, SegmentID: 3, TargetVersion: unreadableTargetVersion},
 					},
 				},
 				{
 					NodeID: 2,
 					Segments: []SegmentEntry{
-						{NodeID: 2, SegmentID: 2},
+						{NodeID: 2, SegmentID: 2, TargetVersion: unreadableTargetVersion},
 					},
 				},
 			},
-			expectGrowing: []SegmentEntry{{SegmentID: 4}, {SegmentID: 5}},
+			expectGrowing: []SegmentEntry{{SegmentID: 4, TargetVersion: unreadableTargetVersion}, {SegmentID: 5, TargetVersion: unreadableTargetVersion}},
 		},
 		{
 			tag: "remove with read",
@@ -370,17 +417,25 @@ func (s *DistributionSuite) TestRemoveDistribution() {
 				{
 					NodeID: 1,
 					Segments: []SegmentEntry{
-						{NodeID: 1, SegmentID: 3},
+						{
+							NodeID:        1,
+							SegmentID:     3,
+							TargetVersion: unreadableTargetVersion,
+						},
 					},
 				},
 				{
 					NodeID: 2,
 					Segments: []SegmentEntry{
-						{NodeID: 2, SegmentID: 2},
+						{
+							NodeID:        2,
+							SegmentID:     2,
+							TargetVersion: unreadableTargetVersion,
+						},
 					},
 				},
 			},
-			expectGrowing: []SegmentEntry{{SegmentID: 4}},
+			expectGrowing: []SegmentEntry{{SegmentID: 4, TargetVersion: unreadableTargetVersion}},
 		},
 	}
 
@@ -394,7 +449,9 @@ func (s *DistributionSuite) TestRemoveDistribution() {
 
 			var version int64
 			if tc.withMockRead {
-				_, _, version = s.dist.GetCurrent()
+				var err error
+				_, _, version, err = s.dist.PinReadableSegments()
+				s.Require().NoError(err)
 			}
 
 			ch := s.dist.RemoveDistributions(tc.removalSealed, tc.removalGrowing)
@@ -407,7 +464,7 @@ func (s *DistributionSuite) TestRemoveDistribution() {
 				default:
 				}
 
-				s.dist.FinishUsage(version)
+				s.dist.Unpin(version)
 			}
 			// check ch close very soon
 			timeout := time.NewTimer(time.Second)
@@ -418,8 +475,8 @@ func (s *DistributionSuite) TestRemoveDistribution() {
 			case <-ch:
 			}
 
-			sealed, growing, version := s.dist.GetCurrent()
-			defer s.dist.FinishUsage(version)
+			sealed, growing, version := s.dist.PinOnlineSegments()
+			defer s.dist.Unpin(version)
 			s.compareSnapshotItems(tc.expectSealed, sealed)
 			s.ElementsMatch(tc.expectGrowing, growing)
 		})
@@ -429,13 +486,15 @@ func (s *DistributionSuite) TestRemoveDistribution() {
 func (s *DistributionSuite) TestPeek() {
 	type testCase struct {
 		tag      string
+		readable bool
 		input    []SegmentEntry
 		expected []SnapshotItem
 	}
 
 	cases := []testCase{
 		{
-			tag: "one node",
+			tag:      "one_node",
+			readable: false,
 			input: []SegmentEntry{
 				{
 					NodeID:    1,
@@ -451,19 +510,22 @@ func (s *DistributionSuite) TestPeek() {
 					NodeID: 1,
 					Segments: []SegmentEntry{
 						{
-							NodeID:    1,
-							SegmentID: 1,
+							NodeID:        1,
+							SegmentID:     1,
+							TargetVersion: unreadableTargetVersion,
 						},
 						{
-							NodeID:    1,
-							SegmentID: 2,
+							NodeID:        1,
+							SegmentID:     2,
+							TargetVersion: unreadableTargetVersion,
 						},
 					},
 				},
 			},
 		},
 		{
-			tag: "multiple nodes",
+			tag:      "multiple_nodes",
+			readable: false,
 			input: []SegmentEntry{
 				{
 					NodeID:    1,
@@ -483,13 +545,15 @@ func (s *DistributionSuite) TestPeek() {
 					NodeID: 1,
 					Segments: []SegmentEntry{
 						{
-							NodeID:    1,
-							SegmentID: 1,
+							NodeID:        1,
+							SegmentID:     1,
+							TargetVersion: unreadableTargetVersion,
 						},
 
 						{
-							NodeID:    1,
-							SegmentID: 3,
+							NodeID:        1,
+							SegmentID:     3,
+							TargetVersion: unreadableTargetVersion,
 						},
 					},
 				},
@@ -497,10 +561,39 @@ func (s *DistributionSuite) TestPeek() {
 					NodeID: 2,
 					Segments: []SegmentEntry{
 						{
-							NodeID:    2,
-							SegmentID: 2,
+							NodeID:        2,
+							SegmentID:     2,
+							TargetVersion: unreadableTargetVersion,
 						},
 					},
+				},
+			},
+		},
+		{
+			tag:      "peek_readable",
+			readable: true,
+			input: []SegmentEntry{
+				{
+					NodeID:    1,
+					SegmentID: 1,
+				},
+				{
+					NodeID:    2,
+					SegmentID: 2,
+				},
+				{
+					NodeID:    1,
+					SegmentID: 3,
+				},
+			},
+			expected: []SnapshotItem{
+				{
+					NodeID:   1,
+					Segments: []SegmentEntry{},
+				},
+				{
+					NodeID:   2,
+					Segments: []SegmentEntry{},
 				},
 			},
 		},
@@ -514,7 +607,7 @@ func (s *DistributionSuite) TestPeek() {
 			// peek during lock
 			s.dist.AddDistributions(tc.input...)
 			s.dist.mut.Lock()
-			sealed, _ := s.dist.Peek()
+			sealed, _ := s.dist.PeekSegments(tc.readable)
 			s.compareSnapshotItems(tc.expected, sealed)
 			s.dist.mut.Unlock()
 		})
@@ -561,6 +654,7 @@ func (s *DistributionSuite) TestAddOfflines() {
 					SegmentID: 3,
 				},
 			},
+			offlines:    []int64{4},
 			serviceable: true,
 		},
 	}
@@ -573,8 +667,88 @@ func (s *DistributionSuite) TestAddOfflines() {
 			s.dist.AddDistributions(tc.input...)
 			s.dist.AddOfflines(tc.offlines...)
 			s.Equal(tc.serviceable, s.dist.Serviceable())
+
+			// current := s.dist.current.Load()
+			for _, offline := range tc.offlines {
+				// current.
+				s.dist.mut.RLock()
+				entry, ok := s.dist.sealedSegments[offline]
+				s.dist.mut.RUnlock()
+				if ok {
+					s.EqualValues(-1, entry.NodeID)
+					s.EqualValues(unreadableTargetVersion, entry.Version)
+				}
+			}
 		})
 	}
+}
+
+func (s *DistributionSuite) Test_SyncTargetVersion() {
+	growing := []SegmentEntry{
+		{
+			NodeID:        1,
+			SegmentID:     1,
+			PartitionID:   1,
+			TargetVersion: 1,
+		},
+		{
+			NodeID:        1,
+			SegmentID:     2,
+			PartitionID:   1,
+			TargetVersion: 1,
+		},
+		{
+			NodeID:        1,
+			SegmentID:     3,
+			PartitionID:   1,
+			TargetVersion: 1,
+		},
+	}
+
+	sealed := []SegmentEntry{
+		{
+			NodeID:        1,
+			SegmentID:     4,
+			PartitionID:   1,
+			TargetVersion: 1,
+		},
+		{
+			NodeID:        1,
+			SegmentID:     5,
+			PartitionID:   1,
+			TargetVersion: 1,
+		},
+		{
+			NodeID:        1,
+			SegmentID:     6,
+			PartitionID:   1,
+			TargetVersion: 1,
+		},
+	}
+
+	s.dist.AddGrowing(growing...)
+	s.dist.AddDistributions(sealed...)
+	s.dist.SyncTargetVersion(2, []int64{1}, []int64{2, 3}, []int64{6}, []int64{})
+
+	s1, s2, _, err := s.dist.PinReadableSegments()
+	s.Require().NoError(err)
+	s.Len(s1[0].Segments, 1)
+	s.Len(s2, 2)
+
+	s1, s2, _ = s.dist.PinOnlineSegments()
+	s.Len(s1[0].Segments, 3)
+	s.Len(s2, 3)
+
+	s.dist.serviceable.Store(true)
+	s.dist.SyncTargetVersion(2, []int64{1}, []int64{222}, []int64{}, []int64{})
+	s.True(s.dist.Serviceable())
+
+	s.dist.SyncTargetVersion(2, []int64{1}, []int64{}, []int64{333}, []int64{})
+	s.False(s.dist.Serviceable())
+
+	s.dist.SyncTargetVersion(2, []int64{1}, []int64{}, []int64{333}, []int64{1, 2, 3})
+	_, _, _, err = s.dist.PinReadableSegments()
+	s.Error(err)
 }
 
 func TestDistributionSuite(t *testing.T) {

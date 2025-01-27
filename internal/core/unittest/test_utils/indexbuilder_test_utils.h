@@ -16,16 +16,16 @@
 #include <limits>
 #include <cmath>
 #include <google/protobuf/text_format.h>
-#include <boost/filesystem.hpp>
-#include <yaml-cpp/yaml.h>
 
 #include "DataGen.h"
+#include "index/Meta.h"
 #include "index/ScalarIndex.h"
 #include "index/StringIndex.h"
 #include "index/Utils.h"
 #include "indexbuilder/ScalarIndexCreator.h"
 #include "indexbuilder/VecIndexCreator.h"
 #include "indexbuilder/index_c.h"
+#include "knowhere/comp/index_param.h"
 #include "pb/index_cgo_msg.pb.h"
 #include "storage/Types.h"
 
@@ -40,160 +40,8 @@ using milvus::indexbuilder::ScalarIndexCreator;
 using ScalarTestParams = std::pair<MapParams, MapParams>;
 using milvus::index::ScalarIndexPtr;
 using milvus::index::StringIndexPtr;
-using milvus::storage::StorageConfig;
-using namespace boost::filesystem;
 
 namespace {
-
-bool
-find_file(const path& dir, const std::string& file_name, path& path_found) {
-    const recursive_directory_iterator end;
-    boost::system::error_code err;
-    auto iter = recursive_directory_iterator(dir, err);
-    while (iter != end) {
-        try {
-            if ((*iter).path().filename() == file_name) {
-                path_found = (*iter).path();
-                return true;
-            }
-            iter++;
-        } catch (filesystem_error& e) {
-        } catch (std::exception& e) {
-            // ignore error
-        }
-    }
-    return false;
-}
-
-StorageConfig
-get_default_storage_config() {
-    char testPath[100];
-    auto pwd = std::string(getcwd(testPath, sizeof(testPath)));
-    path filepath;
-    auto currentPath = path(pwd);
-    while (!find_file(currentPath, "milvus.yaml", filepath)) {
-        currentPath = currentPath.append("../");
-    }
-    auto configPath = filepath.string();
-    YAML::Node config;
-    config = YAML::LoadFile(configPath);
-    auto minioConfig = config["minio"];
-    auto address = minioConfig["address"].as<std::string>();
-    auto port = minioConfig["port"].as<std::string>();
-    auto endpoint = address + ":" + port;
-    auto accessKey = minioConfig["accessKeyID"].as<std::string>();
-    auto accessValue = minioConfig["secretAccessKey"].as<std::string>();
-    auto rootPath = minioConfig["rootPath"].as<std::string>();
-    auto useSSL = minioConfig["useSSL"].as<bool>();
-    auto useIam = minioConfig["useIAM"].as<bool>();
-    auto iamEndPoint = minioConfig["iamEndpoint"].as<std::string>();
-    auto bucketName = minioConfig["bucketName"].as<std::string>();
-
-    return StorageConfig{endpoint,
-                         bucketName,
-                         accessKey,
-                         accessValue,
-                         rootPath,
-                         "minio",
-                         iamEndPoint,
-                         useSSL,
-                         useIam};
-}
-
-void
-delete_cstorage_config(CStorageConfig config) {
-    delete[] config.address;
-    delete[] config.bucket_name;
-    delete[] config.access_key_id;
-    delete[] config.access_key_value;
-    delete[] config.remote_root_path;
-    delete[] config.storage_type;
-    delete[] config.iam_endpoint;
-}
-
-class TestConfigWrapper {
- public:
-    TestConfigWrapper() = default;
-
-    TestConfigWrapper(const TestConfigWrapper&) = delete;
-
-    TestConfigWrapper
-    operator=(const TestConfigWrapper&) = delete;
-
-    ~TestConfigWrapper() {
-        delete_cstorage_config(config_);
-    }
-
- public:
-    static TestConfigWrapper&
-    GetInstance() {
-        // thread-safe enough after c++11
-        static TestConfigWrapper instance;
-        return instance;
-    }
-
-    CStorageConfig
-    get_default_cstorage_config() {
-        auto init = [&] { this->init_default_cstorage_config(); };
-        call_once(once_, init);
-        return config_;
-    }
-
- private:
-    void
-    init_default_cstorage_config() {
-        char testPath[1000];
-        auto pwd = std::string(getcwd(testPath, sizeof(testPath)));
-        path filepath;
-        auto currentPath = path(pwd);
-        while (!find_file(currentPath, "milvus.yaml", filepath)) {
-            currentPath = currentPath.append("../");
-        }
-        auto configPath = filepath.string();
-        YAML::Node config;
-        config = YAML::LoadFile(configPath);
-        auto minioConfig = config["minio"];
-        auto address = minioConfig["address"].as<std::string>();
-        auto port = minioConfig["port"].as<std::string>();
-        auto endpoint = address + ":" + port;
-        auto accessKey = minioConfig["accessKeyID"].as<std::string>();
-        auto accessValue = minioConfig["secretAccessKey"].as<std::string>();
-        auto rootPath = minioConfig["rootPath"].as<std::string>();
-        auto useSSL = minioConfig["useSSL"].as<bool>();
-        auto useIam = minioConfig["useIAM"].as<bool>();
-        auto iamEndPoint = minioConfig["iamEndpoint"].as<std::string>();
-        auto bucketName = minioConfig["bucketName"].as<std::string>();
-        std::string storage_type = "minio";
-
-        config_.address = new char[address.length() + 1];
-        config_.bucket_name = new char[bucketName.length() + 1];
-        config_.access_key_id = new char[accessKey.length() + 1];
-        config_.access_key_value = new char[accessValue.length() + 1];
-        config_.remote_root_path = new char[rootPath.length() + 1];
-        config_.storage_type = new char[storage_type.length() + 1];
-        config_.iam_endpoint = new char[iamEndPoint.length() + 1];
-        config_.useSSL = useSSL;
-        config_.useIAM = useIam;
-
-        strcpy(const_cast<char*>(config_.address), address.c_str());
-        strcpy(const_cast<char*>(config_.bucket_name), bucketName.c_str());
-        strcpy(const_cast<char*>(config_.access_key_id), accessKey.c_str());
-        strcpy(const_cast<char*>(config_.access_key_value),
-               accessValue.c_str());
-        strcpy(const_cast<char*>(config_.remote_root_path), rootPath.c_str());
-        strcpy(const_cast<char*>(config_.storage_type), storage_type.c_str());
-        strcpy(const_cast<char*>(config_.iam_endpoint), iamEndPoint.c_str());
-    }
-
- private:
-    CStorageConfig config_;
-    std::once_flag once_;
-};
-
-CStorageConfig
-get_default_cstorage_config() {
-    return TestConfigWrapper::GetInstance().get_default_cstorage_config();
-}
 
 auto
 generate_build_conf(const milvus::IndexType& index_type,
@@ -249,12 +97,28 @@ generate_build_conf(const milvus::IndexType& index_type,
             {milvus::index::DISK_ANN_SEARCH_LIST_SIZE, std::to_string(128)},
             {milvus::index::DISK_ANN_PQ_CODE_BUDGET, std::to_string(0.001)},
             {milvus::index::DISK_ANN_BUILD_DRAM_BUDGET, std::to_string(32)},
+            {milvus::index::DISK_ANN_BUILD_THREAD_NUM, std::to_string(2)},
+        };
+    } else if (index_type == knowhere::IndexEnum::INDEX_SPARSE_INVERTED_INDEX ||
+               index_type == knowhere::IndexEnum::INDEX_SPARSE_WAND) {
+        if (metric_type == knowhere::metric::BM25) {
+            return knowhere::Json{
+                {knowhere::meta::METRIC_TYPE, metric_type},
+                {knowhere::indexparam::DROP_RATIO_BUILD, "0.1"},
+                {knowhere::meta::BM25_K1, "1.2"},
+                {knowhere::meta::BM25_B, "0.75"},
+                {knowhere::meta::BM25_AVGDL, "100"}};
+        }
+        return knowhere::Json{
+            {knowhere::meta::METRIC_TYPE, metric_type},
+            {knowhere::indexparam::DROP_RATIO_BUILD, "0.1"},
         };
     }
     return knowhere::Json();
 }
 
-auto
+template <typename DataType = float>
+inline auto
 generate_load_conf(const milvus::IndexType& index_type,
                    const milvus::MetricType& metric_type,
                    int64_t nb) {
@@ -262,11 +126,16 @@ generate_load_conf(const milvus::IndexType& index_type,
         return knowhere::Json{
             {knowhere::meta::METRIC_TYPE, metric_type},
             {knowhere::meta::DIM, std::to_string(DIM)},
+            {milvus::index::DISK_ANN_LOAD_THREAD_NUM, std::to_string(2)},
             {milvus::index::DISK_ANN_SEARCH_CACHE_BUDGET,
-             std::to_string(0.0002)},
+             std::to_string(0.05 * sizeof(DataType) * nb /
+                            (1024.0 * 1024.0 * 1024.0))},
         };
     }
-    return knowhere::Json();
+    return knowhere::Json{
+        {knowhere::meta::METRIC_TYPE, metric_type},
+        {knowhere::meta::DIM, std::to_string(DIM)},
+    };
 }
 
 std::vector<milvus::IndexType>
@@ -287,8 +156,8 @@ generate_search_conf(const milvus::IndexType& index_type,
         {knowhere::meta::METRIC_TYPE, metric_type},
     };
 
-    if (milvus::index::is_in_list<milvus::IndexType>(index_type,
-                                                     search_with_nprobe_list)) {
+    if (milvus::is_in_list<milvus::IndexType>(index_type,
+                                              search_with_nprobe_list)) {
         conf[knowhere::indexparam::NPROBE] = 4;
     } else if (index_type == knowhere::IndexEnum::INDEX_HNSW) {
         conf[knowhere::indexparam::EF] = 200;
@@ -313,8 +182,8 @@ generate_range_search_conf(const milvus::IndexType& index_type,
         conf[knowhere::meta::RANGE_FILTER] = 0.1;
     }
 
-    if (milvus::index::is_in_list<milvus::IndexType>(index_type,
-                                                     search_with_nprobe_list)) {
+    if (milvus::is_in_list<milvus::IndexType>(index_type,
+                                              search_with_nprobe_list)) {
         conf[knowhere::indexparam::NPROBE] = 4;
     } else if (index_type == knowhere::IndexEnum::INDEX_HNSW) {
         conf[knowhere::indexparam::EF] = 200;
@@ -349,20 +218,17 @@ generate_params(const knowhere::IndexType& index_type,
 }
 
 auto
-GenDataset(int64_t N,
-           const knowhere::MetricType& metric_type,
-           bool is_binary,
-           int64_t dim = DIM) {
+GenFieldData(int64_t N,
+             const knowhere::MetricType& metric_type,
+             milvus::DataType data_type = milvus::DataType::VECTOR_FLOAT,
+             int64_t dim = DIM) {
     auto schema = std::make_shared<milvus::Schema>();
-    if (!is_binary) {
-        schema->AddDebugField(
-            "fakevec", milvus::DataType::VECTOR_FLOAT, dim, metric_type);
-        return milvus::segcore::DataGen(schema, N);
-    } else {
-        schema->AddDebugField(
-            "fakebinvec", milvus::DataType::VECTOR_BINARY, dim, metric_type);
-        return milvus::segcore::DataGen(schema, N);
-    }
+    schema->AddDebugField(
+        "fakevec",
+        data_type,
+        (data_type != milvus::DataType::VECTOR_SPARSE_FLOAT ? dim : 0),
+        metric_type);
+    return milvus::segcore::DataGen(schema, N);
 }
 
 using QueryResultPtr = std::unique_ptr<milvus::SearchResult>;
@@ -497,7 +363,7 @@ template <typename T,
           typename = typename std::enable_if_t<std::is_arithmetic_v<T> ||
                                                std::is_same_v<T, std::string>>>
 inline std::vector<T>
-GenArr(int64_t n) {
+GenSortedArr(int64_t n) {
     auto max_i8 = std::numeric_limits<int8_t>::max() - 1;
     std::vector<T> arr;
     arr.resize(n);
@@ -523,15 +389,14 @@ GenStrArr(int64_t n) {
 
 template <>
 inline std::vector<std::string>
-GenArr<std::string>(int64_t n) {
+GenSortedArr<std::string>(int64_t n) {
     return GenStrArr(n);
 }
 
 std::vector<ScalarTestParams>
 GenBoolParams() {
     std::vector<ScalarTestParams> ret;
-    ret.emplace_back(
-        ScalarTestParams(MapParams(), {{"index_type", "inverted_index"}}));
+    ret.emplace_back(ScalarTestParams(MapParams(), {{"index_type", "sort"}}));
     ret.emplace_back(ScalarTestParams(MapParams(), {{"index_type", "flat"}}));
     return ret;
 }
@@ -557,8 +422,7 @@ GenParams() {
     }
 
     std::vector<ScalarTestParams> ret;
-    ret.emplace_back(
-        ScalarTestParams(MapParams(), {{"index_type", "inverted_index"}}));
+    ret.emplace_back(ScalarTestParams(MapParams(), {{"index_type", "sort"}}));
     ret.emplace_back(ScalarTestParams(MapParams(), {{"index_type", "flat"}}));
     return ret;
 }
@@ -591,13 +455,27 @@ GenDsFromPB(const google::protobuf::Message& msg) {
 template <typename T>
 inline std::vector<std::string>
 GetIndexTypes() {
-    return std::vector<std::string>{"inverted_index"};
+    return std::vector<std::string>{"sort", milvus::index::BITMAP_INDEX_TYPE};
 }
 
 template <>
 inline std::vector<std::string>
 GetIndexTypes<std::string>() {
-    return std::vector<std::string>{"marisa"};
+    return std::vector<std::string>{
+        "sort", "marisa", milvus::index::BITMAP_INDEX_TYPE};
+}
+
+template <typename T>
+inline std::vector<std::string>
+GetIndexTypesV2() {
+    return std::vector<std::string>{"sort", milvus::index::INVERTED_INDEX_TYPE};
+}
+
+template <>
+inline std::vector<std::string>
+GetIndexTypesV2<std::string>() {
+    return std::vector<std::string>{"marisa",
+                                    milvus::index::INVERTED_INDEX_TYPE};
 }
 
 }  // namespace

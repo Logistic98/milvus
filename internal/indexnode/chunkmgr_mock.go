@@ -9,12 +9,13 @@ import (
 
 	"golang.org/x/exp/mmap"
 
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/proto/etcdpb"
-	"github.com/milvus-io/milvus/internal/proto/indexpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/pkg/common"
 	"github.com/milvus-io/milvus/pkg/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/proto/etcdpb"
+	"github.com/milvus-io/milvus/pkg/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
@@ -66,15 +67,16 @@ var (
 					Description:  "",
 					DataType:     schemapb.DataType_FloatVector,
 					AutoID:       false,
+					TypeParams: []*commonpb.KeyValuePair{
+						{Key: common.DimKey, Value: "8"},
+					},
 				},
 			},
 		},
 	}
 )
 
-var (
-	mockChunkMgrIns = &mockChunkmgr{}
-)
+var mockChunkMgrIns = &mockChunkmgr{}
 
 type mockStorageFactory struct{}
 
@@ -138,14 +140,8 @@ func (c *mockChunkmgr) MultiRead(ctx context.Context, filePaths []string) ([][]b
 	return nil, errNotImplErr
 }
 
-func (c *mockChunkmgr) ReadWithPrefix(ctx context.Context, prefix string) ([]string, [][]byte, error) {
-	// TODO
-	return nil, nil, errNotImplErr
-}
-
-func (c *mockChunkmgr) ListWithPrefix(ctx context.Context, prefix string, recursive bool) ([]string, []time.Time, error) {
-	// TODO
-	return nil, nil, errNotImplErr
+func (c *mockChunkmgr) WalkWithPrefix(ctx context.Context, prefix string, recursive bool, walkFunc storage.ChunkObjectWalkFunc) error {
+	return errNotImplErr
 }
 
 func (c *mockChunkmgr) Mmap(ctx context.Context, filePath string) (*mmap.ReaderAt, error) {
@@ -202,7 +198,7 @@ func (c *mockChunkmgr) mockFieldData(numrows, dim int, collectionID, partitionID
 	insertCodec := &storage.InsertCodec{
 		Schema: collMeta,
 	}
-	blobs, _, err := insertCodec.Serialize(partitionID, segmentID, insertData)
+	blobs, err := insertCodec.Serialize(partitionID, segmentID, insertData)
 	if err != nil {
 		panic(err)
 	}
@@ -241,11 +237,6 @@ func (f *mockFactory) NewMsgStream(context.Context) (msgstream.MsgStream, error)
 }
 
 func (f *mockFactory) NewTtMsgStream(context.Context) (msgstream.MsgStream, error) {
-	// TODO
-	return nil, errNotImplErr
-}
-
-func (f *mockFactory) NewQueryMsgStream(context.Context) (msgstream.MsgStream, error) {
 	// TODO
 	return nil, errNotImplErr
 }

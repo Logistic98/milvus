@@ -17,7 +17,10 @@ import (
 	"runtime"
 	"sync"
 
+	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/errors/oserror"
 	"github.com/shirou/gopsutil/v3/cpu"
+	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/mem"
 	"go.uber.org/automaxprocs/maxprocs"
 	"go.uber.org/zap"
@@ -45,8 +48,10 @@ func InitMaxprocs(serverType string, flags *flag.FlagSet) {
 
 // GetCPUNum returns the count of cpu core.
 func GetCPUNum() int {
+	//nolint
 	cur := runtime.GOMAXPROCS(0)
 	if cur <= 0 {
+		//nolint
 		cur = runtime.NumCPU()
 	}
 	return cur
@@ -72,13 +77,6 @@ func GetCPUUsage() float64 {
 
 // GetMemoryCount returns the memory count in bytes.
 func GetMemoryCount() uint64 {
-	icOnce.Do(func() {
-		ic, icErr = inContainer()
-	})
-	if icErr != nil {
-		log.Error(icErr.Error())
-		return 0
-	}
 	// get host memory by `gopsutil`
 	stats, err := mem.VirtualMemory()
 	if err != nil {
@@ -86,51 +84,20 @@ func GetMemoryCount() uint64 {
 			zap.Error(err))
 		return 0
 	}
-	// not in container, return host memory
-	if !ic {
-		return stats.Total
-	}
 
 	// get container memory by `cgroups`
 	limit, err := getContainerMemLimit()
-	if err != nil {
-		log.Error(err.Error())
-		return 0
-	}
 	// in container, return min(hostMem, containerMem)
-	if limit < stats.Total {
+	if limit > 0 && limit < stats.Total {
 		return limit
 	}
-	return stats.Total
-}
 
-// GetUsedMemoryCount returns the memory usage in bytes.
-func GetUsedMemoryCount() uint64 {
-	icOnce.Do(func() {
-		ic, icErr = inContainer()
-	})
-	if icErr != nil {
-		log.Error(icErr.Error())
-		return 0
-	}
-	if ic {
-		// in container, calculate by `cgroups`
-		used, err := getContainerMemUsed()
-		if err != nil {
-			log.Error(err.Error())
-			return 0
-		}
-		return used
-	}
-	// not in container, calculate by `gopsutil`
-	stats, err := mem.VirtualMemory()
-	if err != nil {
-		log.Warn("failed to get memory usage count",
+	if err != nil || limit > stats.Total {
+		log.RatedWarn(3600, "failed to get container memory limit",
+			zap.Uint64("containerLimit", limit),
 			zap.Error(err))
-		return 0
 	}
-
-	return stats.Used
+	return stats.Total
 }
 
 // GetFreeMemoryCount returns the free memory in bytes.
@@ -138,16 +105,31 @@ func GetFreeMemoryCount() uint64 {
 	return GetMemoryCount() - GetUsedMemoryCount()
 }
 
-// TODO(dragondriver): not accurate to calculate disk usage when we use distributed storage
-
-// GetDiskCount returns the disk count in bytes.
-func GetDiskCount() uint64 {
-	return 100 * 1024 * 1024
+// GetDiskUsage Get Disk Usage in GB
+func GetDiskUsage(path string) (float64, float64, error) {
+	diskStats, err := disk.Usage(path)
+	if err != nil {
+		// If the path does not exist, ignore the error and return 0.
+		if errors.Is(err, oserror.ErrNotExist) {
+			return 0, 0, nil
+		}
+		return 0, 0, err
+	}
+	usedGB := float64(diskStats.Used) / 1e9
+	totalGB := float64(diskStats.Total) / 1e9
+	return usedGB, totalGB, nil
 }
 
-// GetDiskUsage returns the disk usage in bytes.
-func GetDiskUsage() uint64 {
-	return 2 * 1024 * 1024
+// GetIOWait Get IO Wait Percentage
+func GetIOWait() (float64, error) {
+	cpuTimes, err := cpu.Times(false)
+	if err != nil {
+		return 0, err
+	}
+	if len(cpuTimes) > 0 {
+		return cpuTimes[0].Iowait, nil
+	}
+	return 0, nil
 }
 
 func GetMemoryUseRatio() float64 {

@@ -11,7 +11,13 @@
 # or implied. See the License for the specific language governing permissions and limitations under the License.
 #-------------------------------------------------------------------------------
 
-set( KNOWHERE_VERSION 2fa9067d )
+# Update KNOWHERE_VERSION for the first occurrence
+milvus_add_pkg_config("knowhere")
+set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY INCLUDE_DIRECTORIES "")
+set( KNOWHERE_VERSION 7dc867d3 )
+set( GIT_REPOSITORY  "https://github.com/zilliztech/knowhere.git")
+message(STATUS "Knowhere repo: ${GIT_REPOSITORY}")
+message(STATUS "Knowhere version: ${KNOWHERE_VERSION}")
 
 message(STATUS "Building knowhere-${KNOWHERE_SOURCE_VER} from source")
 message(STATUS ${CMAKE_BUILD_TYPE})
@@ -22,16 +28,20 @@ else ()
     set(WITH_DISKANN OFF CACHE BOOL "" FORCE )
 endif ()
 
+if ( INDEX_ENGINE STREQUAL "cardinal" )
+    set(WITH_CARDINAL ON CACHE BOOL "" FORCE )
+else ()
+    set(WITH_CARDINAL OFF CACHE BOOL "" FORCE )
+endif()
+
 if ( MILVUS_GPU_VERSION STREQUAL "ON" )
-    set(USE_CUDA ON CACHE BOOL "" FORCE )
     set(WITH_RAFT ON CACHE BOOL "" FORCE )
 endif ()
-
 
 set( CMAKE_PREFIX_PATH ${CONAN_BOOST_ROOT} )
 FetchContent_Declare(
         knowhere
-        GIT_REPOSITORY  "https://github.com/milvus-io/knowhere.git"
+        GIT_REPOSITORY  ${GIT_REPOSITORY}
         GIT_TAG         ${KNOWHERE_VERSION}
         SOURCE_DIR      ${CMAKE_CURRENT_BINARY_DIR}/knowhere-src
         BINARY_DIR      ${CMAKE_CURRENT_BINARY_DIR}/knowhere-build
@@ -50,3 +60,5 @@ endif()
 # get prometheus COMPILE_OPTIONS
 get_property( var DIRECTORY "${knowhere_SOURCE_DIR}" PROPERTY COMPILE_OPTIONS )
 message( STATUS "knowhere src compile options: ${var}" )
+
+set( KNOWHERE_INCLUDE_DIR ${knowhere_SOURCE_DIR}/include CACHE INTERNAL "Path to knowhere include directory" )

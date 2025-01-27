@@ -1,12 +1,29 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package httpserver
 
 import (
-	"encoding/json"
 	"testing"
 
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/json"
 )
 
 func TestFieldData_AsSchemapb(t *testing.T) {
@@ -163,14 +180,84 @@ func TestFieldData_AsSchemapb(t *testing.T) {
 	})
 
 	// vectors
+	testcases := []struct {
+		name     string
+		dataType schemapb.DataType
+	}{
+		{
+			"float", schemapb.DataType_FloatVector,
+		},
+		{
+			"float16", schemapb.DataType_Float16Vector,
+		},
+		{
+			"bfloat16", schemapb.DataType_BFloat16Vector,
+		},
+	}
+	for _, tc := range testcases {
+		t.Run(tc.name+"vector_ok", func(t *testing.T) {
+			fieldData := FieldData{
+				Type: tc.dataType,
+				Field: []byte(`[
+					[1.1, 2.2, 3.1],
+					[1.1, 2.2, 3.1],
+					[1.1, 2.2, 3.1]
+				]`),
+			}
+			raw, _ := json.Marshal(fieldData)
+			json.Unmarshal(raw, &fieldData)
+			_, err := fieldData.AsSchemapb()
+			assert.NoError(t, err)
+		})
+		t.Run(tc.name+"vector_empty_error", func(t *testing.T) {
+			fieldData := FieldData{
+				Type:  tc.dataType,
+				Field: []byte(""),
+			}
+			raw, _ := json.Marshal(fieldData)
+			json.Unmarshal(raw, &fieldData)
+			_, err := fieldData.AsSchemapb()
+			assert.Error(t, err)
+		})
+		t.Run(tc.name+"vector_dim=0_error", func(t *testing.T) {
+			fieldData := FieldData{
+				Type:  tc.dataType,
+				Field: []byte(`[]`),
+			}
+			raw, _ := json.Marshal(fieldData)
+			json.Unmarshal(raw, &fieldData)
+			_, err := fieldData.AsSchemapb()
+			assert.Error(t, err)
+		})
+		t.Run(tc.name+"vector_vectorTypeError_error", func(t *testing.T) {
+			fieldData := FieldData{
+				Type:  tc.dataType,
+				Field: []byte(`["1"]`),
+			}
+			raw, _ := json.Marshal(fieldData)
+			json.Unmarshal(raw, &fieldData)
+			_, err := fieldData.AsSchemapb()
+			assert.Error(t, err)
+		})
+		t.Run(tc.name+"vector_error", func(t *testing.T) {
+			fieldData := FieldData{
+				Type:  tc.dataType,
+				Field: []byte(`["a", "b", "c"]`),
+			}
+			raw, _ := json.Marshal(fieldData)
+			json.Unmarshal(raw, &fieldData)
+			_, err := fieldData.AsSchemapb()
+			assert.Error(t, err)
+		})
+	}
 
-	t.Run("floatvector_ok", func(t *testing.T) {
+	t.Run("sparsefloatvector_ok_1", func(t *testing.T) {
 		fieldData := FieldData{
-			Type: schemapb.DataType_FloatVector,
+			Type: schemapb.DataType_SparseFloatVector,
 			Field: []byte(`[
-				[1.1, 2.2, 3.1],
-				[1.1, 2.2, 3.1],
-				[1.1, 2.2, 3.1]
+				{"1": 0.1, "2": 0.2},
+				{"3": 0.1, "5": 0.2},
+				{"4": 0.1, "6": 0.2}
 			]`),
 		}
 		raw, _ := json.Marshal(fieldData)
@@ -178,19 +265,40 @@ func TestFieldData_AsSchemapb(t *testing.T) {
 		_, err := fieldData.AsSchemapb()
 		assert.NoError(t, err)
 	})
-	t.Run("floatvector_empty_error", func(t *testing.T) {
+
+	t.Run("sparsefloatvector_ok_2", func(t *testing.T) {
 		fieldData := FieldData{
-			Type:  schemapb.DataType_FloatVector,
-			Field: []byte(""),
+			Type: schemapb.DataType_SparseFloatVector,
+			Field: []byte(`[
+				{"indices": [1, 2], "values": [0.1, 0.2]},
+				{"indices": [3, 5], "values": [0.1, 0.2]},
+				{"indices": [4, 6], "values": [0.1, 0.2]}
+			]`),
 		}
 		raw, _ := json.Marshal(fieldData)
 		json.Unmarshal(raw, &fieldData)
 		_, err := fieldData.AsSchemapb()
-		assert.Error(t, err)
+		assert.NoError(t, err)
 	})
-	t.Run("floatvector_dim=0_error", func(t *testing.T) {
+
+	t.Run("sparsefloatvector_ok_3", func(t *testing.T) {
 		fieldData := FieldData{
-			Type:  schemapb.DataType_FloatVector,
+			Type: schemapb.DataType_SparseFloatVector,
+			Field: []byte(`[
+				{"indices": [1, 2], "values": [0.1, 0.2]},
+				{"3": 0.1, "5": 0.2},
+				{"indices": [4, 6], "values": [0.1, 0.2]}
+			]`),
+		}
+		raw, _ := json.Marshal(fieldData)
+		json.Unmarshal(raw, &fieldData)
+		_, err := fieldData.AsSchemapb()
+		assert.NoError(t, err)
+	})
+
+	t.Run("sparsefloatvector_empty_err", func(t *testing.T) {
+		fieldData := FieldData{
+			Type:  schemapb.DataType_SparseFloatVector,
 			Field: []byte(`[]`),
 		}
 		raw, _ := json.Marshal(fieldData)
@@ -198,20 +306,96 @@ func TestFieldData_AsSchemapb(t *testing.T) {
 		_, err := fieldData.AsSchemapb()
 		assert.Error(t, err)
 	})
-	t.Run("floatvector_vectorTypeError_error", func(t *testing.T) {
+
+	t.Run("sparsefloatvector_invalid_json_err", func(t *testing.T) {
 		fieldData := FieldData{
-			Type:  schemapb.DataType_FloatVector,
-			Field: []byte(`["1"]`),
+			Type: schemapb.DataType_SparseFloatVector,
+			Field: []byte(`[
+				{"3": 0.1, : 0.2}
+			]`),
 		}
 		raw, _ := json.Marshal(fieldData)
 		json.Unmarshal(raw, &fieldData)
 		_, err := fieldData.AsSchemapb()
 		assert.Error(t, err)
 	})
-	t.Run("floatvector_error", func(t *testing.T) {
+
+	t.Run("sparsefloatvector_invalid_row_1_err", func(t *testing.T) {
 		fieldData := FieldData{
-			Type:  schemapb.DataType_FloatVector,
-			Field: []byte(`["a", "b", "c"]`),
+			Type: schemapb.DataType_SparseFloatVector,
+			Field: []byte(`[
+				{"indices": [1, 2], "values": [-0.1, 0.2]},
+			]`),
+		}
+		raw, _ := json.Marshal(fieldData)
+		json.Unmarshal(raw, &fieldData)
+		_, err := fieldData.AsSchemapb()
+		assert.Error(t, err)
+	})
+
+	t.Run("sparsefloatvector_invalid_row_2_err", func(t *testing.T) {
+		fieldData := FieldData{
+			Type: schemapb.DataType_SparseFloatVector,
+			Field: []byte(`[
+				{"indices": [1, -2], "values": [0.1, 0.2]},
+			]`),
+		}
+		raw, _ := json.Marshal(fieldData)
+		json.Unmarshal(raw, &fieldData)
+		_, err := fieldData.AsSchemapb()
+		assert.Error(t, err)
+	})
+
+	t.Run("int8vector_ok_1", func(t *testing.T) {
+		fieldData := FieldData{
+			Type: schemapb.DataType_Int8Vector,
+			Field: []byte(`[
+				[1, 2, 3, 4],
+				[-11, -52, 37, 121],
+				[-128, -35, 31, 127]
+			]`),
+		}
+		raw, _ := json.Marshal(fieldData)
+		json.Unmarshal(raw, &fieldData)
+		_, err := fieldData.AsSchemapb()
+		assert.NoError(t, err)
+	})
+	t.Run("int8vector_ok_1", func(t *testing.T) {
+		fieldData := FieldData{
+			Type: schemapb.DataType_Int8Vector,
+			Field: []byte(`[
+				[-200, 141]
+			]`),
+		}
+		raw, _ := json.Marshal(fieldData)
+		json.Unmarshal(raw, &fieldData)
+		_, err := fieldData.AsSchemapb()
+		assert.Error(t, err)
+	})
+	t.Run("int8vector_empty_err", func(t *testing.T) {
+		fieldData := FieldData{
+			Type:  schemapb.DataType_Int8Vector,
+			Field: []byte(""),
+		}
+		raw, _ := json.Marshal(fieldData)
+		json.Unmarshal(raw, &fieldData)
+		_, err := fieldData.AsSchemapb()
+		assert.Error(t, err)
+	})
+	t.Run("int8vector_dim0_err", func(t *testing.T) {
+		fieldData := FieldData{
+			Type:  schemapb.DataType_Int8Vector,
+			Field: []byte(`[]`),
+		}
+		raw, _ := json.Marshal(fieldData)
+		json.Unmarshal(raw, &fieldData)
+		_, err := fieldData.AsSchemapb()
+		assert.Error(t, err)
+	})
+	t.Run("int8vector_datatype_err", func(t *testing.T) {
+		fieldData := FieldData{
+			Type:  schemapb.DataType_Int8Vector,
+			Field: []byte(`['a', 'b', 'c']`),
 		}
 		raw, _ := json.Marshal(fieldData)
 		json.Unmarshal(raw, &fieldData)

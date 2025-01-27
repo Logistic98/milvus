@@ -21,31 +21,25 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/errors"
-	"github.com/milvus-io/milvus/internal/util/mock"
-
-	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
+
+	"github.com/milvus-io/milvus/internal/util/mock"
+	"github.com/milvus-io/milvus/pkg/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
 func Test_NewClient(t *testing.T) {
 	paramtable.Init()
 
 	ctx := context.Background()
-	client, err := NewClient(ctx, "")
+	client, err := NewClient(ctx, "", 1)
 	assert.Nil(t, client)
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 
-	client, err = NewClient(ctx, "test")
-	assert.Nil(t, err)
+	client, err = NewClient(ctx, "test", 2)
+	assert.NoError(t, err)
 	assert.NotNil(t, client)
-
-	err = client.Start()
-	assert.Nil(t, err)
-
-	err = client.Register()
-	assert.Nil(t, err)
 
 	ctx, cancel := context.WithCancel(ctx)
 
@@ -53,20 +47,20 @@ func Test_NewClient(t *testing.T) {
 		retCheck := func(notNil bool, ret any, err error) {
 			if notNil {
 				assert.NotNil(t, ret)
-				assert.Nil(t, err)
+				assert.NoError(t, err)
 			} else {
 				assert.Nil(t, ret)
-				assert.NotNil(t, err)
+				assert.Error(t, err)
 			}
 		}
 
-		r1, err := client.GetComponentStates(ctx)
+		r1, err := client.GetComponentStates(ctx, nil)
 		retCheck(retNotNil, r1, err)
 
-		r2, err := client.GetTimeTickChannel(ctx)
+		r2, err := client.GetTimeTickChannel(ctx, nil)
 		retCheck(retNotNil, r2, err)
 
-		r3, err := client.GetStatisticsChannel(ctx)
+		r3, err := client.GetStatisticsChannel(ctx, nil)
 		retCheck(retNotNil, r3, err)
 
 		r6, err := client.WatchDmChannels(ctx, nil)
@@ -107,20 +101,33 @@ func Test_NewClient(t *testing.T) {
 
 		r18, err := client.ShowConfigurations(ctx, nil)
 		retCheck(retNotNil, r18, err)
+
+		r19, err := client.QuerySegments(ctx, nil)
+		retCheck(retNotNil, r19, err)
+
+		r20, err := client.SearchSegments(ctx, nil)
+		retCheck(retNotNil, r20, err)
+
+		r21, err := client.DeleteBatch(ctx, nil)
+		retCheck(retNotNil, r21, err)
+
+		// stream rpc
+		client, err := client.QueryStream(ctx, nil)
+		retCheck(retNotNil, client, err)
 	}
 
-	client.grpcClient = &mock.GRPCClientBase[querypb.QueryNodeClient]{
+	client.(*Client).grpcClient = &mock.GRPCClientBase[querypb.QueryNodeClient]{
 		GetGrpcClientErr: errors.New("dummy"),
 	}
 
 	newFunc1 := func(cc *grpc.ClientConn) querypb.QueryNodeClient {
 		return &mock.GrpcQueryNodeClient{Err: nil}
 	}
-	client.grpcClient.SetNewGrpcClientFunc(newFunc1)
+	client.(*Client).grpcClient.SetNewGrpcClientFunc(newFunc1)
 
 	checkFunc(false)
 
-	client.grpcClient = &mock.GRPCClientBase[querypb.QueryNodeClient]{
+	client.(*Client).grpcClient = &mock.GRPCClientBase[querypb.QueryNodeClient]{
 		GetGrpcClientErr: nil,
 	}
 
@@ -128,29 +135,29 @@ func Test_NewClient(t *testing.T) {
 		return &mock.GrpcQueryNodeClient{Err: errors.New("dummy")}
 	}
 
-	client.grpcClient.SetNewGrpcClientFunc(newFunc2)
+	client.(*Client).grpcClient.SetNewGrpcClientFunc(newFunc2)
 
 	checkFunc(false)
 
-	client.grpcClient = &mock.GRPCClientBase[querypb.QueryNodeClient]{
+	client.(*Client).grpcClient = &mock.GRPCClientBase[querypb.QueryNodeClient]{
 		GetGrpcClientErr: nil,
 	}
 
 	newFunc3 := func(cc *grpc.ClientConn) querypb.QueryNodeClient {
 		return &mock.GrpcQueryNodeClient{Err: nil}
 	}
-	client.grpcClient.SetNewGrpcClientFunc(newFunc3)
+	client.(*Client).grpcClient.SetNewGrpcClientFunc(newFunc3)
 
 	checkFunc(true)
 
 	// ctx canceled
-	client.grpcClient = &mock.GRPCClientBase[querypb.QueryNodeClient]{
+	client.(*Client).grpcClient = &mock.GRPCClientBase[querypb.QueryNodeClient]{
 		GetGrpcClientErr: nil,
 	}
-	client.grpcClient.SetNewGrpcClientFunc(newFunc1)
+	client.(*Client).grpcClient.SetNewGrpcClientFunc(newFunc1)
 	cancel() // make context canceled
 	checkFunc(false)
 
-	err = client.Stop()
-	assert.Nil(t, err)
+	err = client.Close()
+	assert.NoError(t, err)
 }

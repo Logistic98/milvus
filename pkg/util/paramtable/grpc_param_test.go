@@ -1,13 +1,18 @@
-// Copyright (C) 2019-2020 Zilliz. All rights reserved.
-//
-// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
 // with the License. You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed under the License
-// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
-// or implied. See the License for the specific language governing permissions and limitations under the License.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package paramtable
 
@@ -23,9 +28,9 @@ import (
 func TestGrpcServerParams(t *testing.T) {
 	role := typeutil.DataNodeRole
 	base := &ComponentParam{}
-	base.Init()
+	base.Init(NewBaseTable(SkipRemote(true)))
 	var serverConfig GrpcServerConfig
-	serverConfig.Init(role, &base.BaseTable)
+	serverConfig.Init(role, base.baseTable)
 
 	assert.Equal(t, serverConfig.Domain, role)
 	t.Logf("Domain = %s", serverConfig.Domain)
@@ -48,9 +53,9 @@ func TestGrpcServerParams(t *testing.T) {
 	assert.Equal(t, serverConfig.ServerMaxRecvSize.GetAsInt(), DefaultServerMaxRecvSize)
 
 	base.Save("grpc.serverMaxRecvSize", "a")
-	assert.Equal(t, serverConfig.ServerMaxSendSize.GetAsInt(), DefaultServerMaxRecvSize)
+	assert.Equal(t, serverConfig.ServerMaxRecvSize.GetAsInt(), DefaultServerMaxRecvSize)
 
-	assert.NotZero(t, serverConfig.ServerMaxSendSize)
+	assert.NotZero(t, serverConfig.ServerMaxSendSize.GetAsInt())
 	t.Logf("ServerMaxSendSize = %d", serverConfig.ServerMaxSendSize.GetAsInt())
 
 	base.Remove(role + ".grpc.serverMaxSendSize")
@@ -61,14 +66,17 @@ func TestGrpcServerParams(t *testing.T) {
 
 	base.Save("grpc.serverMaxSendSize", "a")
 	assert.Equal(t, serverConfig.ServerMaxSendSize.GetAsInt(), DefaultServerMaxSendSize)
+
+	base.Save(serverConfig.GracefulStopTimeout.Key, "1")
+	assert.Equal(t, serverConfig.GracefulStopTimeout.GetAsInt(), 1)
 }
 
 func TestGrpcClientParams(t *testing.T) {
 	role := typeutil.DataNodeRole
 	base := ComponentParam{}
-	base.Init()
+	base.Init(NewBaseTable(SkipRemote(true)))
 	var clientConfig GrpcClientConfig
-	clientConfig.Init(role, &base.BaseTable)
+	clientConfig.Init(role, base.baseTable)
 
 	assert.Equal(t, clientConfig.Domain, role)
 	t.Logf("Domain = %s", clientConfig.Domain)
@@ -122,33 +130,44 @@ func TestGrpcClientParams(t *testing.T) {
 	assert.Equal(t, clientConfig.MaxAttempts.GetAsInt(), DefaultMaxAttempts)
 	base.Save("grpc.client.maxMaxAttempts", "a")
 	assert.Equal(t, clientConfig.MaxAttempts.GetAsInt(), DefaultMaxAttempts)
-	base.Save("grpc.client.maxMaxAttempts", "1")
-	assert.Equal(t, clientConfig.MaxAttempts.GetAsInt(), DefaultMaxAttempts)
-	base.Save("grpc.client.maxMaxAttempts", "10")
-	assert.Equal(t, clientConfig.MaxAttempts.GetAsInt(), DefaultMaxAttempts)
 	base.Save("grpc.client.maxMaxAttempts", "4")
 	assert.Equal(t, clientConfig.MaxAttempts.GetAsInt(), 4)
 
-	base.Save("grpc.client.initialBackOff", "a")
-	base.Save("grpc.client.initialBackOff", "2.0")
+	assert.Equal(t, DefaultInitialBackoff, clientConfig.InitialBackoff.GetAsFloat())
+	base.Save(clientConfig.InitialBackoff.Key, "a")
+	assert.Equal(t, DefaultInitialBackoff, clientConfig.InitialBackoff.GetAsFloat())
+	base.Save(clientConfig.InitialBackoff.Key, "2.0")
+	assert.Equal(t, 2.0, clientConfig.InitialBackoff.GetAsFloat())
 
 	assert.Equal(t, clientConfig.MaxBackoff.GetAsFloat(), DefaultMaxBackoff)
-	base.Save("grpc.client.maxBackOff", "a")
+	base.Save(clientConfig.MaxBackoff.Key, "a")
 	assert.Equal(t, clientConfig.MaxBackoff.GetAsFloat(), DefaultMaxBackoff)
-	base.Save("grpc.client.maxBackOff", "50.0")
-	assert.Equal(t, clientConfig.MaxBackoff.GetAsFloat(), 50.0)
-
-	assert.Equal(t, clientConfig.BackoffMultiplier.GetAsFloat(), DefaultBackoffMultiplier)
-	base.Save("grpc.client.backoffMultiplier", "a")
-	assert.Equal(t, clientConfig.BackoffMultiplier.GetAsFloat(), DefaultBackoffMultiplier)
-	base.Save("grpc.client.backoffMultiplier", "3.0")
-	assert.Equal(t, clientConfig.BackoffMultiplier.GetAsFloat(), 3.0)
+	base.Save(clientConfig.MaxBackoff.Key, "50.0")
+	assert.Equal(t, 50.0, clientConfig.MaxBackoff.GetAsFloat())
 
 	assert.Equal(t, clientConfig.CompressionEnabled.GetAsBool(), DefaultCompressionEnabled)
 	base.Save("grpc.client.CompressionEnabled", "a")
 	assert.Equal(t, clientConfig.CompressionEnabled.GetAsBool(), DefaultCompressionEnabled)
-	base.Save("grpc.client.CompressionEnabled", "true")
-	assert.Equal(t, clientConfig.CompressionEnabled.GetAsBool(), true)
+	base.Save(clientConfig.CompressionEnabled.Key, "true")
+	assert.Equal(t, true, clientConfig.CompressionEnabled.GetAsBool())
+
+	assert.Equal(t, clientConfig.MinResetInterval.GetValue(), "1000")
+	base.Save("grpc.client.minResetInterval", "abc")
+	assert.Equal(t, clientConfig.MinResetInterval.GetValue(), "1000")
+	base.Save("grpc.client.minResetInterval", "5000")
+	assert.Equal(t, clientConfig.MinResetInterval.GetValue(), "5000")
+
+	assert.Equal(t, clientConfig.MinSessionCheckInterval.GetValue(), "200")
+	base.Save("grpc.client.minSessionCheckInterval", "abc")
+	assert.Equal(t, clientConfig.MinSessionCheckInterval.GetValue(), "200")
+	base.Save("grpc.client.minSessionCheckInterval", "500")
+	assert.Equal(t, clientConfig.MinSessionCheckInterval.GetValue(), "500")
+
+	assert.Equal(t, clientConfig.MaxCancelError.GetValue(), "32")
+	base.Save("grpc.client.maxCancelError", "abc")
+	assert.Equal(t, clientConfig.MaxCancelError.GetValue(), "32")
+	base.Save("grpc.client.maxCancelError", "64")
+	assert.Equal(t, clientConfig.MaxCancelError.GetValue(), "64")
 
 	base.Save("common.security.tlsMode", "1")
 	base.Save("tls.serverPemPath", "/pem")
@@ -158,4 +177,22 @@ func TestGrpcClientParams(t *testing.T) {
 	assert.Equal(t, clientConfig.ServerPemPath.GetValue(), "/pem")
 	assert.Equal(t, clientConfig.ServerKeyPath.GetValue(), "/key")
 	assert.Equal(t, clientConfig.CaPemPath.GetValue(), "/ca")
+}
+
+func TestInternalTLSParams(t *testing.T) {
+	base := ComponentParam{}
+	base.Init(NewBaseTable(SkipRemote(true)))
+	var internalTLSCfg InternalTLSConfig
+	internalTLSCfg.Init(base.baseTable)
+
+	base.Save("common.security.internalTlsEnabled", "true")
+	base.Save("internaltls.serverPemPath", "/pem")
+	base.Save("internaltls.serverKeyPath", "/key")
+	base.Save("internaltls.caPemPath", "/ca")
+	base.Save("internaltls.sni", "localhost")
+	assert.Equal(t, internalTLSCfg.InternalTLSEnabled.GetAsBool(), true)
+	assert.Equal(t, internalTLSCfg.InternalTLSServerPemPath.GetValue(), "/pem")
+	assert.Equal(t, internalTLSCfg.InternalTLSServerKeyPath.GetValue(), "/key")
+	assert.Equal(t, internalTLSCfg.InternalTLSCaPemPath.GetValue(), "/ca")
+	assert.Equal(t, internalTLSCfg.InternalTLSSNI.GetValue(), "localhost")
 }

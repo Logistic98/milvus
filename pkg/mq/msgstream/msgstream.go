@@ -19,9 +19,12 @@ package msgstream
 import (
 	"context"
 
-	"github.com/milvus-io/milvus-proto/go-api/msgpb"
+	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/mq/common"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
@@ -38,7 +41,7 @@ type IntPrimaryKey = typeutil.IntPrimaryKey
 type MsgPosition = msgpb.MsgPosition
 
 // MessageID is an alias for short
-type MessageID = mqwrapper.MessageID
+type MessageID = common.MessageID
 
 // MsgPack represents a batch of msg in msgstream
 type MsgPack struct {
@@ -56,23 +59,70 @@ type RepackFunc func(msgs []TsMsg, hashKeys [][]int32) (map[int32]*MsgPack, erro
 type MsgStream interface {
 	Close()
 
-	AsProducer(channels []string)
-	Produce(*MsgPack) error
+	AsProducer(ctx context.Context, channels []string)
+	Produce(context.Context, *MsgPack) error
 	SetRepackFunc(repackFunc RepackFunc)
 	GetProduceChannels() []string
-	Broadcast(*MsgPack) (map[string][]MessageID, error)
+	Broadcast(context.Context, *MsgPack) (map[string][]MessageID, error)
 
-	AsConsumer(channels []string, subName string, position mqwrapper.SubscriptionInitialPosition)
+	AsConsumer(ctx context.Context, channels []string, subName string, position common.SubscriptionInitialPosition) error
 	Chan() <-chan *MsgPack
-	Seek(offset []*MsgPosition) error
+	// Seek consume message from the specified position
+	// includeCurrentMsg indicates whether to consume the current message, and in the milvus system, it should be always false
+	Seek(ctx context.Context, msgPositions []*MsgPosition, includeCurrentMsg bool) error
 
 	GetLatestMsgID(channel string) (MessageID, error)
 	CheckTopicValid(channel string) error
+
+	ForceEnableProduce(can bool)
+}
+
+type ReplicateConfig struct {
+	ReplicateID string
+	CheckFunc   CheckReplicateMsgFunc
+}
+
+type CheckReplicateMsgFunc func(*ReplicateMsg) bool
+
+func GetReplicateConfig(replicateID, dbName, colName string) *ReplicateConfig {
+	if replicateID == "" {
+		return nil
+	}
+	replicateConfig := &ReplicateConfig{
+		ReplicateID: replicateID,
+		CheckFunc: func(msg *ReplicateMsg) bool {
+			if !msg.GetIsEnd() {
+				return false
+			}
+			log.Info("check replicate msg",
+				zap.String("replicateID", replicateID),
+				zap.String("dbName", dbName),
+				zap.String("colName", colName),
+				zap.Any("msg", msg))
+			if msg.GetIsCluster() {
+				return true
+			}
+			return msg.GetDatabase() == dbName && (msg.GetCollection() == colName || msg.GetCollection() == "")
+		},
+	}
+	return replicateConfig
+}
+
+func GetReplicateID(msg TsMsg) string {
+	msgBase, ok := msg.(interface{ GetBase() *commonpb.MsgBase })
+	if !ok {
+		log.Warn("fail to get msg base, please check it", zap.Any("type", msg.Type()))
+		return ""
+	}
+	return msgBase.GetBase().GetReplicateInfo().GetReplicateID()
+}
+
+func MatchReplicateID(msg TsMsg, replicateID string) bool {
+	return GetReplicateID(msg) == replicateID
 }
 
 type Factory interface {
 	NewMsgStream(ctx context.Context) (MsgStream, error)
 	NewTtMsgStream(ctx context.Context) (MsgStream, error)
-	NewQueryMsgStream(ctx context.Context) (MsgStream, error)
 	NewMsgStreamDisposer(ctx context.Context) func([]string, string) error
 }

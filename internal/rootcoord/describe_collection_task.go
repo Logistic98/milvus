@@ -19,8 +19,8 @@ package rootcoord
 import (
 	"context"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 )
 
 // describeCollectionTask describe collection request task
@@ -44,7 +44,22 @@ func (t *describeCollectionTask) Execute(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	aliases := t.core.meta.ListAliasesByID(coll.CollectionID)
-	t.Rsp = convertModelToDesc(coll, aliases)
+
+	aliases := t.core.meta.ListAliasesByID(ctx, coll.CollectionID)
+	db, err := t.core.meta.GetDatabaseByID(ctx, coll.DBID, t.GetTs())
+	if err != nil {
+		return err
+	}
+	t.Rsp = convertModelToDesc(coll, aliases, db.Name)
+	t.Rsp.RequestTime = t.ts
 	return nil
+}
+
+func (t *describeCollectionTask) GetLockerKey() LockerKey {
+	collection := t.core.getCollectionIDStr(t.ctx, t.Req.GetDbName(), t.Req.GetCollectionName(), t.Req.GetCollectionID())
+	return NewLockerKeyChain(
+		NewClusterLockerKey(false),
+		NewDatabaseLockerKey(t.Req.GetDbName(), false),
+		NewCollectionLockerKey(collection, false),
+	)
 }

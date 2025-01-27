@@ -22,7 +22,7 @@
 #include <deque>
 
 #include "common/Types.h"
-#include "exceptions/EasyAssert.h"
+#include "common/EasyAssert.h"
 #include "knowhere/bitsetview.h"
 
 namespace milvus {
@@ -41,8 +41,7 @@ class BitsetView : public knowhere::BitsetView {
     }
 
     BitsetView(const BitsetType& bitset)  // NOLINT
-        : BitsetView((uint8_t*)boost_ext::get_data(bitset),
-                     size_t(bitset.size())) {
+        : BitsetView((uint8_t*)(bitset.data()), bitset.size()) {
     }
 
     BitsetView(const BitsetTypePtr& bitset_ptr) {  // NOLINT
@@ -57,13 +56,13 @@ class BitsetView : public knowhere::BitsetView {
             return {};
         }
 
-        AssertInfo((offset & 0x7) == 0, "offset is not divisible by 8");
+        AssertInfo(
+            (offset & 0x7) == 0, "offset {} is not divisible by 8", offset);
         AssertInfo(offset + size <= this->size(),
-                   fmt::format(
-                       "index out of range, offset={}, size={}, bitset.size={}",
-                       offset,
-                       size,
-                       this->size()));
+                   "index out of range, offset={}, size={}, bitset.size={}",
+                   offset,
+                   size,
+                   this->size());
         return {data() + (offset >> 3), size};
     }
 };

@@ -8,7 +8,7 @@ image:
   all:
     repository: milvusdb/milvus
     tag: master-latest
-    pullPolicy: IfNotPresent
+    pullPolicy: Always
 standalone:
   resources:
     limits:
@@ -17,6 +17,11 @@ standalone:
     requests:
       cpu: 4
       memory: 8Gi
+pulsarv3:
+  enabled: false
+
+pulsar:
+  enabled: false
 
 kafka:
   enabled: false
@@ -27,7 +32,6 @@ kafka:
 etcd:
   replicaCount: 3
   image:
-    debug: true
     repository: milvusdb/etcd
     tag: 3.5.5-r2  
 minio:
@@ -37,6 +41,9 @@ pulsar:
 
 extraConfigFiles:
   user.yaml: |+
-    dataNode:
-      memory:
-        forceSyncEnable: false
+    dataCoord:
+      compaction:
+        indexBasedCompaction: false
+    indexCoord:
+      scheduler:
+        interval: 100        

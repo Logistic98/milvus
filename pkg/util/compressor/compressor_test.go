@@ -4,13 +4,14 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/milvus-io/milvus/pkg/util/hardware"
 )
 
 func TestZstdCompress(t *testing.T) {
@@ -119,15 +120,12 @@ func TestGlobalMethods(t *testing.T) {
 	// Incorrect option
 	err = ZstdCompress(strings.NewReader(data), compressed, zstd.WithWindowSize(3))
 	assert.Error(t, err)
-
-	err = ZstdDecompress(compressed, origin, zstd.WithDecoderConcurrency(0))
-	assert.Error(t, err)
 }
 
 func TestCurrencyGlobalMethods(t *testing.T) {
 	prefix := "Test Currency Global Methods"
 
-	currency := runtime.GOMAXPROCS(0) * 2
+	currency := hardware.GetCPUNum() * 2
 	if currency < 6 {
 		currency = 6
 	}

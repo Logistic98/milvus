@@ -19,12 +19,13 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/cockroachdb/errors"
-	"github.com/spf13/cast"
-	"github.com/spf13/viper"
+	"github.com/samber/lo"
 	"go.uber.org/zap"
+	"gopkg.in/yaml.v2"
 
 	"github.com/milvus-io/milvus/pkg/log"
 )
@@ -34,7 +35,9 @@ type FileSource struct {
 	files   []string
 	configs map[string]string
 
+	updateMu        sync.Mutex
 	configRefresher *refresher
+	manager         ConfigManager
 }
 
 func NewFileSource(fileInfo *FileInfo) *FileSource {
@@ -52,7 +55,7 @@ func (fs *FileSource) GetConfigurationByKey(key string) (string, error) {
 	v, ok := fs.configs[key]
 	fs.RUnlock()
 	if !ok {
-		return "", fmt.Errorf("key not found: %s", key)
+		return "", errors.Wrap(ErrKeyNotFound, key) // fmt.Errorf("key not found: %s", key)
 	}
 	return v, nil
 }
@@ -90,58 +93,92 @@ func (fs *FileSource) Close() {
 	fs.configRefresher.stop()
 }
 
+func (fs *FileSource) SetManager(m ConfigManager) {
+	fs.Lock()
+	defer fs.Unlock()
+	fs.manager = m
+}
+
 func (fs *FileSource) SetEventHandler(eh EventHandler) {
-	fs.configRefresher.eh = eh
+	fs.RWMutex.Lock()
+	defer fs.RWMutex.Unlock()
+	fs.configRefresher.SetEventHandler(eh)
+}
+
+func (fs *FileSource) UpdateOptions(opts Options) {
+	if opts.FileInfo == nil {
+		return
+	}
+
+	fs.Lock()
+	defer fs.Unlock()
+	fs.files = opts.FileInfo.Files
 }
 
 func (fs *FileSource) loadFromFile() error {
-	yamlReader := viper.New()
 	newConfig := make(map[string]string)
-	for _, configFile := range fs.files {
+	var configFiles []string
+
+	fs.RLock()
+	configFiles = fs.files
+	fs.RUnlock()
+
+	notExistsNum := 0
+	for _, configFile := range configFiles {
 		if _, err := os.Stat(configFile); err != nil {
-			continue
-		}
-
-		yamlReader.SetConfigFile(configFile)
-		if err := yamlReader.ReadInConfig(); err != nil {
-			return errors.Wrap(err, "Read config failed: "+configFile)
-		}
-
-		for _, key := range yamlReader.AllKeys() {
-			val := yamlReader.Get(key)
-			str, err := cast.ToStringE(val)
-			if err != nil {
-				switch val := val.(type) {
-				case []any:
-					str = str[:0]
-					for _, v := range val {
-						ss, err := cast.ToStringE(v)
-						if err != nil {
-							log.Warn("cast to string failed", zap.Any("value", v))
-						}
-						if str == "" {
-							str = ss
-						} else {
-							str = str + "," + ss
-						}
-					}
-
-				default:
-					log.Warn("val is not a slice", zap.Any("value", val))
-					continue
-				}
+			if os.IsNotExist(err) {
+				notExistsNum++
+				continue
 			}
-			newConfig[key] = str
-			newConfig[formatKey(key)] = str
+			return err
 		}
+
+		ext := filepath.Ext(configFile)
+		if len(ext) == 0 || (ext[1:] != "yaml" && ext[1:] != "yml") {
+			return fmt.Errorf("Unsupported Config Type: %s", ext)
+		}
+
+		data, err := os.ReadFile(configFile)
+		if err != nil {
+			return errors.Wrapf(err, "Read config failed: %s", configFile)
+		}
+
+		var config map[string]interface{}
+		err = yaml.Unmarshal(data, &config)
+		if err != nil {
+			return errors.Wrapf(err, "unmarshal yaml file %s failed", configFile)
+		}
+
+		flattenAndMergeMap("", config, newConfig)
 	}
+	// not allow all config files missing, return error for this case
+	if notExistsNum == len(configFiles) {
+		return errors.Newf("all config files not exists, files: %v", configFiles)
+	}
+
+	return fs.update(newConfig)
+}
+
+// update souce config
+// make sure only update changes configs
+func (fs *FileSource) update(configs map[string]string) error {
+	// make sure config not change when fire event
+	fs.updateMu.Lock()
+	defer fs.updateMu.Unlock()
+
 	fs.Lock()
-	defer fs.Unlock()
-	err := fs.configRefresher.fireEvents(fs.GetSourceName(), fs.configs, newConfig)
+	events, err := PopulateEvents(fs.GetSourceName(), fs.configs, configs)
 	if err != nil {
+		fs.Unlock()
+		log.Warn("generating event error", zap.Error(err))
 		return err
 	}
-	fs.configs = newConfig
+	fs.configs = configs
+	fs.Unlock()
+	if fs.manager != nil {
+		fs.manager.EvictCacheValueByFormat(lo.Map(events, func(event *Event, _ int) string { return event.Key })...)
+	}
 
+	fs.configRefresher.fireEvents(events...)
 	return nil
 }

@@ -34,16 +34,26 @@ func (suite *CounterTestSuite) SetupSuite() {
 }
 
 func (suite *CounterTestSuite) TestBasic() {
-	//get default value(zero)
+	// get default value(zero)
 	value := suite.counter.Get(suite.label)
 	suite.Equal(int64(0), value)
 
-	//get after inc
-	suite.counter.Inc(suite.label, 3)
+	// get after inc
+	suite.counter.Add(suite.label, 3)
 	value = suite.counter.Get(suite.label)
 	suite.Equal(int64(3), value)
 
-	//remote
+	// remove
+	suite.counter.Remove(suite.label)
+	value = suite.counter.Get(suite.label)
+	suite.Equal(int64(0), value)
+
+	// get after dec
+	suite.counter.Add(suite.label, -3)
+	value = suite.counter.Get(suite.label)
+	suite.Equal(int64(-3), value)
+
+	// remove
 	suite.counter.Remove(suite.label)
 	value = suite.counter.Get(suite.label)
 	suite.Equal(int64(0), value)

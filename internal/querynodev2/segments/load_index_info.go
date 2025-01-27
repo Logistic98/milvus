@@ -17,7 +17,7 @@
 package segments
 
 /*
-#cgo pkg-config: milvus_common milvus_segcore
+#cgo pkg-config: milvus_core
 
 #include "segcore/load_index_c.h"
 #include "common/binary_set_c.h"
@@ -25,18 +25,17 @@ package segments
 import "C"
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
-	"path/filepath"
+	"runtime"
+	"time"
 	"unsafe"
 
-	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/indexparams"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/pkg/metrics"
+	"github.com/milvus-io/milvus/pkg/proto/cgopb"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
@@ -46,39 +45,15 @@ type LoadIndexInfo struct {
 }
 
 // newLoadIndexInfo returns a new LoadIndexInfo and error
-func newLoadIndexInfo() (*LoadIndexInfo, error) {
+func newLoadIndexInfo(ctx context.Context) (*LoadIndexInfo, error) {
 	var cLoadIndexInfo C.CLoadIndexInfo
 
-	// TODO::xige-16 support embedded milvus
-	storageType := "minio"
-	cAddress := C.CString(paramtable.Get().MinioCfg.Address.GetValue())
-	cBucketName := C.CString(paramtable.Get().MinioCfg.BucketName.GetValue())
-	cAccessKey := C.CString(paramtable.Get().MinioCfg.AccessKeyID.GetValue())
-	cAccessValue := C.CString(paramtable.Get().MinioCfg.SecretAccessKey.GetValue())
-	cRootPath := C.CString(paramtable.Get().MinioCfg.RootPath.GetValue())
-	cStorageType := C.CString(storageType)
-	cIamEndPoint := C.CString(paramtable.Get().MinioCfg.IAMEndpoint.GetValue())
-	defer C.free(unsafe.Pointer(cAddress))
-	defer C.free(unsafe.Pointer(cBucketName))
-	defer C.free(unsafe.Pointer(cAccessKey))
-	defer C.free(unsafe.Pointer(cAccessValue))
-	defer C.free(unsafe.Pointer(cRootPath))
-	defer C.free(unsafe.Pointer(cStorageType))
-	defer C.free(unsafe.Pointer(cIamEndPoint))
-	storageConfig := C.CStorageConfig{
-		address:          cAddress,
-		bucket_name:      cBucketName,
-		access_key_id:    cAccessKey,
-		access_key_value: cAccessValue,
-		remote_root_path: cRootPath,
-		storage_type:     cStorageType,
-		iam_endpoint:     cIamEndPoint,
-		useSSL:           C.bool(paramtable.Get().MinioCfg.UseSSL.GetAsBool()),
-		useIAM:           C.bool(paramtable.Get().MinioCfg.UseIAM.GetAsBool()),
-	}
-
-	status := C.NewLoadIndexInfo(&cLoadIndexInfo, storageConfig)
-	if err := HandleCStatus(&status, "NewLoadIndexInfo failed"); err != nil {
+	var status C.CStatus
+	GetDynamicPool().Submit(func() (any, error) {
+		status = C.NewLoadIndexInfo(&cLoadIndexInfo)
+		return nil, nil
+	}).Await()
+	if err := HandleCStatus(ctx, &status, "NewLoadIndexInfo failed"); err != nil {
 		return nil, err
 	}
 	return &LoadIndexInfo{cLoadIndexInfo: cLoadIndexInfo}, nil
@@ -86,117 +61,153 @@ func newLoadIndexInfo() (*LoadIndexInfo, error) {
 
 // deleteLoadIndexInfo would delete C.CLoadIndexInfo
 func deleteLoadIndexInfo(info *LoadIndexInfo) {
-	C.DeleteLoadIndexInfo(info.cLoadIndexInfo)
-}
-
-func (li *LoadIndexInfo) appendLoadIndexInfo(bytesIndex [][]byte, indexInfo *querypb.FieldIndexInfo, collectionID int64, partitionID int64, segmentID int64, fieldType schemapb.DataType) error {
-	fieldID := indexInfo.FieldID
-	indexPaths := indexInfo.IndexFilePaths
-
-	err := li.appendFieldInfo(collectionID, partitionID, segmentID, fieldID, fieldType)
-	if err != nil {
-		return err
-	}
-
-	err = li.appendIndexInfo(indexInfo.IndexID, indexInfo.BuildID, indexInfo.IndexVersion)
-	if err != nil {
-		return err
-	}
-
-	// some build params also exist in indexParams, which are useless during loading process
-	indexParams := funcutil.KeyValuePair2Map(indexInfo.IndexParams)
-	indexparams.SetDiskIndexLoadParams(indexParams, indexInfo.GetNumRows())
-
-	jsonIndexParams, err := json.Marshal(indexParams)
-	if err != nil {
-		err = fmt.Errorf("failed to json marshal index params %w", err)
-		return err
-	}
-	log.Info("start append index params", zap.String("index params", string(jsonIndexParams)))
-
-	for key, value := range indexParams {
-		err = li.appendIndexParam(key, value)
-		if err != nil {
-			return err
-		}
-	}
-
-	err = li.appendIndexData(bytesIndex, indexPaths)
-	return err
+	GetDynamicPool().Submit(func() (any, error) {
+		C.DeleteLoadIndexInfo(info.cLoadIndexInfo)
+		return nil, nil
+	}).Await()
 }
 
 // appendIndexParam append indexParam to index
-func (li *LoadIndexInfo) appendIndexParam(indexKey string, indexValue string) error {
-	cIndexKey := C.CString(indexKey)
-	defer C.free(unsafe.Pointer(cIndexKey))
-	cIndexValue := C.CString(indexValue)
-	defer C.free(unsafe.Pointer(cIndexValue))
-	status := C.AppendIndexParam(li.cLoadIndexInfo, cIndexKey, cIndexValue)
-	return HandleCStatus(&status, "AppendIndexParam failed")
+func (li *LoadIndexInfo) appendIndexParam(ctx context.Context, indexKey string, indexValue string) error {
+	var status C.CStatus
+	GetDynamicPool().Submit(func() (any, error) {
+		cIndexKey := C.CString(indexKey)
+		defer C.free(unsafe.Pointer(cIndexKey))
+		cIndexValue := C.CString(indexValue)
+		defer C.free(unsafe.Pointer(cIndexValue))
+		status = C.AppendIndexParam(li.cLoadIndexInfo, cIndexKey, cIndexValue)
+		return nil, nil
+	}).Await()
+	return HandleCStatus(ctx, &status, "AppendIndexParam failed")
 }
 
-func (li *LoadIndexInfo) appendIndexInfo(indexID int64, buildID int64, indexVersion int64) error {
-	cIndexID := C.int64_t(indexID)
-	cBuildID := C.int64_t(buildID)
-	cIndexVersion := C.int64_t(indexVersion)
+func (li *LoadIndexInfo) appendIndexInfo(ctx context.Context, indexID int64, buildID int64, indexVersion int64) error {
+	var status C.CStatus
+	GetDynamicPool().Submit(func() (any, error) {
+		cIndexID := C.int64_t(indexID)
+		cBuildID := C.int64_t(buildID)
+		cIndexVersion := C.int64_t(indexVersion)
 
-	status := C.AppendIndexInfo(li.cLoadIndexInfo, cIndexID, cBuildID, cIndexVersion)
-	return HandleCStatus(&status, "AppendIndexInfo failed")
+		status = C.AppendIndexInfo(li.cLoadIndexInfo, cIndexID, cBuildID, cIndexVersion)
+		return nil, nil
+	}).Await()
+	return HandleCStatus(ctx, &status, "AppendIndexInfo failed")
 }
 
-func (li *LoadIndexInfo) cleanLocalData() error {
-	status := C.CleanLoadedIndex(li.cLoadIndexInfo)
-	return HandleCStatus(&status, "failed to clean cached data on disk")
+func (li *LoadIndexInfo) cleanLocalData(ctx context.Context) error {
+	var status C.CStatus
+	GetDynamicPool().Submit(func() (any, error) {
+		status = C.CleanLoadedIndex(li.cLoadIndexInfo)
+		return nil, nil
+	}).Await()
+	return HandleCStatus(ctx, &status, "failed to clean cached data on disk")
 }
 
-func (li *LoadIndexInfo) appendIndexFile(filePath string) error {
-	cIndexFilePath := C.CString(filePath)
-	defer C.free(unsafe.Pointer(cIndexFilePath))
+func (li *LoadIndexInfo) appendIndexFile(ctx context.Context, filePath string) error {
+	var status C.CStatus
+	GetDynamicPool().Submit(func() (any, error) {
+		cIndexFilePath := C.CString(filePath)
+		defer C.free(unsafe.Pointer(cIndexFilePath))
 
-	status := C.AppendIndexFilePath(li.cLoadIndexInfo, cIndexFilePath)
-	return HandleCStatus(&status, "AppendIndexIFile failed")
+		status = C.AppendIndexFilePath(li.cLoadIndexInfo, cIndexFilePath)
+		return nil, nil
+	}).Await()
+	return HandleCStatus(ctx, &status, "AppendIndexIFile failed")
 }
 
 // appendFieldInfo appends fieldID & fieldType to index
-func (li *LoadIndexInfo) appendFieldInfo(collectionID int64, partitionID int64, segmentID int64, fieldID int64, fieldType schemapb.DataType) error {
-	cColID := C.int64_t(collectionID)
-	cParID := C.int64_t(partitionID)
-	cSegID := C.int64_t(segmentID)
-	cFieldID := C.int64_t(fieldID)
-	cintDType := uint32(fieldType)
-	status := C.AppendFieldInfo(li.cLoadIndexInfo, cColID, cParID, cSegID, cFieldID, cintDType)
-	return HandleCStatus(&status, "AppendFieldInfo failed")
+func (li *LoadIndexInfo) appendFieldInfo(ctx context.Context, collectionID int64, partitionID int64, segmentID int64, fieldID int64, fieldType schemapb.DataType, enableMmap bool, mmapDirPath string) error {
+	var status C.CStatus
+	GetDynamicPool().Submit(func() (any, error) {
+		cColID := C.int64_t(collectionID)
+		cParID := C.int64_t(partitionID)
+		cSegID := C.int64_t(segmentID)
+		cFieldID := C.int64_t(fieldID)
+		cintDType := uint32(fieldType)
+		cEnableMmap := C.bool(enableMmap)
+		cMmapDirPath := C.CString(mmapDirPath)
+		defer C.free(unsafe.Pointer(cMmapDirPath))
+		status = C.AppendFieldInfo(li.cLoadIndexInfo, cColID, cParID, cSegID, cFieldID, cintDType, cEnableMmap, cMmapDirPath)
+		return nil, nil
+	}).Await()
+
+	return HandleCStatus(ctx, &status, "AppendFieldInfo failed")
 }
 
-// appendIndexData appends binarySet index to cLoadIndexInfo
-func (li *LoadIndexInfo) appendIndexData(bytesIndex [][]byte, indexKeys []string) error {
+func (li *LoadIndexInfo) appendStorageInfo(uri string, version int64) {
+	GetDynamicPool().Submit(func() (any, error) {
+		cURI := C.CString(uri)
+		defer C.free(unsafe.Pointer(cURI))
+		cVersion := C.int64_t(version)
+		C.AppendStorageInfo(li.cLoadIndexInfo, cURI, cVersion)
+		return nil, nil
+	}).Await()
+}
+
+// appendIndexData appends index path to cLoadIndexInfo and create index
+func (li *LoadIndexInfo) appendIndexData(ctx context.Context, indexKeys []string) error {
 	for _, indexPath := range indexKeys {
-		err := li.appendIndexFile(indexPath)
+		err := li.appendIndexFile(ctx, indexPath)
 		if err != nil {
 			return err
 		}
 	}
 
-	var cBinarySet C.CBinarySet
-	status := C.NewBinarySet(&cBinarySet)
-	defer C.DeleteBinarySet(cBinarySet)
+	var status C.CStatus
+	GetLoadPool().Submit(func() (any, error) {
+		traceCtx := ParseCTraceContext(ctx)
+		status = C.AppendIndexV2(traceCtx.ctx, li.cLoadIndexInfo)
+		runtime.KeepAlive(traceCtx)
+		return nil, nil
+	}).Await()
 
-	if err := HandleCStatus(&status, "NewBinarySet failed"); err != nil {
+	return HandleCStatus(ctx, &status, "AppendIndex failed")
+}
+
+func (li *LoadIndexInfo) appendIndexEngineVersion(ctx context.Context, indexEngineVersion int32) error {
+	cIndexEngineVersion := C.int32_t(indexEngineVersion)
+
+	var status C.CStatus
+
+	GetDynamicPool().Submit(func() (any, error) {
+		status = C.AppendIndexEngineVersionToLoadInfo(li.cLoadIndexInfo, cIndexEngineVersion)
+		return nil, nil
+	}).Await()
+
+	return HandleCStatus(ctx, &status, "AppendIndexEngineVersion failed")
+}
+
+func (li *LoadIndexInfo) appendLoadIndexInfo(ctx context.Context, info *cgopb.LoadIndexInfo) error {
+	marshaled, err := proto.Marshal(info)
+	if err != nil {
 		return err
 	}
 
-	for i, byteIndex := range bytesIndex {
-		indexPtr := unsafe.Pointer(&byteIndex[0])
-		indexLen := C.int64_t(len(byteIndex))
-		binarySetKey := filepath.Base(indexKeys[i])
-		indexKey := C.CString(binarySetKey)
-		status = C.AppendIndexBinary(cBinarySet, indexPtr, indexLen, indexKey)
-		C.free(unsafe.Pointer(indexKey))
-		if err := HandleCStatus(&status, "LoadIndexInfo AppendIndexBinary failed"); err != nil {
-			return err
-		}
-	}
+	var status C.CStatus
+	_, _ = GetDynamicPool().Submit(func() (any, error) {
+		status = C.FinishLoadIndexInfo(li.cLoadIndexInfo, (*C.uint8_t)(unsafe.Pointer(&marshaled[0])), (C.uint64_t)(len(marshaled)))
+		return nil, nil
+	}).Await()
 
-	status = C.AppendIndex(li.cLoadIndexInfo, cBinarySet)
-	return HandleCStatus(&status, "AppendIndex failed")
+	return HandleCStatus(ctx, &status, "FinishLoadIndexInfo failed")
+}
+
+func (li *LoadIndexInfo) loadIndex(ctx context.Context) error {
+	var status C.CStatus
+	_, _ = GetLoadPool().Submit(func() (any, error) {
+		start := time.Now()
+		defer func() {
+			metrics.QueryNodeCGOCallLatency.WithLabelValues(
+				fmt.Sprint(paramtable.GetNodeID()),
+				"AppendIndexV2",
+				"Sync",
+			).Observe(float64(time.Since(start).Milliseconds()))
+		}()
+		traceCtx := ParseCTraceContext(ctx)
+		status = C.AppendIndexV2(traceCtx.ctx, li.cLoadIndexInfo)
+		runtime.KeepAlive(traceCtx)
+		return nil, nil
+	}).Await()
+
+	return HandleCStatus(ctx, &status, "AppendIndex failed")
 }

@@ -17,30 +17,37 @@
 #pragma once
 
 #include <memory>
+#include <vector>
 
 #include "index/VectorIndex.h"
 #include "storage/DiskFileManagerImpl.h"
 
 namespace milvus::index {
 
-#ifdef BUILD_DISK_ANN
-
 template <typename T>
 class VectorDiskAnnIndex : public VectorIndex {
  public:
-    explicit VectorDiskAnnIndex(const IndexType& index_type,
-                                const MetricType& metric_type,
-                                storage::FileManagerImplPtr file_manager);
+    explicit VectorDiskAnnIndex(
+        const IndexType& index_type,
+        const MetricType& metric_type,
+        const IndexVersion& version,
+        const storage::FileManagerContext& file_manager_context =
+            storage::FileManagerContext());
+
     BinarySet
-    Serialize(const Config& config) override {
-        auto remote_paths_to_size = file_manager_->GetRemotePathsToFileSize();
+    Serialize(const Config& config) override {  // deprecated
         BinarySet binary_set;
+        index_.Serialize(binary_set);
+        auto remote_paths_to_size = file_manager_->GetRemotePathsToFileSize();
         for (auto& file : remote_paths_to_size) {
             binary_set.Append(file.first, nullptr, file.second);
         }
 
         return binary_set;
     }
+
+    IndexStatsPtr
+    Upload(const Config& config = {}) override;
 
     int64_t
     Count() override {
@@ -52,16 +59,39 @@ class VectorDiskAnnIndex : public VectorIndex {
          const Config& config = {}) override;
 
     void
+    Load(milvus::tracer::TraceContext ctx, const Config& config = {}) override;
+
+    void
     BuildWithDataset(const DatasetPtr& dataset,
                      const Config& config = {}) override;
 
-    std::unique_ptr<SearchResult>
-    Query(const DatasetPtr dataset,
-          const SearchInfo& search_info,
-          const BitsetView& bitset) override;
+    void
+    Build(const Config& config = {}) override;
 
     void
-    CleanLocalData() override;
+    Query(const DatasetPtr dataset,
+          const SearchInfo& search_info,
+          const BitsetView& bitset,
+          SearchResult& search_result) const override;
+
+    const bool
+    HasRawData() const override;
+
+    std::vector<uint8_t>
+    GetVector(const DatasetPtr dataset) const override;
+
+    std::unique_ptr<const knowhere::sparse::SparseRow<float>[]>
+    GetSparseVector(const DatasetPtr dataset) const override {
+        PanicInfo(ErrorCode::Unsupported,
+                  "get sparse vector not supported for disk index");
+    }
+
+    void CleanLocalData() override;
+
+    knowhere::expected<std::vector<knowhere::IndexNode::IteratorPtr>>
+    VectorIterators(const DatasetPtr dataset,
+                    const knowhere::Json& json,
+                    const BitsetView& bitset) const override;
 
  private:
     knowhere::Json
@@ -75,6 +105,5 @@ class VectorDiskAnnIndex : public VectorIndex {
 
 template <typename T>
 using VectorDiskAnnIndexPtr = std::unique_ptr<VectorDiskAnnIndex<T>>;
-#endif
 
 }  // namespace milvus::index

@@ -9,14 +9,16 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/mq/common"
 	"github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper"
 	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
 type Consumer struct {
 	c          *kafka.Consumer
 	config     *kafka.ConfigMap
-	msgChannel chan mqwrapper.Message
+	msgChannel chan common.Message
 	hasAssign  bool
 	skipMsg    bool
 	topic      string
@@ -24,12 +26,13 @@ type Consumer struct {
 	chanOnce   sync.Once
 	closeOnce  sync.Once
 	closeCh    chan struct{}
+	wg         sync.WaitGroup
 }
 
 const timeout = 3000
 
-func newKafkaConsumer(config *kafka.ConfigMap, topic string, groupID string, position mqwrapper.SubscriptionInitialPosition) (*Consumer, error) {
-	msgChannel := make(chan mqwrapper.Message, 256)
+func newKafkaConsumer(config *kafka.ConfigMap, bufSize int64, topic string, groupID string, position common.SubscriptionInitialPosition) (*Consumer, error) {
+	msgChannel := make(chan common.Message, bufSize)
 	kc := &Consumer{
 		config:     config,
 		msgChannel: msgChannel,
@@ -44,9 +47,9 @@ func newKafkaConsumer(config *kafka.ConfigMap, topic string, groupID string, pos
 	}
 
 	// if it's unknown, we leave the assign to seek
-	if position != mqwrapper.SubscriptionPositionUnknown {
+	if position != common.SubscriptionPositionUnknown {
 		var offset kafka.Offset
-		if position == mqwrapper.SubscriptionPositionEarliest {
+		if position == common.SubscriptionPositionEarliest {
 			offset, err = kafka.NewOffset("earliest")
 			if err != nil {
 				return nil, err
@@ -71,7 +74,7 @@ func newKafkaConsumer(config *kafka.ConfigMap, topic string, groupID string, pos
 					return nil, err
 				}
 			} else {
-				offset = kafka.Offset(latestMsgID.(*kafkaID).messageID)
+				offset = kafka.Offset(latestMsgID.(*KafkaID).MessageID)
 				kc.skipMsg = true
 			}
 		}
@@ -112,41 +115,38 @@ func (kc *Consumer) Subscription() string {
 // confluent-kafka-go recommend us to use function-based consumer,
 // channel-based consumer API had already deprecated, see more details
 // https://github.com/confluentinc/confluent-kafka-go.
-func (kc *Consumer) Chan() <-chan mqwrapper.Message {
+func (kc *Consumer) Chan() <-chan common.Message {
 	if !kc.hasAssign {
 		log.Error("can not chan with not assigned channel", zap.String("topic", kc.topic), zap.String("groupID", kc.groupID))
 		panic("failed to chan a kafka consumer without assign")
 	}
 	kc.chanOnce.Do(func() {
+		kc.wg.Add(1)
 		go func() {
+			defer kc.wg.Done()
 			for {
 				select {
 				case <-kc.closeCh:
-					log.Info("close consumer ", zap.String("topic", kc.topic), zap.String("groupID", kc.groupID))
-					start := time.Now()
-					err := kc.c.Close()
-					if err != nil {
-						log.Warn("failed to close ", zap.String("topic", kc.topic), zap.Error(err))
-					}
-					cost := time.Since(start).Milliseconds()
-					if cost > 200 {
-						log.Warn("close consumer costs too long time", zap.Any("topic", kc.topic), zap.String("groupID", kc.groupID), zap.Int64("time(ms)", cost))
-					}
 					if kc.msgChannel != nil {
 						close(kc.msgChannel)
 					}
 					return
 				default:
-					e, err := kc.c.ReadMessage(30 * time.Second)
+					readTimeout := paramtable.Get().KafkaCfg.ReadTimeout.GetAsDuration(time.Second)
+					e, err := kc.c.ReadMessage(readTimeout)
 					if err != nil {
 						// if we failed to read message in 30 Seconds, print out a warn message since there should always be a tt
-						log.Warn("consume msg failed", zap.Any("topic", kc.topic), zap.String("groupID", kc.groupID), zap.Error(err))
+						log.Warn("consume msg failed", zap.String("topic", kc.topic), zap.String("groupID", kc.groupID), zap.Error(err))
 					} else {
 						if kc.skipMsg {
 							kc.skipMsg = false
 							continue
 						}
-						kc.msgChannel <- &kafkaMessage{msg: e}
+
+						select {
+						case kc.msgChannel <- &kafkaMessage{msg: e}:
+						case <-kc.closeCh:
+						}
 					}
 				}
 			}
@@ -156,12 +156,12 @@ func (kc *Consumer) Chan() <-chan mqwrapper.Message {
 	return kc.msgChannel
 }
 
-func (kc *Consumer) Seek(id mqwrapper.MessageID, inclusive bool) error {
+func (kc *Consumer) Seek(id common.MessageID, inclusive bool) error {
 	if kc.hasAssign {
 		return errors.New("kafka consumer is already assigned, can not seek again")
 	}
 
-	offset := kafka.Offset(id.(*kafkaID).messageID)
+	offset := kafka.Offset(id.(*KafkaID).MessageID)
 	return kc.internalSeek(offset, inclusive)
 }
 
@@ -188,7 +188,8 @@ func (kc *Consumer) internalSeek(offset kafka.Offset, inclusive bool) error {
 	if err := kc.c.Seek(kafka.TopicPartition{
 		Topic:     &kc.topic,
 		Partition: mqwrapper.DefaultPartitionIdx,
-		Offset:    offset}, timeout); err != nil {
+		Offset:    offset,
+	}, timeout); err != nil {
 		return err
 	}
 	cost = time.Since(start).Milliseconds()
@@ -199,13 +200,13 @@ func (kc *Consumer) internalSeek(offset kafka.Offset, inclusive bool) error {
 	return nil
 }
 
-func (kc *Consumer) Ack(message mqwrapper.Message) {
+func (kc *Consumer) Ack(message common.Message) {
 	// Do nothing
 	// Kafka retention mechanism only depends on retention configuration,
 	// it does not relate to the commit with consumer's offsets.
 }
 
-func (kc *Consumer) GetLatestMsgID() (mqwrapper.MessageID, error) {
+func (kc *Consumer) GetLatestMsgID() (common.MessageID, error) {
 	low, high, err := kc.c.QueryWatermarkOffsets(kc.topic, mqwrapper.DefaultPartitionIdx, timeout)
 	if err != nil {
 		return nil, err
@@ -217,36 +218,48 @@ func (kc *Consumer) GetLatestMsgID() (mqwrapper.MessageID, error) {
 		high = high - 1
 	}
 
-	log.Info("get latest msg ID ", zap.Any("topic", kc.topic), zap.Int64("oldest offset", low), zap.Int64("latest offset", high))
-	return &kafkaID{messageID: high}, nil
+	log.Info("get latest msg ID ", zap.String("topic", kc.topic), zap.Int64("oldest offset", low), zap.Int64("latest offset", high))
+	return &KafkaID{MessageID: high}, nil
 }
 
 func (kc *Consumer) CheckTopicValid(topic string) error {
-	latestMsgID, err := kc.GetLatestMsgID()
+	_, err := kc.GetLatestMsgID()
 	log.With(zap.String("topic", kc.topic))
 	// check topic is existed
 	if err != nil {
 		switch v := err.(type) {
 		case kafka.Error:
-			if v.Code() == kafka.ErrUnknownTopic || v.Code() == kafka.ErrUnknownPartition || v.Code() == kafka.ErrUnknownTopicOrPart {
-				return merr.WrapErrTopicNotFound(topic, "topic get latest msg ID failed, topic or partition does not exists")
+			if v.Code() == kafka.ErrUnknownTopic || v.Code() == kafka.ErrUnknownTopicOrPart {
+				return merr.WrapErrMqTopicNotFound(topic, err.Error())
 			}
+			return merr.WrapErrMqInternal(err)
 		default:
 			return err
 		}
 	}
 
-	// check topic is empty
-	if !latestMsgID.AtEarliestPosition() {
-		return merr.WrapErrTopicNotEmpty(topic, "topic is not empty")
-	}
-	log.Info("created topic is empty")
-
 	return nil
+}
+
+func (kc *Consumer) closeInternal() {
+	log.Info("close consumer ", zap.String("topic", kc.topic), zap.String("groupID", kc.groupID))
+	start := time.Now()
+	err := kc.c.Close()
+	if err != nil {
+		log.Warn("failed to close ", zap.String("topic", kc.topic), zap.Error(err))
+	}
+	cost := time.Since(start).Milliseconds()
+	if cost > 200 {
+		log.Warn("close consumer costs too long time", zap.String("topic", kc.topic), zap.String("groupID", kc.groupID), zap.Int64("time(ms)", cost))
+	}
 }
 
 func (kc *Consumer) Close() {
 	kc.closeOnce.Do(func() {
 		close(kc.closeCh)
+		// wait work goroutine exit
+		kc.wg.Wait()
+		// close the client
+		kc.closeInternal()
 	})
 }

@@ -22,9 +22,9 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus/pkg/metrics"
+	"github.com/milvus-io/milvus/pkg/proto/rootcoordpb"
 	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/util/timerecord"
@@ -52,7 +52,6 @@ func (ta *timestampAllocator) alloc(ctx context.Context, count uint32) ([]Timest
 	req := &rootcoordpb.AllocTimestampRequest{
 		Base: commonpbutil.NewMsgBase(
 			commonpbutil.WithMsgType(commonpb.MsgType_RequestTSO),
-			commonpbutil.WithMsgID(0),
 			commonpbutil.WithSourceID(ta.peerID),
 		),
 		Count: count,
@@ -66,10 +65,13 @@ func (ta *timestampAllocator) alloc(ctx context.Context, count uint32) ([]Timest
 	if err != nil {
 		return nil, fmt.Errorf("syncTimestamp Failed:%w", err)
 	}
-	if resp.Status.ErrorCode != commonpb.ErrorCode_Success {
-		return nil, fmt.Errorf("syncTimeStamp Failed:%s", resp.Status.Reason)
+	if resp.GetStatus().GetErrorCode() != commonpb.ErrorCode_Success {
+		return nil, fmt.Errorf("syncTimeStamp Failed:%s", resp.GetStatus().GetReason())
 	}
-	start, cnt := resp.Timestamp, resp.Count
+	if resp == nil {
+		return nil, fmt.Errorf("empty AllocTimestampResponse")
+	}
+	start, cnt := resp.GetTimestamp(), resp.GetCount()
 	ret := make([]Timestamp, cnt)
 	for i := uint32(0); i < cnt; i++ {
 		ret[i] = start + uint64(i)

@@ -19,9 +19,9 @@ package rootcoord
 import (
 	"context"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus/internal/util/proxyutil"
 )
 
 type dropAliasTask struct {
@@ -37,9 +37,19 @@ func (t *dropAliasTask) Prepare(ctx context.Context) error {
 }
 
 func (t *dropAliasTask) Execute(ctx context.Context) error {
+	collID := t.core.meta.GetCollectionID(ctx, t.Req.GetDbName(), t.Req.GetAlias())
 	// drop alias is atomic enough.
-	if err := t.core.ExpireMetaCache(ctx, []string{t.Req.GetAlias()}, InvalidCollectionID, t.GetTs()); err != nil {
+	if err := t.core.ExpireMetaCache(ctx, t.Req.GetDbName(), []string{t.Req.GetAlias()}, collID, "", t.GetTs(), proxyutil.SetMsgType(commonpb.MsgType_DropAlias)); err != nil {
 		return err
 	}
-	return t.core.meta.DropAlias(ctx, t.Req.GetAlias(), t.GetTs())
+	return t.core.meta.DropAlias(ctx, t.Req.GetDbName(), t.Req.GetAlias(), t.GetTs())
+}
+
+func (t *dropAliasTask) GetLockerKey() LockerKey {
+	collection := t.core.getCollectionIDStr(t.ctx, t.Req.GetDbName(), t.Req.GetAlias(), 0)
+	return NewLockerKeyChain(
+		NewClusterLockerKey(false),
+		NewDatabaseLockerKey(t.Req.GetDbName(), false),
+		NewCollectionLockerKey(collection, true),
+	)
 }

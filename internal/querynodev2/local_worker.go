@@ -18,17 +18,12 @@ package querynodev2
 
 import (
 	"context"
-	"fmt"
 
-	"github.com/samber/lo"
-	"go.uber.org/zap"
-
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/querynodev2/cluster"
-	"github.com/milvus-io/milvus/internal/querynodev2/segments"
-	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/internal/util/streamrpc"
+	"github.com/milvus-io/milvus/pkg/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/util/merr"
 )
 
 var _ cluster.Worker = &LocalWorker{}
@@ -44,52 +39,34 @@ func NewLocalWorker(node *QueryNode) *LocalWorker {
 }
 
 func (w *LocalWorker) LoadSegments(ctx context.Context, req *querypb.LoadSegmentsRequest) error {
-	log := log.Ctx(ctx)
-	log.Info("start to load segments...")
-	loaded, err := w.node.loader.Load(ctx,
-		req.GetCollectionID(),
-		segments.SegmentTypeSealed,
-		req.GetVersion(),
-		req.GetInfos()...,
-	)
-	if err != nil {
-		return err
-	}
-
-	log.Info("save loaded segments...",
-		zap.Int64s("segments", lo.Map(loaded, func(s segments.Segment, _ int) int64 { return s.ID() })))
-	w.node.manager.Segment.Put(segments.SegmentTypeSealed, loaded...)
-	return nil
+	status, err := w.node.LoadSegments(ctx, req)
+	return merr.CheckRPCCall(status, err)
 }
 
 func (w *LocalWorker) ReleaseSegments(ctx context.Context, req *querypb.ReleaseSegmentsRequest) error {
-	log := log.Ctx(ctx)
-	log.Info("start to release segments")
-	for _, id := range req.GetSegmentIDs() {
-		w.node.manager.Segment.Remove(id, req.GetScope())
-	}
-	return nil
+	status, err := w.node.ReleaseSegments(ctx, req)
+	return merr.CheckRPCCall(status, err)
 }
 
 func (w *LocalWorker) Delete(ctx context.Context, req *querypb.DeleteRequest) error {
-	log := log.Ctx(ctx)
-	log.Info("start to process segment delete")
 	status, err := w.node.Delete(ctx, req)
-	if err != nil {
-		return err
-	}
-	if status.GetErrorCode() != commonpb.ErrorCode_Success {
-		return fmt.Errorf(status.GetReason())
-	}
-	return nil
+	return merr.CheckRPCCall(status, err)
 }
 
-func (w *LocalWorker) Search(ctx context.Context, req *querypb.SearchRequest) (*internalpb.SearchResults, error) {
-	return w.node.Search(ctx, req)
+func (w *LocalWorker) DeleteBatch(ctx context.Context, req *querypb.DeleteBatchRequest) (*querypb.DeleteBatchResponse, error) {
+	return w.node.DeleteBatch(ctx, req)
 }
 
-func (w *LocalWorker) Query(ctx context.Context, req *querypb.QueryRequest) (*internalpb.RetrieveResults, error) {
-	return w.node.Query(ctx, req)
+func (w *LocalWorker) SearchSegments(ctx context.Context, req *querypb.SearchRequest) (*internalpb.SearchResults, error) {
+	return w.node.SearchSegments(ctx, req)
+}
+
+func (w *LocalWorker) QueryStreamSegments(ctx context.Context, req *querypb.QueryRequest, srv streamrpc.QueryStreamServer) error {
+	return w.node.queryStreamSegments(ctx, req, srv)
+}
+
+func (w *LocalWorker) QuerySegments(ctx context.Context, req *querypb.QueryRequest) (*internalpb.RetrieveResults, error) {
+	return w.node.QuerySegments(ctx, req)
 }
 
 func (w *LocalWorker) GetStatistics(ctx context.Context, req *querypb.GetStatisticsRequest) (*internalpb.GetStatisticsResponse, error) {

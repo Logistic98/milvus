@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 
+	"go.uber.org/zap"
+
 	"github.com/milvus-io/milvus/pkg/log"
 )
 
@@ -22,9 +24,21 @@ func main() {
 	}
 	switch args[1] {
 	case generateCsv:
-		WriteCsv()
+		f, err := os.Create("configs.csv")
+		defer f.Close()
+		if err != nil {
+			log.Error("create file failed", zap.Error(err))
+			os.Exit(-2)
+		}
+		WriteCsv(f)
 	case generateYaml:
-		WriteYaml()
+		f, err := os.Create("milvus.yaml")
+		defer f.Close()
+		if err != nil {
+			log.Error("create file failed", zap.Error(err))
+			os.Exit(-2)
+		}
+		WriteYaml(f)
 	case showYaml:
 		var f string
 		if len(args) == 2 {
@@ -36,5 +50,4 @@ func main() {
 	default:
 		log.Error(fmt.Sprintf("unknown argument %s", args[1]))
 	}
-
 }

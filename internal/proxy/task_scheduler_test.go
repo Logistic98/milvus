@@ -25,16 +25,17 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/msgpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	"github.com/milvus-io/milvus/pkg/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 func TestBaseTaskQueue(t *testing.T) {
-
 	var err error
 	var unissuedTask task
 	var activeTask task
@@ -103,15 +104,14 @@ func TestBaseTaskQueue(t *testing.T) {
 	queue.setMaxTaskNum(10) // not accurate, full also means utBufChan block
 	for i := 0; i < int(queue.getMaxTaskNum()); i++ {
 		err = queue.Enqueue(newDefaultMockTask())
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 	}
 	assert.True(t, queue.utFull())
 	err = queue.Enqueue(newDefaultMockTask())
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 }
 
 func TestDdTaskQueue(t *testing.T) {
-
 	var err error
 	var unissuedTask task
 	var activeTask task
@@ -180,16 +180,15 @@ func TestDdTaskQueue(t *testing.T) {
 	queue.setMaxTaskNum(10) // not accurate, full also means utBufChan block
 	for i := 0; i < int(queue.getMaxTaskNum()); i++ {
 		err = queue.Enqueue(newDefaultMockDdlTask())
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 	}
 	assert.True(t, queue.utFull())
 	err = queue.Enqueue(newDefaultMockDdlTask())
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 }
 
 // test the logic of queue
 func TestDmTaskQueue_Basic(t *testing.T) {
-
 	var err error
 	var unissuedTask task
 	var activeTask task
@@ -257,16 +256,15 @@ func TestDmTaskQueue_Basic(t *testing.T) {
 	queue.setMaxTaskNum(10) // not accurate, full also means utBufChan block
 	for i := 0; i < int(queue.getMaxTaskNum()); i++ {
 		err = queue.Enqueue(newDefaultMockDmlTask())
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 	}
 	assert.True(t, queue.utFull())
 	err = queue.Enqueue(newDefaultMockDmlTask())
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 }
 
 // test the timestamp statistics
 func TestDmTaskQueue_TimestampStatistics(t *testing.T) {
-
 	var err error
 	var unissuedTask task
 
@@ -354,7 +352,7 @@ func TestDmTaskQueue_TimestampStatistics2(t *testing.T) {
 				return
 			case <-ticker.C:
 				stats, err := queue.getPChanStatsInfo()
-				assert.Nil(t, err)
+				assert.NoError(t, err)
 				if currPChanStats == nil {
 					currPChanStats = stats
 				} else {
@@ -394,7 +392,7 @@ func TestDmTaskQueue_TimestampStatistics2(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	//time.Sleep(time.Millisecond*100)
+	// time.Sleep(time.Millisecond*100)
 	needLoop := true
 	for needLoop {
 		processCountMut.RLock()
@@ -408,12 +406,11 @@ func TestDmTaskQueue_TimestampStatistics2(t *testing.T) {
 	wgSchedule.Wait()
 
 	stats, err := queue.getPChanStatsInfo()
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.Zero(t, len(stats))
 }
 
 func TestDqTaskQueue(t *testing.T) {
-
 	var err error
 	var unissuedTask task
 	var activeTask task
@@ -482,15 +479,14 @@ func TestDqTaskQueue(t *testing.T) {
 	queue.setMaxTaskNum(10) // not accurate, full also means utBufChan block
 	for i := 0; i < int(queue.getMaxTaskNum()); i++ {
 		err = queue.Enqueue(newDefaultMockDqlTask())
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 	}
 	assert.True(t, queue.utFull())
 	err = queue.Enqueue(newDefaultMockDqlTask())
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 }
 
 func TestTaskScheduler(t *testing.T) {
-
 	var err error
 
 	ctx := context.Background()
@@ -567,10 +563,12 @@ func TestTaskScheduler_concurrentPushAndPop(t *testing.T) {
 	collectionID := UniqueID(0)
 	collectionName := "col-0"
 	channels := []pChan{"mock-chan-0", "mock-chan-1"}
-	cache := newMockCache()
-	cache.setGetIDFunc(func(ctx context.Context, collectionName string) (typeutil.UniqueID, error) {
-		return collectionID, nil
-	})
+	cache := NewMockCache(t)
+	cache.On("GetCollectionID",
+		mock.Anything, // context.Context
+		mock.AnythingOfType("string"),
+		mock.AnythingOfType("string"),
+	).Return(collectionID, nil)
 	globalMetaCache = cache
 	tsoAllocatorIns := newMockTsoAllocator()
 	factory := newSimpleMockMsgStreamFactory()
@@ -579,14 +577,12 @@ func TestTaskScheduler_concurrentPushAndPop(t *testing.T) {
 
 	run := func(wg *sync.WaitGroup) {
 		defer wg.Done()
-		chMgr := newMockChannelsMgr()
-		chMgr.getChannelsFunc = func(collectionID UniqueID) ([]pChan, error) {
-			return channels, nil
-		}
+		chMgr := NewMockChannelsMgr(t)
+		chMgr.EXPECT().getChannels(mock.Anything).Return(channels, nil)
 		it := &insertTask{
 			ctx: context.Background(),
 			insertMsg: &msgstream.InsertMsg{
-				InsertRequest: msgpb.InsertRequest{
+				InsertRequest: &msgpb.InsertRequest{
 					Base:           &commonpb.MsgBase{},
 					CollectionName: collectionName,
 				},
@@ -597,9 +593,7 @@ func TestTaskScheduler_concurrentPushAndPop(t *testing.T) {
 		assert.NoError(t, err)
 		task := scheduler.scheduleDmTask()
 		scheduler.dmQueue.AddActiveTask(task)
-		chMgr.getChannelsFunc = func(collectionID UniqueID) ([]pChan, error) {
-			return nil, fmt.Errorf("mock err")
-		}
+		chMgr.EXPECT().getChannels(mock.Anything).Return(nil, fmt.Errorf("mock err"))
 		scheduler.dmQueue.PopActiveTask(task.ID()) // assert no panic
 	}
 
@@ -609,4 +603,76 @@ func TestTaskScheduler_concurrentPushAndPop(t *testing.T) {
 		go run(wg)
 	}
 	wg.Wait()
+}
+
+func TestTaskScheduler_SkipAllocTimestamp(t *testing.T) {
+	dbName := "test_query"
+	collName := "test_skip_alloc_timestamp"
+	collID := UniqueID(111)
+	mockMetaCache := NewMockCache(t)
+	globalMetaCache = mockMetaCache
+
+	tsoAllocatorIns := newMockTsoAllocator()
+	queue := newBaseTaskQueue(tsoAllocatorIns)
+	assert.NotNil(t, queue)
+
+	assert.True(t, queue.utEmpty())
+	assert.False(t, queue.utFull())
+
+	mockMetaCache.EXPECT().GetCollectionID(mock.Anything, mock.Anything, mock.Anything).Return(collID, nil)
+	mockMetaCache.EXPECT().GetCollectionInfo(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(
+		&collectionInfo{
+			collID:           collID,
+			consistencyLevel: commonpb.ConsistencyLevel_Eventually,
+		}, nil)
+	mockMetaCache.EXPECT().AllocID(mock.Anything).Return(1, nil).Twice()
+
+	t.Run("query", func(t *testing.T) {
+		qt := &queryTask{
+			RetrieveRequest: &internalpb.RetrieveRequest{
+				Base: &commonpb.MsgBase{},
+			},
+			request: &milvuspb.QueryRequest{
+				DbName:                dbName,
+				CollectionName:        collName,
+				UseDefaultConsistency: true,
+			},
+		}
+
+		err := queue.Enqueue(qt)
+		assert.NoError(t, err)
+	})
+
+	t.Run("search", func(t *testing.T) {
+		st := &searchTask{
+			SearchRequest: &internalpb.SearchRequest{
+				Base: &commonpb.MsgBase{},
+			},
+			request: &milvuspb.SearchRequest{
+				DbName:                dbName,
+				CollectionName:        collName,
+				UseDefaultConsistency: true,
+			},
+		}
+
+		err := queue.Enqueue(st)
+		assert.NoError(t, err)
+	})
+
+	mockMetaCache.EXPECT().AllocID(mock.Anything).Return(0, fmt.Errorf("mock error")).Once()
+	t.Run("failed", func(t *testing.T) {
+		st := &searchTask{
+			SearchRequest: &internalpb.SearchRequest{
+				Base: &commonpb.MsgBase{},
+			},
+			request: &milvuspb.SearchRequest{
+				DbName:                dbName,
+				CollectionName:        collName,
+				UseDefaultConsistency: true,
+			},
+		}
+
+		err := queue.Enqueue(st)
+		assert.Error(t, err)
+	})
 }

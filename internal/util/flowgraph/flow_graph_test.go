@@ -24,8 +24,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
 // Flow graph basic example: count `c = pow(a) + 2`
@@ -34,7 +35,7 @@ import (
 // nodeD: count c = b + 2
 
 type nodeA struct {
-	BaseNode
+	InputNode
 	inputChan chan float64
 	a         float64
 }
@@ -46,7 +47,7 @@ type nodeB struct {
 
 type nodeC struct {
 	BaseNode
-	d          float64
+	c          float64
 	outputChan chan float64
 }
 
@@ -116,8 +117,10 @@ func createExampleFlowGraph() (*TimeTickedFlowGraph, chan float64, chan float64,
 	fg := NewTimeTickedFlowGraph(ctx)
 
 	var a Node = &nodeA{
-		BaseNode: BaseNode{
-			maxQueueLength: MaxQueueLength,
+		InputNode: InputNode{
+			BaseNode: BaseNode{
+				maxQueueLength: MaxQueueLength,
+			},
 		},
 		inputChan: inputChan,
 	}
@@ -137,7 +140,7 @@ func createExampleFlowGraph() (*TimeTickedFlowGraph, chan float64, chan float64,
 	fg.AddNode(b)
 	fg.AddNode(c)
 
-	var err = fg.SetEdges(a.Name(),
+	err := fg.SetEdges(a.Name(),
 		[]string{b.Name()},
 	)
 	if err != nil {
@@ -174,8 +177,10 @@ func TestTimeTickedFlowGraph_AddNode(t *testing.T) {
 	fg := NewTimeTickedFlowGraph(context.TODO())
 
 	var a Node = &nodeA{
-		BaseNode: BaseNode{
-			maxQueueLength: MaxQueueLength,
+		InputNode: InputNode{
+			BaseNode: BaseNode{
+				maxQueueLength: MaxQueueLength,
+			},
 		},
 		inputChan: inputChan,
 	}
@@ -187,8 +192,12 @@ func TestTimeTickedFlowGraph_AddNode(t *testing.T) {
 
 	fg.AddNode(a)
 	assert.Equal(t, len(fg.nodeCtx), 1)
+	assert.Equal(t, len(fg.nodeSequence), 1)
+	assert.Equal(t, a.Name(), fg.nodeSequence[0])
 	fg.AddNode(b)
 	assert.Equal(t, len(fg.nodeCtx), 2)
+	assert.Equal(t, len(fg.nodeSequence), 2)
+	assert.Equal(t, b.Name(), fg.nodeSequence[1])
 }
 
 func TestTimeTickedFlowGraph_Start(t *testing.T) {
@@ -217,4 +226,31 @@ func TestTimeTickedFlowGraph_Close(t *testing.T) {
 	assert.NoError(t, err)
 	defer cancel()
 	fg.Close()
+}
+
+func TestBlockAll(t *testing.T) {
+	fg := NewTimeTickedFlowGraph(context.Background())
+	fg.AddNode(&nodeA{})
+	fg.AddNode(&nodeB{})
+	fg.AddNode(&nodeC{})
+
+	count := 1000
+	ch := make([]chan struct{}, count)
+	for i := 0; i < count; i++ {
+		ch[i] = make(chan struct{})
+		go func(i int) {
+			fg.Blockall()
+			defer fg.Unblock()
+			close(ch[i])
+		}(i)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	for i := 0; i < count; i++ {
+		select {
+		case <-ch[i]:
+		case <-ctx.Done():
+			t.Error("block all timeout")
+		}
+	}
 }

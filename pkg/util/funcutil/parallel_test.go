@@ -18,13 +18,14 @@ package funcutil
 
 import (
 	"math/rand"
-	"runtime"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/milvus-io/milvus/pkg/util/hardware"
 )
 
 func dummyFunc() {
@@ -65,7 +66,7 @@ func Test_ProcessFuncParallel(t *testing.T) {
 	assert.Equal(t, err, nil, "process function parallel must be right")
 	assert.Equal(t, s, expectedS, "process function parallel must be right")
 
-	err = ProcessFuncParallel(total, runtime.NumCPU(), naiveF, "naiveF") // Parallel by CPU
+	err = ProcessFuncParallel(total, hardware.GetCPUNum(), naiveF, "naiveF") // Parallel by CPU
 	assert.Equal(t, err, nil, "process function parallel must be right")
 	assert.Equal(t, s, expectedS, "process function parallel must be right")
 
@@ -82,7 +83,7 @@ func Test_ProcessFuncParallel(t *testing.T) {
 	err = ProcessFuncParallel(total, total, oddErrorF, "oddErrorF") // Totally Parallel
 	assert.NotEqual(t, err, nil, "process function parallel must be right")
 
-	err = ProcessFuncParallel(total, runtime.NumCPU(), oddErrorF, "oddErrorF") // Parallel by CPU
+	err = ProcessFuncParallel(total, hardware.GetCPUNum(), oddErrorF, "oddErrorF") // Parallel by CPU
 	assert.NotEqual(t, err, nil, "process function parallel must be right")
 
 	evenErrorF := func(idx int) error {
@@ -98,7 +99,7 @@ func Test_ProcessFuncParallel(t *testing.T) {
 	err = ProcessFuncParallel(total, total, evenErrorF, "evenErrorF") // Totally Parallel
 	assert.NotEqual(t, err, nil, "process function parallel must be right")
 
-	err = ProcessFuncParallel(total, runtime.NumCPU(), evenErrorF, "evenErrorF") // Parallel by CPU
+	err = ProcessFuncParallel(total, hardware.GetCPUNum(), evenErrorF, "evenErrorF") // Parallel by CPU
 	assert.NotEqual(t, err, nil, "process function parallel must be right")
 
 	// rand.Int() may be always an even number
@@ -110,11 +111,11 @@ func Test_ProcessFuncParallel(t *testing.T) {
 	}
 
 	err = ProcessFuncParallel(total, 1, randomErrorF, "randomErrorF") // serial
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 
 	err = ProcessFuncParallel(total, total, randomErrorF, "randomErrorF") // Totally Parallel
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 
-	err = ProcessFuncParallel(total, runtime.NumCPU(), randomErrorF, "randomErrorF") // Parallel by CPU
-	assert.NotNil(t, err)
+	err = ProcessFuncParallel(total, hardware.GetCPUNum(), randomErrorF, "randomErrorF") // Parallel by CPU
+	assert.Error(t, err)
 }

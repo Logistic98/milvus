@@ -1,8 +1,9 @@
 package deletebuffer
 
 import (
-	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/samber/lo"
+
+	"github.com/milvus-io/milvus/internal/storage"
 )
 
 // Item wraps cache item as `timed`.
@@ -23,6 +24,12 @@ func (item *Item) Size() int64 {
 	}, int64(0))
 }
 
+func (item *Item) EntryNum() int64 {
+	return lo.Reduce(item.Data, func(entryNum int64, item BufferItem, _ int) int64 {
+		return entryNum + item.EntryNum()
+	}, int64(0))
+}
+
 type BufferItem struct {
 	PartitionID int64
 	DeleteData  storage.DeleteData
@@ -35,4 +42,8 @@ func (item *BufferItem) Size() int64 {
 	}
 
 	return int64(96) + pkSize + int64(8*len(item.DeleteData.Tss))
+}
+
+func (item *BufferItem) EntryNum() int64 {
+	return int64(len(item.DeleteData.Pks))
 }

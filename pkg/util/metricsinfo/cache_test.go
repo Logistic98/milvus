@@ -15,8 +15,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 )
 
 func Test_NewMetricsCacheManager(t *testing.T) {
@@ -100,7 +101,7 @@ func TestMetricsCacheManager_UpdateSystemInfoMetrics(t *testing.T) {
 	manager.InvalidateSystemInfoMetrics()
 	assert.Equal(t, false, manager.IsSystemInfoMetricsValid())
 	resp, err := manager.GetSystemInfoMetrics()
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 	assert.Nil(t, resp)
 
 	bigRetention := time.Hour * 24
@@ -110,13 +111,13 @@ func TestMetricsCacheManager_UpdateSystemInfoMetrics(t *testing.T) {
 	manager.UpdateSystemInfoMetrics(&milvuspb.GetMetricsResponse{})
 	assert.Equal(t, true, manager.IsSystemInfoMetricsValid())
 	resp, err = manager.GetSystemInfoMetrics()
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.NotNil(t, resp)
 
 	manager.UpdateSystemInfoMetrics(nil)
 	assert.Equal(t, false, manager.IsSystemInfoMetricsValid())
 	resp, err = manager.GetSystemInfoMetrics()
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 	assert.Nil(t, resp)
 
 	manager.SetRetention(smallRetention)
@@ -124,7 +125,7 @@ func TestMetricsCacheManager_UpdateSystemInfoMetrics(t *testing.T) {
 	time.Sleep(smallRetention)
 	assert.Equal(t, false, manager.IsSystemInfoMetricsValid())
 	resp, err = manager.GetSystemInfoMetrics()
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 	assert.Nil(t, resp)
 }
 
@@ -135,7 +136,7 @@ func TestMetricsCacheManager_GetSystemInfoMetrics(t *testing.T) {
 	manager.InvalidateSystemInfoMetrics()
 	assert.Equal(t, false, manager.IsSystemInfoMetricsValid())
 	resp, err := manager.GetSystemInfoMetrics()
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 	assert.Nil(t, resp)
 
 	bigRetention := time.Hour * 24
@@ -145,13 +146,13 @@ func TestMetricsCacheManager_GetSystemInfoMetrics(t *testing.T) {
 	manager.UpdateSystemInfoMetrics(&milvuspb.GetMetricsResponse{})
 	assert.Equal(t, true, manager.IsSystemInfoMetricsValid())
 	resp, err = manager.GetSystemInfoMetrics()
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.NotNil(t, resp)
 
 	manager.UpdateSystemInfoMetrics(nil)
 	assert.Equal(t, false, manager.IsSystemInfoMetricsValid())
 	resp, err = manager.GetSystemInfoMetrics()
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 	assert.Nil(t, resp)
 
 	manager.SetRetention(smallRetention)
@@ -159,6 +160,6 @@ func TestMetricsCacheManager_GetSystemInfoMetrics(t *testing.T) {
 	time.Sleep(smallRetention)
 	assert.Equal(t, false, manager.IsSystemInfoMetricsValid())
 	resp, err = manager.GetSystemInfoMetrics()
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 	assert.Nil(t, resp)
 }

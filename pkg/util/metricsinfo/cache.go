@@ -20,7 +20,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 )
 
 // DefaultMetricsRetention defines the default retention of metrics cache.
@@ -106,7 +106,6 @@ func (manager *MetricsCacheManager) GetSystemInfoMetrics() (*milvuspb.GetMetrics
 	if manager.systemInfoMetricsInvalid ||
 		manager.systemInfoMetrics == nil ||
 		time.Since(manager.systemInfoMetricsLastUpdatedTime) >= retention {
-
 		return nil, errInvalidSystemInfosMetricCache
 	}
 

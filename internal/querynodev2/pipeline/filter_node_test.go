@@ -20,35 +20,35 @@ import (
 	"testing"
 
 	"github.com/samber/lo"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
 
-	"github.com/milvus-io/milvus-proto/go-api/msgpb"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
+	"github.com/milvus-io/milvus/internal/querynodev2/delegator"
 	"github.com/milvus-io/milvus/internal/querynodev2/segments"
 	"github.com/milvus-io/milvus/pkg/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
-//test of filter node
+// test of filter node
 type FilterNodeSuite struct {
 	suite.Suite
-	//datas
+	// datas
 	collectionID int64
 	partitionIDs []int64
 	channel      string
 
 	validSegmentIDs    []int64
-	excludedSegments   *typeutil.ConcurrentMap[int64, *datapb.SegmentInfo]
 	excludedSegmentIDs []int64
 	insertSegmentIDs   []int64
 	deleteSegmentSum   int
-	//segmentID of msg invalid because empty of not aligned
+	// segmentID of msg invalid because empty of not aligned
 	errSegmentID int64
 
-	//mocks
+	// mocks
 	manager *segments.Manager
+
+	delegator *delegator.MockShardDelegator
 }
 
 func (suite *FilterNodeSuite) SetupSuite() {
@@ -63,24 +63,16 @@ func (suite *FilterNodeSuite) SetupSuite() {
 	suite.deleteSegmentSum = 4
 	suite.errSegmentID = 7
 
-	//init excludedSegment
-	suite.excludedSegments = typeutil.NewConcurrentMap[int64, *datapb.SegmentInfo]()
-	for _, id := range suite.excludedSegmentIDs {
-		suite.excludedSegments.Insert(id, &datapb.SegmentInfo{
-			DmlPosition: &msgpb.MsgPosition{
-				Timestamp: 1,
-			},
-		})
-	}
+	suite.delegator = delegator.NewMockShardDelegator(suite.T())
 }
 
-//test filter node with collection load collection
+// test filter node with collection load collection
 func (suite *FilterNodeSuite) TestWithLoadCollection() {
-	//data
+	// data
 	suite.validSegmentIDs = []int64{2, 3, 4, 5, 6}
 
-	//mock
-	collection := segments.NewCollectionWithoutSchema(suite.collectionID, querypb.LoadType_LoadCollection)
+	// mock
+	collection := segments.NewTestCollection(suite.collectionID, querypb.LoadType_LoadCollection, nil)
 	for _, partitionID := range suite.partitionIDs {
 		collection.AddPartition(partitionID)
 	}
@@ -95,7 +87,11 @@ func (suite *FilterNodeSuite) TestWithLoadCollection() {
 		Segment:    mockSegmentManager,
 	}
 
-	node := newFilterNode(suite.collectionID, suite.channel, suite.manager, suite.excludedSegments, 8)
+	suite.delegator.EXPECT().VerifyExcludedSegments(mock.Anything, mock.Anything).RunAndReturn(func(segmentID int64, ts uint64) bool {
+		return !(lo.Contains(suite.excludedSegmentIDs, segmentID) && ts <= 1)
+	})
+	suite.delegator.EXPECT().TryCleanExcludedSegments(mock.Anything)
+	node := newFilterNode(suite.collectionID, suite.channel, suite.manager, suite.delegator, 8)
 	in := suite.buildMsgPack()
 	out := node.Operate(in)
 
@@ -109,13 +105,13 @@ func (suite *FilterNodeSuite) TestWithLoadCollection() {
 	suite.Equal(suite.deleteSegmentSum, len(nodeMsg.deleteMsgs))
 }
 
-//test filter node with collection load partition
+// test filter node with collection load partition
 func (suite *FilterNodeSuite) TestWithLoadPartation() {
-	//data
+	// data
 	suite.validSegmentIDs = []int64{2, 3, 4, 5, 6}
 
-	//mock
-	collection := segments.NewCollectionWithoutSchema(suite.collectionID, querypb.LoadType_LoadPartition)
+	// mock
+	collection := segments.NewTestCollection(suite.collectionID, querypb.LoadType_LoadPartition, nil)
 	collection.AddPartition(suite.partitionIDs[0])
 
 	mockCollectionManager := segments.NewMockCollectionManager(suite.T())
@@ -128,7 +124,11 @@ func (suite *FilterNodeSuite) TestWithLoadPartation() {
 		Segment:    mockSegmentManager,
 	}
 
-	node := newFilterNode(suite.collectionID, suite.channel, suite.manager, suite.excludedSegments, 8)
+	suite.delegator.EXPECT().VerifyExcludedSegments(mock.Anything, mock.Anything).RunAndReturn(func(segmentID int64, ts uint64) bool {
+		return !(lo.Contains(suite.excludedSegmentIDs, segmentID) && ts <= 1)
+	})
+	suite.delegator.EXPECT().TryCleanExcludedSegments(mock.Anything)
+	node := newFilterNode(suite.collectionID, suite.channel, suite.manager, suite.delegator, 8)
 	in := suite.buildMsgPack()
 	out := node.Operate(in)
 
@@ -149,43 +149,43 @@ func (suite *FilterNodeSuite) buildMsgPack() *msgstream.MsgPack {
 		Msgs:    []msgstream.TsMsg{},
 	}
 
-	//add valid insert
+	// add valid insert
 	for _, id := range suite.insertSegmentIDs {
 		insertMsg := buildInsertMsg(suite.collectionID, suite.partitionIDs[id%2], id, suite.channel, 1)
 		msgPack.Msgs = append(msgPack.Msgs, insertMsg)
 	}
 
-	//add valid delete
+	// add valid delete
 	for i := 0; i < suite.deleteSegmentSum; i++ {
 		deleteMsg := buildDeleteMsg(suite.collectionID, suite.partitionIDs[i%2], suite.channel, 1)
 		msgPack.Msgs = append(msgPack.Msgs, deleteMsg)
 	}
 
-	//add invalid msg
+	// add invalid msg
 
-	//segment in excludedSegments
-	//some one end timestamp befroe dmlPosition timestamp will be invalid
+	// segment in excludedSegments
+	// some one end timestamp befroe dmlPosition timestamp will be invalid
 	for _, id := range suite.excludedSegmentIDs {
 		insertMsg := buildInsertMsg(suite.collectionID, suite.partitionIDs[id%2], id, suite.channel, 1)
 		insertMsg.EndTimestamp = uint64(id)
 		msgPack.Msgs = append(msgPack.Msgs, insertMsg)
 	}
 
-	//empty msg
+	// empty msg
 	insertMsg := buildInsertMsg(suite.collectionID, suite.partitionIDs[0], suite.errSegmentID, suite.channel, 0)
 	msgPack.Msgs = append(msgPack.Msgs, insertMsg)
 
 	deleteMsg := buildDeleteMsg(suite.collectionID, suite.partitionIDs[0], suite.channel, 0)
 	msgPack.Msgs = append(msgPack.Msgs, deleteMsg)
 
-	//msg not target
+	// msg not target
 	insertMsg = buildInsertMsg(suite.collectionID+1, 1, 0, "Unknown", 1)
 	msgPack.Msgs = append(msgPack.Msgs, insertMsg)
 
 	deleteMsg = buildDeleteMsg(suite.collectionID+1, 1, "Unknown", 1)
 	msgPack.Msgs = append(msgPack.Msgs, deleteMsg)
 
-	//msg not aligned
+	// msg not aligned
 	insertMsg = buildInsertMsg(suite.collectionID, suite.partitionIDs[0], suite.errSegmentID, suite.channel, 1)
 	insertMsg.Timestamps = []uint64{}
 	msgPack.Msgs = append(msgPack.Msgs, insertMsg)

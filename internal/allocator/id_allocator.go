@@ -22,8 +22,9 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus/pkg/proto/rootcoordpb"
 	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
 )
 
@@ -83,7 +84,6 @@ func (ia *IDAllocator) gatherReqIDCount() uint32 {
 }
 
 func (ia *IDAllocator) syncID() (bool, error) {
-
 	need := ia.gatherReqIDCount()
 	if need < ia.countPerRPC {
 		need = ia.countPerRPC
@@ -93,7 +93,6 @@ func (ia *IDAllocator) syncID() (bool, error) {
 	req := &rootcoordpb.AllocIDRequest{
 		Base: commonpbutil.NewMsgBase(
 			commonpbutil.WithMsgType(commonpb.MsgType_RequestID),
-			commonpbutil.WithMsgID(0),
 			commonpbutil.WithSourceID(ia.PeerID),
 		),
 		Count: need,

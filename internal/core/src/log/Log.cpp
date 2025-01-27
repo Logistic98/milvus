@@ -14,6 +14,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "common/EasyAssert.h"
+#include "fmt/core.h"
 #include "log/Log.h"
 
 /*
@@ -44,10 +46,21 @@ LogOut(const char* pattern, ...) {
 
     va_list vl;
     va_start(vl, pattern);
-    vsnprintf(str_p.get(), len, pattern, vl);  // NOLINT
+    int result = vsnprintf(str_p.get(), len, pattern, vl);  // NOLINT
     va_end(vl);
 
-    return std::string(str_p.get());
+    if (result < 0) {
+        std::cerr << "Error: vsnprintf failed to format the string."
+                  << std::endl;
+        return "Formatting Error";
+    } else if (static_cast<size_t>(result) >= len) {
+        std::cerr
+            << "Warning: Output was truncated. Buffer size was insufficient."
+            << std::endl;
+        return "Truncated Output";
+    }
+
+    return {str_p.get()};
 }
 
 void
@@ -84,18 +97,6 @@ get_now_timestamp() {
 #ifndef WIN32
 
 int64_t
-get_system_boottime() {
-    FILE* uptime = fopen("/proc/uptime", "r");
-    float since_sys_boot, _;
-    auto ret = fscanf(uptime, "%f %f", &since_sys_boot, &_);
-    fclose(uptime);
-    if (ret != 2) {
-        throw std::runtime_error("read /proc/uptime failed.");
-    }
-    return static_cast<int64_t>(since_sys_boot);
-}
-
-int64_t
 get_thread_starttime() {
 #ifdef __APPLE__
     uint64_t tid;
@@ -108,15 +109,25 @@ get_thread_starttime() {
 
     int64_t pid = getpid();
     char filename[256];
-    snprintf(filename,
-             sizeof(filename),
-             "/proc/%lld/task/%lld/stat",
-             (long long)pid,   // NOLINT, TODO: How to solve this?
-             (long long)tid);  // NOLINT
+    int ret_snprintf =
+        snprintf(filename,
+                 sizeof(filename),
+                 "/proc/%lld/task/%lld/stat",
+                 (long long)pid,   // NOLINT, TODO: How to solve this?
+                 (long long)tid);  // NOLINT
+
+    if (ret_snprintf < 0 ||
+        static_cast<size_t>(ret_snprintf) >= sizeof(filename)) {
+        std::cerr << "Error: snprintf failed or output was truncated when "
+                     "creating filename."
+                  << std::endl;
+        throw std::runtime_error("Failed to format filename string.");
+    }
 
     int64_t val = 0;
     char comm[16], state;
     FILE* thread_stat = fopen(filename, "r");
+    AssertInfo(thread_stat != nullptr, "opening file:{} failed!", filename);
     auto ret = fscanf(
         thread_stat, "%lld %s %s ", (long long*)&val, comm, &state);  // NOLINT
 
@@ -133,33 +144,10 @@ get_thread_starttime() {
     return val / sysconf(_SC_CLK_TCK);
 }
 
-int64_t
-get_thread_start_timestamp() {
-    try {
-        return get_now_timestamp() - get_system_boottime() +
-               get_thread_starttime();
-    } catch (...) {
-        return 0;
-    }
-}
-
 #else
 
 #define WINDOWS_TICK 10000000
 #define SEC_TO_UNIX_EPOCH 11644473600LL
-
-int64_t
-get_thread_start_timestamp() {
-    FILETIME dummy;
-    FILETIME ret;
-
-    if (GetThreadTimes(GetCurrentThread(), &ret, &dummy, &dummy, &dummy)) {
-        auto ticks = Int64ShllMod32(ret.dwHighDateTime, 32) | ret.dwLowDateTime;
-        auto thread_started = ticks / WINDOWS_TICK - SEC_TO_UNIX_EPOCH;
-        return get_now_timestamp() - thread_started;
-    }
-    return 0;
-}
 
 #endif
 

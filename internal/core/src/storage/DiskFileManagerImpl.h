@@ -24,44 +24,54 @@
 
 #include "storage/IndexData.h"
 #include "storage/FileManager.h"
-#include "storage/LocalChunkManager.h"
-#include "storage/MinioChunkManager.h"
-
+#include "storage/ChunkManager.h"
 #include "common/Consts.h"
 
 namespace milvus::storage {
 
 class DiskFileManagerImpl : public FileManagerImpl {
  public:
-    explicit DiskFileManagerImpl(const FieldDataMeta& field_meta,
-                                 const IndexMeta& index_meta,
-                                 const StorageConfig& storage_config);
+    explicit DiskFileManagerImpl(const FileManagerContext& fileManagerContext);
 
-    virtual ~DiskFileManagerImpl();
+    ~DiskFileManagerImpl() override;
 
-    virtual bool
-    LoadFile(const std::string& filename) noexcept;
+    bool
+    LoadFile(const std::string& filename) noexcept override;
 
-    virtual bool
-    AddFile(const std::string& filename) noexcept;
+    bool
+    AddFile(const std::string& filename) noexcept override;
 
-    virtual std::optional<bool>
-    IsExisted(const std::string& filename) noexcept;
+    std::optional<bool>
+    IsExisted(const std::string& filename) noexcept override;
 
-    virtual bool
-    RemoveFile(const std::string& filename) noexcept;
+    bool
+    RemoveFile(const std::string& filename) noexcept override;
 
  public:
-    virtual std::string
-    GetName() const {
+    bool
+    AddTextLog(const std::string& filename) noexcept;
+
+ public:
+    std::string
+    GetName() const override {
         return "DiskFileManagerImpl";
     }
 
     std::string
-    GetRemoteIndexObjectPrefix();
+    GetLocalIndexObjectPrefix();
+
+    // Similar to GetTextIndexIdentifier, segment_id and field_id is also required.
+    std::string
+    GetLocalTextIndexPrefix();
 
     std::string
-    GetLocalIndexObjectPrefix();
+    GetIndexIdentifier();
+
+    // Different from user index, a text index task may have multiple text fields sharing same build_id/task_id. So
+    // segment_id and field_id are required to identify a unique text index, in case that we support multiple index task
+    // in the same indexnode at the same time later.
+    std::string
+    GetTextIndexIdentifier();
 
     std::string
     GetLocalRawDataObjectPrefix();
@@ -77,21 +87,32 @@ class DiskFileManagerImpl : public FileManagerImpl {
     }
 
     void
-    CacheIndexToDisk(std::vector<std::string> remote_files);
+    CacheIndexToDisk(const std::vector<std::string>& remote_files);
 
-    uint64_t
-    CacheBatchIndexFilesToDisk(const std::vector<std::string>& remote_files,
-                               const std::string& local_file_name,
-                               uint64_t local_file_init_offfset);
+    void
+    CacheTextLogToDisk(const std::vector<std::string>& remote_files);
 
-    FieldDataMeta
-    GetFileDataMeta() const {
-        return field_meta_;
+    void
+    AddBatchIndexFiles(const std::string& local_file_name,
+                       const std::vector<int64_t>& local_file_offsets,
+                       const std::vector<std::string>& remote_files,
+                       const std::vector<int64_t>& remote_file_sizes);
+
+    template <typename DataType>
+    std::string
+    CacheRawDataToDisk(std::vector<std::string> remote_files);
+
+    std::string
+    CacheOptFieldToDisk(OptFieldT& fields_map);
+
+    std::string
+    GetRemoteIndexPrefix() const {
+        return GetRemoteIndexObjectPrefix();
     }
 
-    IndexMeta
-    GetIndexMeta() const {
-        return index_meta_;
+    size_t
+    GetAddedTotalFileSize() const {
+        return added_total_file_size_;
     }
 
  private:
@@ -103,21 +124,20 @@ class DiskFileManagerImpl : public FileManagerImpl {
     std::string
     GetFileName(const std::string& localfile);
 
+    std::string
+    GetRemoteIndexPath(const std::string& file_name, int64_t slice_num) const;
+
+    std::string
+    GetRemoteTextLogPath(const std::string& file_name, int64_t slice_num) const;
+
  private:
-    // collection meta
-    FieldDataMeta field_meta_;
-
-    // index meta
-    IndexMeta index_meta_;
-
     // local file path (abs path)
     std::vector<std::string> local_paths_;
 
     // remote file path
     std::map<std::string, int64_t> remote_paths_to_size_;
 
-    RemoteChunkManagerPtr rcm_;
-    std::string remote_root_path_;
+    size_t added_total_file_size_ = 0;
 };
 
 using DiskANNFileManagerImplPtr = std::shared_ptr<DiskFileManagerImpl>;

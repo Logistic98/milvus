@@ -17,41 +17,42 @@
 #include "pb/index_cgo_msg.pb.h"
 
 #include <string>
+#include <utility>
 
 namespace milvus::indexbuilder {
 
-ScalarIndexCreator::ScalarIndexCreator(DataType dtype,
-                                       const char* type_params,
-                                       const char* index_params)
-    : dtype_(dtype) {
-    // TODO: move parse-related logic to a common interface.
-    proto::indexcgo::TypeParams type_params_;
-    proto::indexcgo::IndexParams index_params_;
-    milvus::index::ParseFromString(type_params_, std::string(type_params));
-    milvus::index::ParseFromString(index_params_, std::string(index_params));
-
-    for (auto i = 0; i < type_params_.params_size(); ++i) {
-        const auto& param = type_params_.params(i);
-        config_[param.key()] = param.value();
-    }
-
-    for (auto i = 0; i < index_params_.params_size(); ++i) {
-        const auto& param = index_params_.params(i);
-        config_[param.key()] = param.value();
-    }
-
+ScalarIndexCreator::ScalarIndexCreator(
+    DataType dtype,
+    Config& config,
+    const storage::FileManagerContext& file_manager_context)
+    : config_(config), dtype_(dtype) {
     milvus::index::CreateIndexInfo index_info;
+    if (config.contains("index_type")) {
+        index_type_ = config.at("index_type").get<std::string>();
+    }
+    // Config should have value for milvus::index::SCALAR_INDEX_ENGINE_VERSION for production calling chain.
+    // Use value_or(1) for unit test without setting this value
+    index_info.scalar_index_engine_version =
+        milvus::index::GetValueFromConfig<int32_t>(
+            config, milvus::index::SCALAR_INDEX_ENGINE_VERSION)
+            .value_or(1);
+
     index_info.field_type = dtype_;
     index_info.index_type = index_type();
-    index_ =
-        index::IndexFactory::GetInstance().CreateIndex(index_info, nullptr);
+    index_ = index::IndexFactory::GetInstance().CreateIndex(
+        index_info, file_manager_context);
 }
 
 void
 ScalarIndexCreator::Build(const milvus::DatasetPtr& dataset) {
     auto size = dataset->GetRows();
     auto data = dataset->GetTensor();
-    index_->BuildWithRawData(size, data);
+    index_->BuildWithRawDataForUT(size, data);
+}
+
+void
+ScalarIndexCreator::Build() {
+    index_->Build(config_);
 }
 
 milvus::BinarySet
@@ -66,8 +67,11 @@ ScalarIndexCreator::Load(const milvus::BinarySet& binary_set) {
 
 std::string
 ScalarIndexCreator::index_type() {
-    // TODO
-    return "sort";
+    return index_type_;
 }
 
+index::IndexStatsPtr
+ScalarIndexCreator::Upload() {
+    return index_->Upload();
+}
 }  // namespace milvus::indexbuilder

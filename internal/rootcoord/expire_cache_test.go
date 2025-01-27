@@ -19,19 +19,20 @@ package rootcoord
 import (
 	"testing"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-
-	"github.com/milvus-io/milvus/internal/proto/proxypb"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus/internal/util/proxyutil"
+	"github.com/milvus-io/milvus/pkg/proto/proxypb"
 )
 
 func Test_expireCacheConfig_apply(t *testing.T) {
-	c := defaultExpireCacheConfig()
+	c := proxyutil.DefaultExpireCacheConfig()
 	req := &proxypb.InvalidateCollMetaCacheRequest{}
-	c.apply(req)
-	assert.Nil(t, req.GetBase())
-	opt := expireCacheWithDropFlag()
+	c.Apply(req)
+	assert.Equal(t, commonpb.MsgType_Undefined, req.GetBase().GetMsgType())
+	opt := proxyutil.SetMsgType(commonpb.MsgType_DropCollection)
 	opt(&c)
-	c.apply(req)
+	c.Apply(req)
 	assert.Equal(t, commonpb.MsgType_DropCollection, req.GetBase().GetMsgType())
 }

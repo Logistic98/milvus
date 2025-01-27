@@ -3,27 +3,25 @@ package backend
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"path"
 	"strconv"
 	"strings"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus/cmd/tools/migration/configs"
-	"github.com/milvus-io/milvus/cmd/tools/migration/legacy"
-
-	"github.com/milvus-io/milvus/cmd/tools/migration/legacy/legacypb"
-
-	"github.com/golang/protobuf/proto"
 	"github.com/milvus-io/milvus/cmd/tools/migration/console"
+	"github.com/milvus-io/milvus/cmd/tools/migration/legacy"
+	"github.com/milvus-io/milvus/cmd/tools/migration/legacy/legacypb"
 	"github.com/milvus-io/milvus/cmd/tools/migration/meta"
 	"github.com/milvus-io/milvus/cmd/tools/migration/utils"
 	"github.com/milvus-io/milvus/cmd/tools/migration/versions"
 	"github.com/milvus-io/milvus/internal/metastore/kv/rootcoord"
 	"github.com/milvus-io/milvus/internal/metastore/model"
-	pb "github.com/milvus-io/milvus/internal/proto/etcdpb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
+	"github.com/milvus-io/milvus/internal/storage"
+	pb "github.com/milvus-io/milvus/pkg/proto/etcdpb"
+	"github.com/milvus-io/milvus/pkg/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
@@ -44,7 +42,7 @@ func newEtcd210(cfg *configs.MilvusConfig) (*etcd210, error) {
 func (b etcd210) loadTtAliases() (meta.TtAliasesMeta210, error) {
 	ttAliases := make(meta.TtAliasesMeta210)
 	prefix := path.Join(rootcoord.SnapshotPrefix, rootcoord.CollectionAliasMetaPrefix210)
-	keys, values, err := b.txn.LoadWithPrefix(prefix)
+	keys, values, err := b.txn.LoadWithPrefix(context.TODO(), prefix)
 	if err != nil {
 		return nil, err
 	}
@@ -56,7 +54,7 @@ func (b etcd210) loadTtAliases() (meta.TtAliasesMeta210, error) {
 		tsKey := keys[i]
 		tsValue := values[i]
 		valueIsTombstone := rootcoord.IsTombstone(tsValue)
-		var aliasInfo = &pb.CollectionInfo{} // alias stored in collection info.
+		aliasInfo := &pb.CollectionInfo{} // alias stored in collection info.
 		if valueIsTombstone {
 			aliasInfo = nil
 		} else {
@@ -76,7 +74,7 @@ func (b etcd210) loadTtAliases() (meta.TtAliasesMeta210, error) {
 func (b etcd210) loadAliases() (meta.AliasesMeta210, error) {
 	aliases := make(meta.AliasesMeta210)
 	prefix := rootcoord.CollectionAliasMetaPrefix210
-	keys, values, err := b.txn.LoadWithPrefix(prefix)
+	keys, values, err := b.txn.LoadWithPrefix(context.TODO(), prefix)
 	if err != nil {
 		return nil, err
 	}
@@ -88,7 +86,7 @@ func (b etcd210) loadAliases() (meta.AliasesMeta210, error) {
 		key := keys[i]
 		value := values[i]
 		valueIsTombstone := rootcoord.IsTombstone(value)
-		var aliasInfo = &pb.CollectionInfo{} // alias stored in collection info.
+		aliasInfo := &pb.CollectionInfo{} // alias stored in collection info.
 		if valueIsTombstone {
 			aliasInfo = nil
 		} else {
@@ -104,7 +102,7 @@ func (b etcd210) loadAliases() (meta.AliasesMeta210, error) {
 func (b etcd210) loadTtCollections() (meta.TtCollectionsMeta210, error) {
 	ttCollections := make(meta.TtCollectionsMeta210)
 	prefix := path.Join(rootcoord.SnapshotPrefix, rootcoord.CollectionMetaPrefix)
-	keys, values, err := b.txn.LoadWithPrefix(prefix)
+	keys, values, err := b.txn.LoadWithPrefix(context.TODO(), prefix)
 	if err != nil {
 		return nil, err
 	}
@@ -122,7 +120,7 @@ func (b etcd210) loadTtCollections() (meta.TtCollectionsMeta210, error) {
 		}
 
 		valueIsTombstone := rootcoord.IsTombstone(tsValue)
-		var coll = &pb.CollectionInfo{}
+		coll := &pb.CollectionInfo{}
 		if valueIsTombstone {
 			coll = nil
 		} else {
@@ -146,7 +144,7 @@ func (b etcd210) loadTtCollections() (meta.TtCollectionsMeta210, error) {
 func (b etcd210) loadCollections() (meta.CollectionsMeta210, error) {
 	collections := make(meta.CollectionsMeta210)
 	prefix := rootcoord.CollectionMetaPrefix
-	keys, values, err := b.txn.LoadWithPrefix(prefix)
+	keys, values, err := b.txn.LoadWithPrefix(context.TODO(), prefix)
 	if err != nil {
 		return nil, err
 	}
@@ -164,7 +162,7 @@ func (b etcd210) loadCollections() (meta.CollectionsMeta210, error) {
 		}
 
 		valueIsTombstone := rootcoord.IsTombstone(value)
-		var coll = &pb.CollectionInfo{}
+		coll := &pb.CollectionInfo{}
 		if valueIsTombstone {
 			coll = nil
 		} else {
@@ -201,7 +199,7 @@ func parseCollectionIndexKey(key string) (collectionID, indexID typeutil.UniqueI
 func (b etcd210) loadCollectionIndexes() (meta.CollectionIndexesMeta210, error) {
 	collectionIndexes := make(meta.CollectionIndexesMeta210)
 	prefix := legacy.IndexMetaBefore220Prefix
-	keys, values, err := b.txn.LoadWithPrefix(prefix)
+	keys, values, err := b.txn.LoadWithPrefix(context.TODO(), prefix)
 	if err != nil {
 		return nil, err
 	}
@@ -213,7 +211,7 @@ func (b etcd210) loadCollectionIndexes() (meta.CollectionIndexesMeta210, error) 
 		key := keys[i]
 		value := values[i]
 
-		var index = &pb.IndexInfo{}
+		index := &pb.IndexInfo{}
 		if err := proto.Unmarshal([]byte(value), index); err != nil {
 			return nil, err
 		}
@@ -229,7 +227,7 @@ func (b etcd210) loadCollectionIndexes() (meta.CollectionIndexesMeta210, error) 
 func (b etcd210) loadSegmentIndexes() (meta.SegmentIndexesMeta210, error) {
 	segmentIndexes := make(meta.SegmentIndexesMeta210)
 	prefix := legacy.SegmentIndexPrefixBefore220
-	keys, values, err := b.txn.LoadWithPrefix(prefix)
+	keys, values, err := b.txn.LoadWithPrefix(context.TODO(), prefix)
 	if err != nil {
 		return nil, err
 	}
@@ -240,7 +238,7 @@ func (b etcd210) loadSegmentIndexes() (meta.SegmentIndexesMeta210, error) {
 	for i := 0; i < l; i++ {
 		value := values[i]
 
-		var index = &pb.SegmentIndexInfo{}
+		index := &pb.SegmentIndexInfo{}
 		if err := proto.Unmarshal([]byte(value), index); err != nil {
 			return nil, err
 		}
@@ -252,7 +250,7 @@ func (b etcd210) loadSegmentIndexes() (meta.SegmentIndexesMeta210, error) {
 func (b etcd210) loadIndexBuildMeta() (meta.IndexBuildMeta210, error) {
 	indexBuildMeta := make(meta.IndexBuildMeta210)
 	prefix := legacy.IndexBuildPrefixBefore220
-	keys, values, err := b.txn.LoadWithPrefix(prefix)
+	keys, values, err := b.txn.LoadWithPrefix(context.TODO(), prefix)
 	if err != nil {
 		return nil, err
 	}
@@ -263,7 +261,7 @@ func (b etcd210) loadIndexBuildMeta() (meta.IndexBuildMeta210, error) {
 	for i := 0; i < l; i++ {
 		value := values[i]
 
-		var record = &legacypb.IndexMeta{}
+		record := &legacypb.IndexMeta{}
 		if err := proto.Unmarshal([]byte(value), record); err != nil {
 			return nil, err
 		}
@@ -281,7 +279,7 @@ func (b etcd210) loadLastDDLRecords() (meta.LastDDLRecords, error) {
 		path.Join(rootcoord.SnapshotPrefix, legacy.DDMsgSendPrefixBefore220),
 	}
 	for _, prefix := range prefixes {
-		keys, values, err := b.txn.LoadWithPrefix(prefix)
+		keys, values, err := b.txn.LoadWithPrefix(context.TODO(), prefix)
 		if err != nil {
 			return nil, err
 		}
@@ -297,7 +295,7 @@ func (b etcd210) loadLastDDLRecords() (meta.LastDDLRecords, error) {
 
 func (b etcd210) loadLoadInfos() (meta.CollectionLoadInfo210, error) {
 	loadInfo := make(meta.CollectionLoadInfo210)
-	_, collectionValues, err := b.txn.LoadWithPrefix(legacy.CollectionLoadMetaPrefixV1)
+	_, collectionValues, err := b.txn.LoadWithPrefix(context.TODO(), legacy.CollectionLoadMetaPrefixV1)
 	if err != nil {
 		return nil, err
 	}
@@ -422,7 +420,7 @@ func (b etcd210) Backup(meta *meta.Meta, backupFile string) error {
 		instance = metaRootPath
 	}
 	header := &BackupHeader{
-		Version:   BackupHeaderVersionV1,
+		Version:   int32(BackupHeaderVersionV1),
 		Instance:  instance,
 		MetaPath:  metaPath,
 		Entries:   int64(len(saves)),
@@ -434,7 +432,7 @@ func (b etcd210) Backup(meta *meta.Meta, backupFile string) error {
 		return err
 	}
 	console.Warning(fmt.Sprintf("backup to: %s", backupFile))
-	return ioutil.WriteFile(backupFile, backup, 0600)
+	return storage.WriteFile(backupFile, backup, 0o600)
 }
 
 func (b etcd210) BackupV2(file string) error {
@@ -474,7 +472,7 @@ func (b etcd210) BackupV2(file string) error {
 	}
 
 	header := &BackupHeader{
-		Version:   BackupHeaderVersionV1,
+		Version:   int32(BackupHeaderVersionV1),
 		Instance:  instance,
 		MetaPath:  metaPath,
 		Entries:   int64(len(saves)),
@@ -489,11 +487,11 @@ func (b etcd210) BackupV2(file string) error {
 	}
 
 	console.Warning(fmt.Sprintf("backup to: %s", file))
-	return ioutil.WriteFile(file, backup, 0600)
+	return storage.WriteFile(file, backup, 0o600)
 }
 
 func (b etcd210) Restore(backupFile string) error {
-	backup, err := ioutil.ReadFile(backupFile)
+	backup, err := storage.ReadFile(backupFile)
 	if err != nil {
 		return err
 	}

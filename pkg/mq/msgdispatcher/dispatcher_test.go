@@ -17,20 +17,27 @@
 package msgdispatcher
 
 import (
+	"fmt"
+	"math/rand"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"golang.org/x/net/context"
 
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
+	"github.com/milvus-io/milvus/pkg/mq/common"
 	"github.com/milvus-io/milvus/pkg/mq/msgstream"
-	"github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper"
 )
 
 func TestDispatcher(t *testing.T) {
+	ctx := context.Background()
 	t.Run("test base", func(t *testing.T) {
-		d, err := NewDispatcher(newMockFactory(), true, "mock_pchannel_0", nil,
-			"mock_subName_0", mqwrapper.SubscriptionPositionEarliest, nil, nil)
+		d, err := NewDispatcher(ctx, newMockFactory(), true, "mock_pchannel_0", nil, "mock_subName_0", common.SubscriptionPositionEarliest, nil, nil, false)
 		assert.NoError(t, err)
 		assert.NotPanics(t, func() {
 			d.Handle(start)
@@ -49,21 +56,34 @@ func TestDispatcher(t *testing.T) {
 		assert.Equal(t, pos.Timestamp, curTs)
 	})
 
+	t.Run("test AsConsumer fail", func(t *testing.T) {
+		ms := msgstream.NewMockMsgStream(t)
+		ms.EXPECT().AsConsumer(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(errors.New("mock error"))
+		ms.EXPECT().Close().Return()
+		factory := &msgstream.MockMqFactory{
+			NewMsgStreamFunc: func(ctx context.Context) (msgstream.MsgStream, error) {
+				return ms, nil
+			},
+		}
+		d, err := NewDispatcher(ctx, factory, true, "mock_pchannel_0", nil, "mock_subName_0", common.SubscriptionPositionEarliest, nil, nil, false)
+
+		assert.Error(t, err)
+		assert.Nil(t, d)
+	})
+
 	t.Run("test target", func(t *testing.T) {
-		d, err := NewDispatcher(newMockFactory(), true, "mock_pchannel_0", nil,
-			"mock_subName_0", mqwrapper.SubscriptionPositionEarliest, nil, nil)
+		d, err := NewDispatcher(ctx, newMockFactory(), true, "mock_pchannel_0", nil, "mock_subName_0", common.SubscriptionPositionEarliest, nil, nil, false)
 		assert.NoError(t, err)
 		output := make(chan *msgstream.MsgPack, 1024)
-		d.AddTarget(&target{
-			vchannel: "mock_vchannel_0",
-			pos:      nil,
-			ch:       output,
-		})
-		d.AddTarget(&target{
-			vchannel: "mock_vchannel_1",
-			pos:      nil,
-			ch:       nil,
-		})
+
+		getTarget := func(vchannel string, pos *Pos, ch chan *msgstream.MsgPack) *target {
+			target := newTarget(vchannel, pos, nil)
+			target.ch = ch
+			return target
+		}
+
+		d.AddTarget(getTarget("mock_vchannel_0", nil, output))
+		d.AddTarget(getTarget("mock_vchannel_1", nil, nil))
 		num := d.TargetNum()
 		assert.Equal(t, 2, num)
 
@@ -87,11 +107,8 @@ func TestDispatcher(t *testing.T) {
 	t.Run("test concurrent send and close", func(t *testing.T) {
 		for i := 0; i < 100; i++ {
 			output := make(chan *msgstream.MsgPack, 1024)
-			target := &target{
-				vchannel: "mock_vchannel_0",
-				pos:      nil,
-				ch:       output,
-			}
+			target := newTarget("mock_vchannel_0", nil, nil)
+			target.ch = output
 			assert.Equal(t, cap(output), cap(target.ch))
 			wg := &sync.WaitGroup{}
 			for j := 0; j < 100; j++ {
@@ -113,8 +130,7 @@ func TestDispatcher(t *testing.T) {
 }
 
 func BenchmarkDispatcher_handle(b *testing.B) {
-	d, err := NewDispatcher(newMockFactory(), true, "mock_pchannel_0", nil,
-		"mock_subName_0", mqwrapper.SubscriptionPositionEarliest, nil, nil)
+	d, err := NewDispatcher(context.Background(), newMockFactory(), true, "mock_pchannel_0", nil, "mock_subName_0", common.SubscriptionPositionEarliest, nil, nil, false)
 	assert.NoError(b, err)
 
 	for i := 0; i < b.N; i++ {
@@ -125,4 +141,196 @@ func BenchmarkDispatcher_handle(b *testing.B) {
 	}
 	// BenchmarkDispatcher_handle-12    	    9568	    122123 ns/op
 	// PASS
+}
+
+func TestGroupMessage(t *testing.T) {
+	d, err := NewDispatcher(context.Background(), newMockFactory(), true, "mock_pchannel_0", nil, "mock_subName_0"+fmt.Sprintf("%d", rand.Int()), common.SubscriptionPositionEarliest, nil, nil, false)
+	assert.NoError(t, err)
+	d.AddTarget(newTarget("mock_pchannel_0_1v0", nil, nil))
+	d.AddTarget(newTarget("mock_pchannel_0_2v0", nil, msgstream.GetReplicateConfig("local-test", "foo", "coo")))
+	{
+		// no replicate msg
+		packs := d.groupingMsgs(&MsgPack{
+			BeginTs: 1,
+			EndTs:   10,
+			StartPositions: []*msgstream.MsgPosition{
+				{
+					ChannelName: "mock_pchannel_0",
+					MsgID:       []byte("1"),
+					Timestamp:   1,
+				},
+			},
+			EndPositions: []*msgstream.MsgPosition{
+				{
+					ChannelName: "mock_pchannel_0",
+					MsgID:       []byte("10"),
+					Timestamp:   10,
+				},
+			},
+			Msgs: []msgstream.TsMsg{
+				&msgstream.InsertMsg{
+					BaseMsg: msgstream.BaseMsg{
+						BeginTimestamp: 5,
+						EndTimestamp:   5,
+					},
+					InsertRequest: &msgpb.InsertRequest{
+						Base: &commonpb.MsgBase{
+							MsgType:   commonpb.MsgType_Insert,
+							Timestamp: 5,
+						},
+						ShardName: "mock_pchannel_0_1v0",
+					},
+				},
+			},
+		})
+		assert.Len(t, packs, 1)
+	}
+
+	{
+		// equal to replicateID
+		packs := d.groupingMsgs(&MsgPack{
+			BeginTs: 1,
+			EndTs:   10,
+			StartPositions: []*msgstream.MsgPosition{
+				{
+					ChannelName: "mock_pchannel_0",
+					MsgID:       []byte("1"),
+					Timestamp:   1,
+				},
+			},
+			EndPositions: []*msgstream.MsgPosition{
+				{
+					ChannelName: "mock_pchannel_0",
+					MsgID:       []byte("10"),
+					Timestamp:   10,
+				},
+			},
+			Msgs: []msgstream.TsMsg{
+				&msgstream.ReplicateMsg{
+					BaseMsg: msgstream.BaseMsg{
+						BeginTimestamp: 100,
+						EndTimestamp:   100,
+					},
+					ReplicateMsg: &msgpb.ReplicateMsg{
+						Base: &commonpb.MsgBase{
+							MsgType:   commonpb.MsgType_Replicate,
+							Timestamp: 100,
+							ReplicateInfo: &commonpb.ReplicateInfo{
+								ReplicateID: "local-test",
+							},
+						},
+					},
+				},
+			},
+		})
+		assert.Len(t, packs, 2)
+		{
+			replicatePack := packs["mock_pchannel_0_2v0"]
+			assert.EqualValues(t, 100, replicatePack.BeginTs)
+			assert.EqualValues(t, 100, replicatePack.EndTs)
+			assert.EqualValues(t, 100, replicatePack.StartPositions[0].Timestamp)
+			assert.EqualValues(t, 100, replicatePack.EndPositions[0].Timestamp)
+			assert.Len(t, replicatePack.Msgs, 0)
+		}
+		{
+			replicatePack := packs["mock_pchannel_0_1v0"]
+			assert.EqualValues(t, 1, replicatePack.BeginTs)
+			assert.EqualValues(t, 10, replicatePack.EndTs)
+			assert.EqualValues(t, 1, replicatePack.StartPositions[0].Timestamp)
+			assert.EqualValues(t, 10, replicatePack.EndPositions[0].Timestamp)
+			assert.Len(t, replicatePack.Msgs, 0)
+		}
+	}
+
+	{
+		// not equal to replicateID
+		packs := d.groupingMsgs(&MsgPack{
+			BeginTs: 1,
+			EndTs:   10,
+			StartPositions: []*msgstream.MsgPosition{
+				{
+					ChannelName: "mock_pchannel_0",
+					MsgID:       []byte("1"),
+					Timestamp:   1,
+				},
+			},
+			EndPositions: []*msgstream.MsgPosition{
+				{
+					ChannelName: "mock_pchannel_0",
+					MsgID:       []byte("10"),
+					Timestamp:   10,
+				},
+			},
+			Msgs: []msgstream.TsMsg{
+				&msgstream.ReplicateMsg{
+					BaseMsg: msgstream.BaseMsg{
+						BeginTimestamp: 100,
+						EndTimestamp:   100,
+					},
+					ReplicateMsg: &msgpb.ReplicateMsg{
+						Base: &commonpb.MsgBase{
+							MsgType:   commonpb.MsgType_Replicate,
+							Timestamp: 100,
+							ReplicateInfo: &commonpb.ReplicateInfo{
+								ReplicateID: "local-test-1", // not equal to replicateID
+							},
+						},
+					},
+				},
+			},
+		})
+		assert.Len(t, packs, 1)
+		replicatePack := packs["mock_pchannel_0_2v0"]
+		assert.Nil(t, replicatePack)
+	}
+
+	{
+		// replicate end
+		replicateTarget := d.targets["mock_pchannel_0_2v0"]
+		assert.NotNil(t, replicateTarget.replicateConfig)
+		packs := d.groupingMsgs(&MsgPack{
+			BeginTs: 1,
+			EndTs:   10,
+			StartPositions: []*msgstream.MsgPosition{
+				{
+					ChannelName: "mock_pchannel_0",
+					MsgID:       []byte("1"),
+					Timestamp:   1,
+				},
+			},
+			EndPositions: []*msgstream.MsgPosition{
+				{
+					ChannelName: "mock_pchannel_0",
+					MsgID:       []byte("10"),
+					Timestamp:   10,
+				},
+			},
+			Msgs: []msgstream.TsMsg{
+				&msgstream.ReplicateMsg{
+					BaseMsg: msgstream.BaseMsg{
+						BeginTimestamp: 100,
+						EndTimestamp:   100,
+					},
+					ReplicateMsg: &msgpb.ReplicateMsg{
+						Base: &commonpb.MsgBase{
+							MsgType:   commonpb.MsgType_Replicate,
+							Timestamp: 100,
+							ReplicateInfo: &commonpb.ReplicateInfo{
+								ReplicateID: "local-test",
+							},
+						},
+						IsEnd:    true,
+						Database: "foo",
+					},
+				},
+			},
+		})
+		assert.Len(t, packs, 2)
+		replicatePack := packs["mock_pchannel_0_2v0"]
+		assert.EqualValues(t, 100, replicatePack.BeginTs)
+		assert.EqualValues(t, 100, replicatePack.EndTs)
+		assert.EqualValues(t, 100, replicatePack.StartPositions[0].Timestamp)
+		assert.EqualValues(t, 100, replicatePack.EndPositions[0].Timestamp)
+		assert.Nil(t, replicateTarget.replicateConfig)
+	}
 }

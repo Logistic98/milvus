@@ -17,9 +17,30 @@
 package metrics
 
 import (
+	"fmt"
+
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
+)
+
+const (
+	SegmentGrowTaskLabel   = "segment_grow"
+	SegmentReduceTaskLabel = "segment_reduce"
+	SegmentMoveTaskLabel   = "segment_move"
+	SegmentUpdateTaskLabel = "segment_update"
+
+	ChannelGrowTaskLabel   = "channel_grow"
+	ChannelReduceTaskLabel = "channel_reduce"
+	ChannelMoveTaskLabel   = "channel_move"
+
+	LeaderGrowTaskLabel   = "leader_grow"
+	LeaderReduceTaskLabel = "leader_reduce"
+	LeaderUpdateTaskLabel = "leader_update"
+
+	UnknownTaskLabel = "unknown"
+
+	QueryCoordTaskType = "querycoord_task_type"
 )
 
 var (
@@ -83,7 +104,7 @@ var (
 			Subsystem: typeutil.QueryCoordRole,
 			Name:      "task_num",
 			Help:      "the number of tasks in QueryCoord's scheduler",
-		}, []string{})
+		}, []string{QueryCoordTaskType})
 
 	QueryCoordNumQueryNodes = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -92,6 +113,50 @@ var (
 			Name:      "querynode_num",
 			Help:      "number of QueryNodes managered by QueryCoord",
 		}, []string{})
+
+	QueryCoordCurrentTargetCheckpointUnixSeconds = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryCoordRole,
+			Name:      "current_target_checkpoint_unix_seconds",
+			Help:      "current target checkpoint timestamp in unix seconds",
+		}, []string{
+			nodeIDLabelName,
+			channelNameLabelName,
+		})
+
+	QueryCoordTaskLatency = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryCoordRole,
+			Name:      "task_latency",
+			Help:      "latency of all kind of task in query coord scheduler scheduler",
+			Buckets:   longTaskBuckets,
+		}, []string{collectionIDLabelName, taskTypeLabel, channelNameLabelName})
+
+	QueryCoordResourceGroupInfo = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryCoordRole,
+			Name:      "resource_group_info",
+			Help:      "all resource group detail info in query coord",
+		}, []string{ResourceGroupLabelName, NodeIDLabelName})
+
+	QueryCoordResourceGroupReplicaTotal = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryCoordRole,
+			Name:      "resource_group_replica_total",
+			Help:      "total replica number of resource group",
+		}, []string{ResourceGroupLabelName})
+
+	QueryCoordReplicaRONodeTotal = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryCoordRole,
+			Name:      "replica_ro_node_total",
+			Help:      "total read only node number of replica",
+		})
 )
 
 // RegisterQueryCoord registers QueryCoord metrics
@@ -104,4 +169,15 @@ func RegisterQueryCoord(registry *prometheus.Registry) {
 	registry.MustRegister(QueryCoordReleaseLatency)
 	registry.MustRegister(QueryCoordTaskNum)
 	registry.MustRegister(QueryCoordNumQueryNodes)
+	registry.MustRegister(QueryCoordCurrentTargetCheckpointUnixSeconds)
+	registry.MustRegister(QueryCoordTaskLatency)
+	registry.MustRegister(QueryCoordResourceGroupInfo)
+	registry.MustRegister(QueryCoordResourceGroupReplicaTotal)
+	registry.MustRegister(QueryCoordReplicaRONodeTotal)
+}
+
+func CleanQueryCoordMetricsWithCollectionID(collectionID int64) {
+	QueryCoordTaskLatency.DeletePartialMatch(prometheus.Labels{
+		collectionIDLabelName: fmt.Sprint(collectionID),
+	})
 }

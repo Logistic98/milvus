@@ -17,15 +17,17 @@
 package pipeline
 
 import (
+	context2 "context"
 	"fmt"
 	"testing"
 
-	"github.com/milvus-io/milvus-proto/go-api/msgpb"
-	"github.com/milvus-io/milvus/pkg/mq/msgdispatcher"
-	"github.com/milvus-io/milvus/pkg/mq/msgstream"
-	"github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
+	"github.com/milvus-io/milvus/pkg/mq/msgdispatcher"
+	"github.com/milvus-io/milvus/pkg/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
 type StreamPipelineSuite struct {
@@ -33,21 +35,22 @@ type StreamPipelineSuite struct {
 	pipeline   StreamPipeline
 	inChannel  chan *msgstream.MsgPack
 	outChannel chan msgstream.Timestamp
-	//data
+	// data
 	length  int
 	channel string
-	//mock
+	// mock
 	msgDispatcher *msgdispatcher.MockClient
 }
 
 func (suite *StreamPipelineSuite) SetupTest() {
+	paramtable.Init()
 	suite.channel = "test-channel"
 	suite.inChannel = make(chan *msgstream.MsgPack, 1)
 	suite.outChannel = make(chan msgstream.Timestamp)
 	suite.msgDispatcher = msgdispatcher.NewMockClient(suite.T())
-	suite.msgDispatcher.EXPECT().Register(suite.channel, mock.Anything, mqwrapper.SubscriptionPositionUnknown).Return(suite.inChannel, nil)
+	suite.msgDispatcher.EXPECT().Register(mock.Anything, mock.Anything).Return(suite.inChannel, nil)
 	suite.msgDispatcher.EXPECT().Deregister(suite.channel)
-	suite.pipeline = NewPipelineWithStream(suite.msgDispatcher, 0, false, suite.channel)
+	suite.pipeline = NewPipelineWithStream(suite.msgDispatcher, 0, false, suite.channel, nil)
 	suite.length = 4
 }
 
@@ -62,16 +65,16 @@ func (suite *StreamPipelineSuite) TestBasic() {
 		})
 	}
 
-	err := suite.pipeline.ConsumeMsgStream(&msgpb.MsgPosition{})
+	err := suite.pipeline.ConsumeMsgStream(context2.Background(), &msgpb.MsgPosition{})
 	suite.NoError(err)
 
 	suite.pipeline.Start()
 	defer suite.pipeline.Close()
-	suite.inChannel <- &msgstream.MsgPack{}
+	suite.inChannel <- &msgstream.MsgPack{BeginTs: 1001}
 
 	for i := 1; i <= suite.length; i++ {
 		output := <-suite.outChannel
-		suite.Equal(msgstream.Timestamp(i), output)
+		suite.Equal(int64(1001), int64(output))
 	}
 }
 

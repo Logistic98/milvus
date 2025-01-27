@@ -19,17 +19,23 @@ package msgstream
 import (
 	"context"
 	"strings"
+	"time"
 
 	"github.com/apache/pulsar-client-go/pulsar"
 	"github.com/cockroachdb/errors"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/streamnative/pulsarctl/pkg/cli"
 	"github.com/streamnative/pulsarctl/pkg/pulsar/utils"
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper"
+	"github.com/milvus-io/milvus/pkg/metrics"
+	"github.com/milvus-io/milvus/pkg/mq/common"
+	"github.com/milvus-io/milvus/pkg/mq/mqimpl/rocksmq/server"
 	kafkawrapper "github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper/kafka"
+	"github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper/nmq"
 	pulsarmqwrapper "github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper/pulsar"
+	"github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper/rmq"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/util/retry"
 )
@@ -41,65 +47,94 @@ type PmsFactory struct {
 	PulsarAddress    string
 	PulsarWebAddress string
 	ReceiveBufSize   int64
-	PulsarBufSize    int64
+	MQBufSize        int64
 	PulsarAuthPlugin string
 	PulsarAuthParams string
 	PulsarTenant     string
 	PulsarNameSpace  string
+	RequestTimeout   time.Duration
+	metricRegisterer prometheus.Registerer
 }
 
-func NewPmsFactory(config *paramtable.PulsarConfig) *PmsFactory {
-	return &PmsFactory{
-		PulsarBufSize:    1024,
-		ReceiveBufSize:   1024,
+func NewPmsFactory(serviceParam *paramtable.ServiceParam) *PmsFactory {
+	config := &serviceParam.PulsarCfg
+	f := &PmsFactory{
+		MQBufSize:        serviceParam.MQCfg.MQBufSize.GetAsInt64(),
+		ReceiveBufSize:   serviceParam.MQCfg.ReceiveBufSize.GetAsInt64(),
 		PulsarAddress:    config.Address.GetValue(),
 		PulsarWebAddress: config.WebAddress.GetValue(),
 		PulsarAuthPlugin: config.AuthPlugin.GetValue(),
 		PulsarAuthParams: config.AuthParams.GetValue(),
 		PulsarTenant:     config.Tenant.GetValue(),
 		PulsarNameSpace:  config.Namespace.GetValue(),
+		RequestTimeout:   config.RequestTimeout.GetAsDuration(time.Second),
 	}
+	if config.EnableClientMetrics.GetAsBool() {
+		// Enable client metrics if config.EnableClientMetrics is true, use pkg-defined registerer.
+		f.metricRegisterer = metrics.GetRegisterer()
+	}
+	return f
 }
 
 // NewMsgStream is used to generate a new Msgstream object
 func (f *PmsFactory) NewMsgStream(ctx context.Context) (MsgStream, error) {
+	var timeout time.Duration = f.RequestTimeout
+
+	if deadline, ok := ctx.Deadline(); ok {
+		if deadline.Before(time.Now()) {
+			return nil, errors.New("context timeout when NewMsgStream")
+		}
+		timeout = time.Until(deadline)
+	}
+
 	auth, err := f.getAuthentication()
 	if err != nil {
 		return nil, err
 	}
 	clientOpts := pulsar.ClientOptions{
-		URL:            f.PulsarAddress,
-		Authentication: auth,
+		URL:               f.PulsarAddress,
+		Authentication:    auth,
+		OperationTimeout:  timeout,
+		MetricsRegisterer: f.metricRegisterer,
 	}
 
 	pulsarClient, err := pulsarmqwrapper.NewClient(f.PulsarTenant, f.PulsarNameSpace, clientOpts)
 	if err != nil {
 		return nil, err
 	}
-	return NewMqMsgStream(ctx, f.ReceiveBufSize, f.PulsarBufSize, pulsarClient, f.dispatcherFactory.NewUnmarshalDispatcher())
+	return NewMqMsgStream(context.Background(), f.ReceiveBufSize, f.MQBufSize, pulsarClient, f.dispatcherFactory.NewUnmarshalDispatcher())
 }
 
 // NewTtMsgStream is used to generate a new TtMsgstream object
 func (f *PmsFactory) NewTtMsgStream(ctx context.Context) (MsgStream, error) {
+	var timeout time.Duration = f.RequestTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		if deadline.Before(time.Now()) {
+			return nil, errors.New("context timeout when NewTtMsgStream")
+		}
+		timeout = time.Until(deadline)
+	}
 	auth, err := f.getAuthentication()
 	if err != nil {
 		return nil, err
 	}
 	clientOpts := pulsar.ClientOptions{
-		URL:            f.PulsarAddress,
-		Authentication: auth,
+		URL:               f.PulsarAddress,
+		Authentication:    auth,
+		OperationTimeout:  timeout,
+		MetricsRegisterer: f.metricRegisterer,
 	}
 
 	pulsarClient, err := pulsarmqwrapper.NewClient(f.PulsarTenant, f.PulsarNameSpace, clientOpts)
 	if err != nil {
 		return nil, err
 	}
-	return NewMqTtMsgStream(ctx, f.ReceiveBufSize, f.PulsarBufSize, pulsarClient, f.dispatcherFactory.NewUnmarshalDispatcher())
+
+	return NewMqTtMsgStream(context.Background(), f.ReceiveBufSize, f.MQBufSize, pulsarClient, f.dispatcherFactory.NewUnmarshalDispatcher())
 }
 
 func (f *PmsFactory) getAuthentication() (pulsar.Authentication, error) {
 	auth, err := pulsar.NewAuthentication(f.PulsarAuthPlugin, f.PulsarAuthParams)
-
 	if err != nil {
 		log.Error("build authencation from config failed, please check it!",
 			zap.String("authPlugin", f.PulsarAuthPlugin),
@@ -107,11 +142,6 @@ func (f *PmsFactory) getAuthentication() (pulsar.Authentication, error) {
 		return nil, errors.New("build authencation from config failed")
 	}
 	return auth, nil
-}
-
-// NewQueryMsgStream is used to generate a new QueryMsgstream object
-func (f *PmsFactory) NewQueryMsgStream(ctx context.Context) (MsgStream, error) {
-	return f.NewMsgStream(ctx)
 }
 
 func (f *PmsFactory) NewMsgStreamDisposer(ctx context.Context) func([]string, string) error {
@@ -141,7 +171,7 @@ func (f *PmsFactory) NewMsgStreamDisposer(ctx context.Context) func([]string, st
 					}
 				}
 				log.Warn("failed to clean up subscriptions", zap.String("pulsar web", f.PulsarWebAddress),
-					zap.String("topic", channel), zap.Any("subname", subname), zap.Error(err))
+					zap.String("topic", channel), zap.String("subname", subname), zap.Error(err))
 			}
 		}
 		return nil
@@ -152,20 +182,23 @@ type KmsFactory struct {
 	dispatcherFactory ProtoUDFactory
 	config            *paramtable.KafkaConfig
 	ReceiveBufSize    int64
+	MQBufSize         int64
 }
 
 func (f *KmsFactory) NewMsgStream(ctx context.Context) (MsgStream, error) {
-	kafkaClient := kafkawrapper.NewKafkaClientInstanceWithConfig(f.config)
-	return NewMqMsgStream(ctx, f.ReceiveBufSize, -1, kafkaClient, f.dispatcherFactory.NewUnmarshalDispatcher())
+	kafkaClient, err := kafkawrapper.NewKafkaClientInstanceWithConfig(ctx, f.config)
+	if err != nil {
+		return nil, err
+	}
+	return NewMqMsgStream(context.Background(), f.ReceiveBufSize, f.MQBufSize, kafkaClient, f.dispatcherFactory.NewUnmarshalDispatcher())
 }
 
 func (f *KmsFactory) NewTtMsgStream(ctx context.Context) (MsgStream, error) {
-	kafkaClient := kafkawrapper.NewKafkaClientInstanceWithConfig(f.config)
-	return NewMqTtMsgStream(ctx, f.ReceiveBufSize, -1, kafkaClient, f.dispatcherFactory.NewUnmarshalDispatcher())
-}
-
-func (f *KmsFactory) NewQueryMsgStream(ctx context.Context) (MsgStream, error) {
-	return f.NewMsgStream(ctx)
+	kafkaClient, err := kafkawrapper.NewKafkaClientInstanceWithConfig(ctx, f.config)
+	if err != nil {
+		return nil, err
+	}
+	return NewMqTtMsgStream(context.Background(), f.ReceiveBufSize, f.MQBufSize, kafkaClient, f.dispatcherFactory.NewUnmarshalDispatcher())
 }
 
 func (f *KmsFactory) NewMsgStreamDisposer(ctx context.Context) func([]string, string) error {
@@ -174,17 +207,46 @@ func (f *KmsFactory) NewMsgStreamDisposer(ctx context.Context) func([]string, st
 		if err != nil {
 			return err
 		}
-		msgstream.AsConsumer(channels, subname, mqwrapper.SubscriptionPositionUnknown)
+		msgstream.AsConsumer(ctx, channels, subname, common.SubscriptionPositionUnknown)
 		msgstream.Close()
 		return nil
 	}
 }
 
-func NewKmsFactory(config *paramtable.KafkaConfig) Factory {
+func NewKmsFactory(config *paramtable.ServiceParam) Factory {
 	f := &KmsFactory{
 		dispatcherFactory: ProtoUDFactory{},
-		ReceiveBufSize:    1024,
-		config:            config,
+		ReceiveBufSize:    config.MQCfg.ReceiveBufSize.GetAsInt64(),
+		MQBufSize:         config.MQCfg.MQBufSize.GetAsInt64(),
+		config:            &config.KafkaCfg,
 	}
 	return f
+}
+
+// NewNatsmqFactory create a new nats-mq factory.
+func NewNatsmqFactory() Factory {
+	paramtable.Init()
+	paramtable := paramtable.Get()
+	nmq.MustInitNatsMQ(nmq.ParseServerOption(paramtable))
+	return &CommonFactory{
+		Newer:             nmq.NewClientWithDefaultOptions,
+		DispatcherFactory: ProtoUDFactory{},
+		ReceiveBufSize:    paramtable.MQCfg.ReceiveBufSize.GetAsInt64(),
+		MQBufSize:         paramtable.MQCfg.MQBufSize.GetAsInt64(),
+	}
+}
+
+// NewRocksmqFactory creates a new message stream factory based on rocksmq.
+func NewRocksmqFactory(path string, cfg *paramtable.ServiceParam) Factory {
+	if err := server.InitRocksMQ(path); err != nil {
+		log.Fatal("fail to init rocksmq", zap.Error(err))
+	}
+	log.Info("init rocksmq msgstream success", zap.String("path", path))
+
+	return &CommonFactory{
+		Newer:             rmq.NewClientWithDefaultOptions,
+		DispatcherFactory: ProtoUDFactory{},
+		ReceiveBufSize:    cfg.MQCfg.ReceiveBufSize.GetAsInt64(),
+		MQBufSize:         cfg.MQCfg.MQBufSize.GetAsInt64(),
+	}
 }

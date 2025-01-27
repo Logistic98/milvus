@@ -11,7 +11,7 @@ import (
 func TestKeyLock(t *testing.T) {
 	keys := []string{"Milvus", "Blazing", "Fast"}
 
-	keyLock := NewKeyLock()
+	keyLock := NewKeyLock[string]()
 
 	keyLock.Lock(keys[0])
 	keyLock.Lock(keys[1])
@@ -46,7 +46,7 @@ func TestKeyLock(t *testing.T) {
 func TestKeyRLock(t *testing.T) {
 	keys := []string{"Milvus", "Blazing", "Fast"}
 
-	keyLock := NewKeyLock()
+	keyLock := NewKeyLock[string]()
 
 	keyLock.RLock(keys[0])
 	keyLock.RLock(keys[0])
@@ -66,4 +66,19 @@ func TestKeyRLock(t *testing.T) {
 
 	wg.Wait()
 	assert.Equal(t, keyLock.size(), 0)
+}
+
+func TestNewKeyLock(t *testing.T) {
+	keyLock := NewKeyLock[string]()
+	keyLock.Lock("a")
+	keyLock.Lock("b")
+
+	keyLock.Unlock("a")
+	keyLock.Unlock("b")
+
+	assert.Equal(t, 0, keyLock.size())
+	keyLock.keyLocksMutex.Lock()
+	keyLen := len(keyLock.refLocks)
+	keyLock.keyLocksMutex.Unlock()
+	assert.Equal(t, 0, keyLen)
 }

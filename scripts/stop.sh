@@ -20,6 +20,6 @@ if [ -z "$PROCESS" ]; then
   echo "No milvus process"
   exit 0
 fi
-kill -9 $PROCESS
+kill -15 $PROCESS
 echo "Milvus stopped"
 

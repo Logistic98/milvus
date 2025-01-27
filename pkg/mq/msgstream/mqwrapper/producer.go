@@ -16,34 +16,19 @@
 
 package mqwrapper
 
-import "context"
+import (
+	"context"
 
-// ProducerOptions contains the options of a producer
-type ProducerOptions struct {
-	// The topic that this Producer will publish
-	Topic string
-
-	// Enable compression
-	// For Pulsar, this enables ZSTD compression with default compression level
-	EnableCompression bool
-}
-
-// ProducerMessage contains the messages of a producer
-type ProducerMessage struct {
-	// Payload get the payload of the message
-	Payload []byte
-	// Properties are application defined key/value pairs that will be attached to the message.
-	// Return the properties attached to the message.
-	Properties map[string]string
-}
+	"github.com/milvus-io/milvus/pkg/mq/common"
+)
 
 // Producer is the interface that provides operations of producer
 type Producer interface {
 	// return the topic which producer is publishing to
-	//Topic() string
+	// Topic() string
 
 	// publish a message
-	Send(ctx context.Context, message *ProducerMessage) (MessageID, error)
+	Send(ctx context.Context, message *common.ProducerMessage) (common.MessageID, error)
 
 	Close()
 }

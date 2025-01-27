@@ -29,7 +29,11 @@ namespace milvus::index {
 
 class StringIndex : public ScalarIndex<std::string> {
  public:
-    const TargetBitmapPtr
+    StringIndex(const std::string& index_type)
+        : ScalarIndex<std::string>(index_type) {
+    }
+
+    const TargetBitmap
     Query(const DatasetPtr& dataset) override {
         auto op = dataset->Get<OpType>(OPERATOR_TYPE);
         if (op == OpType::PrefixMatch) {
@@ -39,7 +43,7 @@ class StringIndex : public ScalarIndex<std::string> {
         return ScalarIndex<std::string>::Query(dataset);
     }
 
-    virtual const TargetBitmapPtr
+    virtual const TargetBitmap
     PrefixMatch(const std::string_view prefix) = 0;
 };
 using StringIndexPtr = std::unique_ptr<StringIndex>;

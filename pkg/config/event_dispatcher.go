@@ -15,24 +15,44 @@
 // limitations under the License.
 package config
 
+import (
+	"strings"
+	"sync"
+)
+
 type EventDispatcher struct {
-	registry map[string][]EventHandler
+	mut       sync.RWMutex
+	registry  map[string][]EventHandler
+	keyPrefix []string
 }
 
 func NewEventDispatcher() *EventDispatcher {
 	return &EventDispatcher{
-		registry: make(map[string][]EventHandler),
+		registry:  make(map[string][]EventHandler),
+		keyPrefix: make([]string, 0),
 	}
 }
 
 func (ed *EventDispatcher) Get(key string) []EventHandler {
+	ed.mut.RLock()
+	defer ed.mut.RUnlock()
 	return ed.registry[formatKey(key)]
 }
 
 func (ed *EventDispatcher) Dispatch(event *Event) {
-	hs, ok := ed.registry[formatKey(event.Key)]
+	ed.mut.RLock()
+	defer ed.mut.RUnlock()
+	var hs []EventHandler
+	realKey := formatKey(event.Key)
+	hs, ok := ed.registry[realKey]
 	if !ok {
-		return
+		for _, v := range ed.keyPrefix {
+			if strings.HasPrefix(realKey, v) {
+				if _, exist := ed.registry[v]; exist {
+					hs = append(hs, ed.registry[v]...)
+				}
+			}
+		}
 	}
 	for _, h := range hs {
 		h.OnEvent(event)
@@ -41,6 +61,8 @@ func (ed *EventDispatcher) Dispatch(event *Event) {
 
 // register a handler to watch specific config changed
 func (ed *EventDispatcher) Register(key string, handler EventHandler) {
+	ed.mut.Lock()
+	defer ed.mut.Unlock()
 	key = formatKey(key)
 	v, ok := ed.registry[key]
 	if ok {
@@ -50,7 +72,23 @@ func (ed *EventDispatcher) Register(key string, handler EventHandler) {
 	}
 }
 
+// register a handler to watch specific config changed
+func (ed *EventDispatcher) RegisterForKeyPrefix(keyPrefix string, handler EventHandler) {
+	ed.mut.Lock()
+	defer ed.mut.Unlock()
+	keyPrefix = formatKey(keyPrefix)
+	v, ok := ed.registry[keyPrefix]
+	if ok {
+		ed.registry[keyPrefix] = append(v, handler)
+	} else {
+		ed.registry[keyPrefix] = []EventHandler{handler}
+	}
+	ed.keyPrefix = append(ed.keyPrefix, keyPrefix)
+}
+
 func (ed *EventDispatcher) Unregister(key string, handler EventHandler) {
+	ed.mut.Lock()
+	defer ed.mut.Unlock()
 	key = formatKey(key)
 	v, ok := ed.registry[key]
 	if !ok {
@@ -64,4 +102,11 @@ func (ed *EventDispatcher) Unregister(key string, handler EventHandler) {
 		newGroup = append(newGroup, eh)
 	}
 	ed.registry[key] = newGroup
+}
+
+func (ed *EventDispatcher) Clean() {
+	ed.mut.Lock()
+	defer ed.mut.Unlock()
+
+	ed.registry = make(map[string][]EventHandler)
 }

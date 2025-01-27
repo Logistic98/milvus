@@ -8,7 +8,7 @@ String cron_string = BRANCH_NAME == "master" ? "50 1 * * * " : ""
 // Make timeout 4 hours so that we can run two nightly during the ci
 int total_timeout_minutes = 7 * 60
 def imageTag=''
-def chart_version='4.0.6'
+def chart_version='4.1.27'
 pipeline {
     triggers {
         cron """${cron_timezone}
@@ -87,7 +87,7 @@ pipeline {
                     axes {
                         axis {
                             name 'MILVUS_SERVER_TYPE'
-                            values 'standalone', 'distributed-pulsar', 'distributed-kafka'
+                            values 'standalone', 'distributed-pulsar', 'distributed-kafka', 'standalone-authentication', 'standalone-one-pod'
                         }
                         axis {
                             name 'MILVUS_CLIENT'
@@ -103,17 +103,19 @@ pipeline {
                                         script {
                                             sh 'printenv'
                                             def clusterEnabled = "false"
-                                            def mysqlEnabled = "false"
                                             // def setMemoryResourceLimitArgs="--set standalone.resources.limits.memory=4Gi"
                                             def mqMode='pulsar' // default using is pulsar
-                                            def mysql_architecture = "standalone"
+                                            def authenticationEnabled = "false"
+                                            def valuesFile = "values/ci/nightly.yaml"
                                             if ("${MILVUS_SERVER_TYPE}" == "distributed-pulsar") {
                                                 clusterEnabled = "true"
                                             } else if ("${MILVUS_SERVER_TYPE}" == "distributed-kafka") {
                                                 clusterEnabled = "true"
-//                                                 mysqlEnabled = "true"
                                                 mqMode='kafka'
-//                                                 mysql_architecture = "replication"
+                                            } else if("${MILVUS_SERVER_TYPE}" == "standalone-authentication") {
+                                                authenticationEnabled = "true"
+                                            } else if("${MILVUS_SERVER_TYPE}" == "standalone-one-pod") {
+                                                valuesFile = "values/ci/nightly-one-pod.yaml"
                                             }
                                             if ("${MILVUS_CLIENT}" == "pymilvus") {
                                                 if ("${imageTag}"==''){
@@ -145,8 +147,6 @@ pipeline {
                                                     --set queryNode.replicas=2 \
                                                     --set indexNode.replicas=2 \
                                                     --set dataNode.replicas=2 \
-                                                    --set mysql.enabled=${mysqlEnabled} \
-                                                    --set mysql.architecture=${mysql_architecture} \
                                                     --set dataCoordinator.gc.missingTolerance=86400 \
                                                     --set dataCoordinator.gc.dropTolerance=86400 \
                                                     --set indexCoordinator.gc.interval=1 \
@@ -160,10 +160,11 @@ pipeline {
                                                     --set indexNode.disk.enabled=true \
                                                     --set queryNode.disk.enabled=true \
                                                     --set standalone.disk.enabled=true \
+                                                    --set log.level=debug \
+                                                    --set common.security.authorizationEnabled=${authenticationEnabled} \
                                                     --version ${chart_version} \
                                                     -f values/${mqMode}.yaml \
-                                                    -f values/mysql.yaml \
-                                                    -f values/ci/nightly.yaml "
+                                                    -f ${valuesFile}"
                                                     """
                                                 }
                                             } else {
@@ -192,6 +193,7 @@ pipeline {
                                                 def clusterEnabled = "false"
                                                 def mqMode='pulsar'
                                                 int e2e_timeout_seconds = 5 * 60 * 60
+                                                int parallel_num = 6
                                                 def tag="L0 L1 L2"
                                                 if ("${MILVUS_SERVER_TYPE}" == "distributed-pulsar") {
                                                     clusterEnabled = "true"
@@ -203,15 +205,19 @@ pipeline {
                                                     mqMode='kafka'
                                                     tag="L0 L1 L2 ClusterOnly"
                                                     e2e_timeout_seconds = 6 * 60 * 60
+                                                } else if("${MILVUS_SERVER_TYPE}" == "standalone-authentication") {
+                                                    tag="RBAC"
+                                                    parallel_num = 1
+                                                    e2e_timeout_seconds = 3 * 60 * 60
                                                 }
                                                 if ("${MILVUS_CLIENT}" == "pymilvus") {
-                                                    sh """ 
+                                                    sh """
                                                     MILVUS_HELM_RELEASE_NAME="${release_name}" \
                                                     MILVUS_HELM_NAMESPACE="milvus-ci" \
                                                     MILVUS_CLUSTER_ENABLED="${clusterEnabled}" \
                                                     TEST_TIMEOUT="${e2e_timeout_seconds}" \
                                                     MQ_MODE="${mqMode}" \
-                                                    ./ci_e2e.sh  "-n 6 --tags ${tag}"
+                                                    ./ci_e2e.sh  "-n ${parallel_num} --tags ${tag}"
                                                     """
                                                 } else {
                                                 error "Error: Unsupported Milvus client: ${MILVUS_CLIENT}"

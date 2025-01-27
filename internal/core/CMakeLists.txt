@@ -29,6 +29,14 @@ if ( MILVUS_GPU_VERSION )
     add_definitions(-DMILVUS_GPU_VERSION)
 endif ()
 
+if ( USE_DYNAMIC_SIMD )
+    add_definitions(-DUSE_DYNAMIC_SIMD)
+endif()
+
+if (USE_OPENDAL) 
+    add_definitions(-DUSE_OPENDAL)
+endif()
+
 project(core)
 include(CheckCXXCompilerFlag)
 if ( APPLE )
@@ -41,6 +49,8 @@ elseif ( MSYS )
 else ()
     message(FATAL_ERROR "Unsupported platform!" )
 endif ()
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g")
 
 if (CMAKE_COMPILER_IS_GNUCC)
     if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER 11.99)
@@ -100,7 +110,9 @@ using_ccache_if_defined(MILVUS_USE_CCACHE)
 include( ExternalProject )
 include( GNUInstallDirs )
 include( FetchContent )
+
 include_directories( thirdparty )
+
 set( FETCHCONTENT_BASE_DIR ${MILVUS_BINARY_DIR}/3rdparty_download )
 set( FETCHCONTENT_QUIET OFF )
 include( ThirdPartyPackages )
@@ -114,8 +126,19 @@ if (LINUX OR MSYS)
                   "-fPIC"
                   "-DELPP_THREAD_SAFE"
                   "-fopenmp"
-                  "-Werror"
+                  "-Wno-error"
+                  "-Wno-all"
                   )
+    if (USE_ASAN STREQUAL "ON") 
+        message( STATUS "Building Milvus Core Using AddressSanitizer")
+        add_compile_options(-fno-stack-protector -fno-omit-frame-pointer -fno-var-tracking -fsanitize=address)
+        add_link_options(-fno-stack-protector -fno-omit-frame-pointer -fno-var-tracking -fsanitize=address)
+    endif()
+    if (CMAKE_BUILD_TYPE STREQUAL "Release")
+        append_flags( CMAKE_CXX_FLAGS
+                "-O3"
+                )
+    endif()
 endif ()
 
 if ( APPLE )
@@ -124,14 +147,12 @@ if ( APPLE )
             "-fPIC"
             "-DELPP_THREAD_SAFE"
             "-fopenmp"
-            "-Wno-error"
-            "-Wsign-compare"
-            "-Wall"
             "-pedantic"
-            "-Wno-unused-command-line-argument"
-            "-Wextra"
-            "-Wno-unused-parameter"
-            "-Wno-deprecated"
+            "-Wall"
+            "-D_DARWIN_C_SOURCE"
+            "-Wno-gnu-zero-variadic-macro-arguments"
+            "-Wno-variadic-macros"
+            "-Wno-reorder-ctor"
             "-DBOOST_STACKTRACE_GNU_SOURCE_NOT_REQUIRED=1"
             )
 endif ()
@@ -275,9 +296,21 @@ install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/src/segcore/
         FILES_MATCHING PATTERN "*_c.h"
 )
 
+# Install exec/expression/function
+install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/src/exec/expression/function/
+        DESTINATION include/exec/expression/function
+        FILES_MATCHING PATTERN "*_c.h"
+)
+
 # Install indexbuilder
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/src/indexbuilder/
         DESTINATION include/indexbuilder
+        FILES_MATCHING PATTERN "*_c.h"
+)
+
+# Install clustering
+install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/src/clustering/
+        DESTINATION include/clustering
         FILES_MATCHING PATTERN "*_c.h"
 )
 
@@ -287,7 +320,17 @@ install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/src/common/
         FILES_MATCHING PATTERN "*_c.h"
 )
 
+# Install monitor
+install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/src/monitor/
+        DESTINATION include/monitor
+        FILES_MATCHING PATTERN "*_c.h"
+)
+
+install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/src/futures/
+        DESTINATION include/futures
+        FILES_MATCHING PATTERN "*.h"
+)
+
 install(DIRECTORY ${CMAKE_BINARY_DIR}/lib/
         DESTINATION ${CMAKE_INSTALL_FULL_LIBDIR}
 )
-

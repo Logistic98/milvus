@@ -3,7 +3,7 @@ package typeutil
 import (
 	"fmt"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 )
 
 type kvPairsHelper[K comparable, V any] struct {
@@ -16,6 +16,10 @@ func (h *kvPairsHelper[K, V]) Get(k K) (V, error) {
 		return v, fmt.Errorf("%v not found", k)
 	}
 	return v, nil
+}
+
+func (h *kvPairsHelper[K, V]) GetAll() map[K]V {
+	return h.kvPairs
 }
 
 func NewKvPairs(pairs []*commonpb.KeyValuePair) *kvPairsHelper[string, string] {

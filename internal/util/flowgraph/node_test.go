@@ -25,70 +25,92 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/msgpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	"github.com/milvus-io/milvus/internal/util/dependency"
+	"github.com/milvus-io/milvus/pkg/mq/common"
 	"github.com/milvus-io/milvus/pkg/mq/msgstream"
-	"github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper"
 )
 
 func generateMsgPack() msgstream.MsgPack {
 	msgPack := msgstream.MsgPack{}
-	baseMsg := msgstream.BaseMsg{
-		BeginTimestamp: uint64(time.Now().Unix()),
-		EndTimestamp:   uint64(time.Now().Unix() + 1),
-		HashValues:     []uint32{0},
-	}
-	timeTickResult := msgpb.TimeTickMsg{
-		Base: &commonpb.MsgBase{
-			MsgType:   commonpb.MsgType_TimeTick,
-			MsgID:     0,
-			Timestamp: math.MaxUint64,
-			SourceID:  0,
-		},
-	}
+
 	timeTickMsg := &msgstream.TimeTickMsg{
-		BaseMsg:     baseMsg,
-		TimeTickMsg: timeTickResult,
+		BaseMsg: msgstream.BaseMsg{
+			BeginTimestamp: uint64(time.Now().Unix()),
+			EndTimestamp:   uint64(time.Now().Unix() + 1),
+			HashValues:     []uint32{0},
+		},
+		TimeTickMsg: &msgpb.TimeTickMsg{
+			Base: &commonpb.MsgBase{
+				MsgType:   commonpb.MsgType_TimeTick,
+				MsgID:     0,
+				Timestamp: math.MaxUint64,
+				SourceID:  0,
+			},
+		},
 	}
 	msgPack.Msgs = append(msgPack.Msgs, timeTickMsg)
 
 	return msgPack
 }
 
-func TestNodeCtx_Start(t *testing.T) {
+func generateInsertMsgPack() msgstream.MsgPack {
+	msgPack := msgstream.MsgPack{}
+	insertMsg := &msgstream.InsertMsg{
+		BaseMsg: msgstream.BaseMsg{
+			BeginTimestamp: uint64(time.Now().Unix()),
+			EndTimestamp:   uint64(time.Now().Unix() + 1),
+			HashValues:     []uint32{0},
+		},
+		InsertRequest: &msgpb.InsertRequest{
+			Base: &commonpb.MsgBase{MsgType: commonpb.MsgType_Insert},
+		},
+	}
+	msgPack.Msgs = append(msgPack.Msgs, insertMsg)
+	return msgPack
+}
+
+func TestNodeManager_Start(t *testing.T) {
 	t.Setenv("ROCKSMQ_PATH", "/tmp/MilvusTest/FlowGraph/TestNodeStart")
 	factory := dependency.NewDefaultFactory(true)
 
 	msgStream, _ := factory.NewMsgStream(context.TODO())
 	channels := []string{"cc"}
-	msgStream.AsConsumer(channels, "sub", mqwrapper.SubscriptionPositionEarliest)
+	msgStream.AsConsumer(context.TODO(), channels, "sub", common.SubscriptionPositionEarliest)
 
 	produceStream, _ := factory.NewMsgStream(context.TODO())
-	produceStream.AsProducer(channels)
+	produceStream.AsProducer(context.TODO(), channels)
 
 	msgPack := generateMsgPack()
-	produceStream.Produce(&msgPack)
+	produceStream.Produce(context.TODO(), &msgPack)
 	time.Sleep(time.Millisecond * 2)
 	msgPack = generateMsgPack()
-	produceStream.Produce(&msgPack)
+	produceStream.Produce(context.TODO(), &msgPack)
 
 	nodeName := "input_node"
 	inputNode := NewInputNode(msgStream.Chan(), nodeName, 100, 100, "", 0, 0, "")
 
-	node := &nodeCtx{
-		node:    inputNode,
-		closeCh: make(chan struct{}),
-		closeWg: &sync.WaitGroup{},
+	ddNode := BaseNode{}
+
+	node0 := &nodeCtx{
+		node: inputNode,
 	}
 
-	node.inputChannel = make(chan []Msg)
+	node1 := &nodeCtx{
+		node: &ddNode,
+	}
 
+	node0.downstream = node1
+
+	node0.inputChannel = make(chan []Msg)
+
+	nodeCtxManager := NewNodeCtxManager(node0, &sync.WaitGroup{})
 	assert.NotPanics(t, func() {
-		node.Start()
+		nodeCtxManager.Start()
 	})
 
-	node.Close()
+	nodeCtxManager.Close()
 }
 
 func TestBaseNode(t *testing.T) {

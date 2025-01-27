@@ -22,13 +22,13 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
-	"github.com/milvus-io/milvus/pkg/util/tsoutil"
 	"github.com/stretchr/testify/suite"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus/pkg/common"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/proto/rootcoordpb"
+	"github.com/milvus-io/milvus/pkg/util/tsoutil"
 )
 
 type UtilSuite struct {
@@ -111,42 +111,10 @@ func (suite *UtilSuite) TestVerifyResponse() {
 	for _, c := range cases {
 		r := VerifyResponse(c.resp, c.err)
 		if c.equalValue {
-			suite.EqualValues(c.expected.Error(), r.Error())
+			suite.Contains(r.Error(), c.expected.Error())
 		} else {
 			suite.Equal(c.expected, r)
 		}
-	}
-}
-
-func (suite *UtilSuite) TestGetCompactTime() {
-	paramtable.Get().Save(Params.CommonCfg.RetentionDuration.Key, "43200") // 5 days
-	defer paramtable.Get().Reset(Params.CommonCfg.RetentionDuration.Key)   // 5 days
-
-	tFixed := time.Date(2021, 11, 15, 0, 0, 0, 0, time.Local)
-	tBefore := tFixed.Add(-1 * Params.CommonCfg.RetentionDuration.GetAsDuration(time.Second))
-
-	type args struct {
-		allocator allocator
-	}
-	tests := []struct {
-		name    string
-		args    args
-		want    *compactTime
-		wantErr bool
-	}{
-		{
-			"test get timetravel",
-			args{&fixedTSOAllocator{fixedTime: tFixed}},
-			&compactTime{tsoutil.ComposeTS(tBefore.UnixNano()/int64(time.Millisecond), 0), 0, 0},
-			false,
-		},
-	}
-	for _, tt := range tests {
-		suite.Run(tt.name, func() {
-			got, err := GetCompactTime(context.TODO(), tt.args.allocator)
-			suite.Equal(tt.wantErr, err != nil)
-			suite.EqualValues(tt.want, got)
-		})
 	}
 }
 
@@ -158,11 +126,15 @@ type fixedTSOAllocator struct {
 	fixedTime time.Time
 }
 
-func (f *fixedTSOAllocator) allocTimestamp(_ context.Context) (Timestamp, error) {
+func (f *fixedTSOAllocator) AllocTimestamp(_ context.Context) (Timestamp, error) {
 	return tsoutil.ComposeTS(f.fixedTime.UnixNano()/int64(time.Millisecond), 0), nil
 }
 
-func (f *fixedTSOAllocator) allocID(_ context.Context) (UniqueID, error) {
+func (f *fixedTSOAllocator) AllocID(_ context.Context) (UniqueID, error) {
+	panic("not implemented") // TODO: Implement
+}
+
+func (f *fixedTSOAllocator) AllocN(_ context.Context, _ int64) (UniqueID, UniqueID, error) {
 	panic("not implemented") // TODO: Implement
 }
 
@@ -195,4 +167,35 @@ func (suite *UtilSuite) TestGetCollectionTTL() {
 	ttl, err = getCollectionTTL(map[string]string{})
 	suite.NoError(err)
 	suite.Equal(ttl, Params.CommonCfg.EntityExpirationTTL.GetAsDuration(time.Second))
+}
+
+func (suite *UtilSuite) TestGetCollectionAutoCompactionEnabled() {
+	properties := map[string]string{
+		common.CollectionAutoCompactionKey: "true",
+	}
+
+	enabled, err := getCollectionAutoCompactionEnabled(properties)
+	suite.NoError(err)
+	suite.True(enabled)
+
+	properties = map[string]string{
+		common.CollectionAutoCompactionKey: "bad_value",
+	}
+
+	_, err = getCollectionAutoCompactionEnabled(properties)
+	suite.Error(err)
+
+	enabled, err = getCollectionAutoCompactionEnabled(map[string]string{})
+	suite.NoError(err)
+	suite.Equal(Params.DataCoordCfg.EnableAutoCompaction.GetAsBool(), enabled)
+}
+
+func (suite *UtilSuite) TestCalculateL0SegmentSize() {
+	logsize := int64(100)
+	fields := []*datapb.FieldBinlog{{
+		FieldID: 102,
+		Binlogs: []*datapb.Binlog{{LogSize: logsize, MemorySize: logsize}},
+	}}
+
+	suite.Equal(calculateL0SegmentSize(fields), float64(logsize))
 }

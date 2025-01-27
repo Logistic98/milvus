@@ -5,8 +5,8 @@ import (
 
 	"github.com/stretchr/testify/suite"
 
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/proto/querypb"
 )
 
 type ReducerFactorySuite struct {
@@ -43,20 +43,18 @@ func (suite *ReducerFactorySuite) TestCreateInternalReducer() {
 }
 
 func (suite *ReducerFactorySuite) TestCreateSegCoreReducer() {
-
 	req := &querypb.QueryRequest{
 		Req: &internalpb.RetrieveRequest{
 			IsCount: false,
 		},
 	}
 
-	suite.sr = CreateSegCoreReducer(req, nil)
+	suite.sr = CreateSegCoreReducer(req, nil, nil)
 	_, suite.ok = suite.sr.(*defaultLimitReducerSegcore)
 	suite.True(suite.ok)
 
 	req.Req.IsCount = true
-
-	suite.sr = CreateSegCoreReducer(req, nil)
+	suite.sr = CreateSegCoreReducer(req, nil, nil)
 	_, suite.ok = suite.sr.(*cntReducerSegCore)
 	suite.True(suite.ok)
 }

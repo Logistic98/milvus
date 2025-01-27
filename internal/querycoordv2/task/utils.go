@@ -18,21 +18,35 @@ package task
 
 import (
 	"context"
+	"fmt"
+	"strconv"
 	"time"
 
-	"github.com/milvus-io/milvus/pkg/util/tsoutil"
-	"go.uber.org/zap"
+	"github.com/samber/lo"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/msgpb"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
-	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/internal/querycoordv2/utils"
+	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/pkg/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
+
+// idSource helper type for using id as task source
+type idSource int64
+
+func (s idSource) String() string {
+	return fmt.Sprintf("ID-%d", s)
+}
+
+func WrapIDSource(id int64) Source {
+	return idSource(id)
+}
 
 func Wait(ctx context.Context, timeout time.Duration, tasks ...Task) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
@@ -72,50 +86,67 @@ func SetReason(reason string, tasks ...Task) {
 // - only 1 reduce action -> Reduce
 // - 1 grow action, and ends with 1 reduce action -> Move
 func GetTaskType(task Task) Type {
-	if len(task.Actions()) > 1 {
+	switch {
+	case len(task.Actions()) > 1:
 		return TaskTypeMove
-	} else if task.Actions()[0].Type() == ActionTypeGrow {
+	case task.Actions()[0].Type() == ActionTypeGrow:
 		return TaskTypeGrow
-	} else {
+	case task.Actions()[0].Type() == ActionTypeReduce:
 		return TaskTypeReduce
+	case task.Actions()[0].Type() == ActionTypeUpdate:
+		return TaskTypeUpdate
 	}
+	return 0
+}
+
+func mergeCollectonProps(schemaProps []*commonpb.KeyValuePair, collectionProps []*commonpb.KeyValuePair) []*commonpb.KeyValuePair {
+	// Merge the collectionProps and schemaProps maps, giving priority to the values in schemaProps if there are duplicate keys.
+	props := make(map[string]string)
+	for _, p := range collectionProps {
+		props[p.GetKey()] = p.GetValue()
+	}
+	for _, p := range schemaProps {
+		props[p.GetKey()] = p.GetValue()
+	}
+	var ret []*commonpb.KeyValuePair
+	for k, v := range props {
+		ret = append(ret, &commonpb.KeyValuePair{
+			Key:   k,
+			Value: v,
+		})
+	}
+	return ret
 }
 
 func packLoadSegmentRequest(
 	task *SegmentTask,
 	action Action,
 	schema *schemapb.CollectionSchema,
+	collectionProperties []*commonpb.KeyValuePair,
 	loadMeta *querypb.LoadMetaInfo,
 	loadInfo *querypb.SegmentLoadInfo,
-	resp *datapb.GetSegmentInfoResponse,
+	indexInfo []*indexpb.IndexInfo,
 ) *querypb.LoadSegmentsRequest {
-	var deltaPosition *msgpb.MsgPosition
-	segment := resp.GetInfos()[0]
-
-	var posSrcStr string
-	if segment.GetDmlPosition() != nil {
-		deltaPosition = segment.GetDmlPosition()
-		posSrcStr = "segmentDMLPos"
-	} else {
-		deltaPosition = segment.GetStartPosition()
-		posSrcStr = "segmentStartPos"
+	loadScope := querypb.LoadScope_Full
+	if action.Type() == ActionTypeUpdate {
+		loadScope = querypb.LoadScope_Index
 	}
 
-	posTime := tsoutil.PhysicalTime(deltaPosition.GetTimestamp())
-	tsLag := time.Since(posTime)
-	if tsLag >= 10*time.Minute {
-		log.Warn("deltaPosition is quite stale when packLoadSegmentRequest",
-			zap.Int64("taskID", task.ID()),
-			zap.Int64("collectionID", task.CollectionID()),
-			zap.Int64("segmentID", task.SegmentID()),
-			zap.Int64("node", action.Node()),
-			zap.Int64("source", task.SourceID()),
-			zap.String("channel", segment.InsertChannel),
-			zap.String("posSource", posSrcStr),
-			zap.Uint64("posTs", deltaPosition.GetTimestamp()),
-			zap.Time("posTime", posTime),
-			zap.Duration("tsLag", tsLag))
+	if task.Source() == utils.LeaderChecker {
+		loadScope = querypb.LoadScope_Delta
 	}
+	// field mmap enabled if collection-level mmap enabled or the field mmap enabled
+	collectionMmapEnabled, exist := common.IsMmapDataEnabled(collectionProperties...)
+	for _, field := range schema.GetFields() {
+		if exist {
+			field.TypeParams = append(field.TypeParams, &commonpb.KeyValuePair{
+				Key:   common.MmapEnabledKey,
+				Value: strconv.FormatBool(collectionMmapEnabled),
+			})
+		}
+	}
+
+	schema.Properties = mergeCollectonProps(schema.Properties, collectionProperties)
 
 	return &querypb.LoadSegmentsRequest{
 		Base: commonpbutil.NewMsgBase(
@@ -123,14 +154,16 @@ func packLoadSegmentRequest(
 			commonpbutil.WithMsgID(task.ID()),
 		),
 		Infos:          []*querypb.SegmentLoadInfo{loadInfo},
-		Schema:         schema,
-		LoadMeta:       loadMeta,
+		Schema:         schema,   // assign it for compatibility of rolling upgrade from 2.2.x to 2.3
+		LoadMeta:       loadMeta, // assign it for compatibility of rolling upgrade from 2.2.x to 2.3
 		CollectionID:   task.CollectionID(),
 		ReplicaID:      task.ReplicaID(),
-		DeltaPositions: []*msgpb.MsgPosition{deltaPosition},
+		DeltaPositions: []*msgpb.MsgPosition{loadInfo.GetDeltaPosition()}, // assign it for compatibility of rolling upgrade from 2.2.x to 2.3
 		DstNodeID:      action.Node(),
 		Version:        time.Now().UnixNano(),
 		NeedTransfer:   true,
+		IndexInfoList:  indexInfo,
+		LoadScope:      loadScope,
 	}
 }
 
@@ -144,17 +177,20 @@ func packReleaseSegmentRequest(task *SegmentTask, action *SegmentAction) *queryp
 		NodeID:       action.Node(),
 		CollectionID: task.CollectionID(),
 		SegmentIDs:   []int64{task.SegmentID()},
-		Scope:        action.Scope(),
-		Shard:        action.Shard(),
+		Scope:        action.GetScope(),
+		Shard:        action.GetShard(),
 		NeedTransfer: false,
 	}
 }
 
-func packLoadMeta(loadType querypb.LoadType, collectionID int64, partitions ...int64) *querypb.LoadMetaInfo {
+func packLoadMeta(loadType querypb.LoadType, collectionID int64, databaseName string, resourceGroup string, loadFields []int64, partitions ...int64) *querypb.LoadMetaInfo {
 	return &querypb.LoadMetaInfo{
-		LoadType:     loadType,
-		CollectionID: collectionID,
-		PartitionIDs: partitions,
+		LoadType:      loadType,
+		CollectionID:  collectionID,
+		PartitionIDs:  partitions,
+		DbName:        databaseName,
+		ResourceGroup: resourceGroup,
+		LoadFields:    loadFields,
 	}
 }
 
@@ -164,19 +200,21 @@ func packSubChannelRequest(
 	schema *schemapb.CollectionSchema,
 	loadMeta *querypb.LoadMetaInfo,
 	channel *meta.DmChannel,
+	indexInfo []*indexpb.IndexInfo,
 ) *querypb.WatchDmChannelsRequest {
 	return &querypb.WatchDmChannelsRequest{
 		Base: commonpbutil.NewMsgBase(
 			commonpbutil.WithMsgType(commonpb.MsgType_WatchDmChannels),
 			commonpbutil.WithMsgID(task.ID()),
 		),
-		NodeID:       action.Node(),
-		CollectionID: task.CollectionID(),
-		Infos:        []*datapb.VchannelInfo{channel.VchannelInfo},
-		Schema:       schema,
-		LoadMeta:     loadMeta,
-		ReplicaID:    task.ReplicaID(),
-		Version:      time.Now().UnixNano(),
+		NodeID:        action.Node(),
+		CollectionID:  task.CollectionID(),
+		Infos:         []*datapb.VchannelInfo{channel.VchannelInfo},
+		Schema:        schema,   // assign it for compatibility of rolling upgrade from 2.2.x to 2.3
+		LoadMeta:      loadMeta, // assign it for compatibility of rolling upgrade from 2.2.x to 2.3
+		ReplicaID:     task.ReplicaID(),
+		Version:       time.Now().UnixNano(),
+		IndexInfoList: indexInfo,
 	}
 }
 
@@ -184,26 +222,29 @@ func fillSubChannelRequest(
 	ctx context.Context,
 	req *querypb.WatchDmChannelsRequest,
 	broker meta.Broker,
+	includeFlushed bool,
 ) error {
 	segmentIDs := typeutil.NewUniqueSet()
 	for _, vchannel := range req.GetInfos() {
-		segmentIDs.Insert(vchannel.GetFlushedSegmentIds()...)
+		if includeFlushed {
+			segmentIDs.Insert(vchannel.GetFlushedSegmentIds()...)
+		}
 		segmentIDs.Insert(vchannel.GetUnflushedSegmentIds()...)
+		segmentIDs.Insert(vchannel.GetLevelZeroSegmentIds()...)
 	}
 
 	if segmentIDs.Len() == 0 {
 		return nil
 	}
 
-	resp, err := broker.GetSegmentInfo(ctx, segmentIDs.Collect()...)
+	segmentInfos, err := broker.GetSegmentInfo(ctx, segmentIDs.Collect()...)
 	if err != nil {
 		return err
 	}
-	segmentInfos := make(map[int64]*datapb.SegmentInfo)
-	for _, info := range resp.GetInfos() {
-		segmentInfos[info.GetID()] = info
-	}
-	req.SegmentInfos = segmentInfos
+
+	req.SegmentInfos = lo.SliceToMap(segmentInfos, func(info *datapb.SegmentInfo) (int64, *datapb.SegmentInfo) {
+		return info.GetID(), info
+	})
 	return nil
 }
 
@@ -217,12 +258,4 @@ func packUnsubDmChannelRequest(task *ChannelTask, action Action) *querypb.UnsubD
 		CollectionID: task.CollectionID(),
 		ChannelName:  task.Channel(),
 	}
-}
-
-func getShardLeader(replicaMgr *meta.ReplicaManager, distMgr *meta.DistributionManager, collectionID, nodeID int64, channel string) (int64, bool) {
-	replica := replicaMgr.GetByCollectionAndNode(collectionID, nodeID)
-	if replica == nil {
-		return 0, false
-	}
-	return distMgr.GetShardLeader(replica, channel)
 }

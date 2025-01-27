@@ -18,76 +18,50 @@ package segments
 
 import (
 	"context"
-	"fmt"
 
-	"github.com/cockroachdb/errors"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/util/merr"
 )
 
-func validate(ctx context.Context, manager *Manager, collectionID int64, partitionIDs []int64, segmentIDs []int64, segmentFilter SegmentFilter) ([]int64, []int64, error) {
-	var searchPartIDs []int64
-	var newSegmentIDs []int64
-
+func validate(ctx context.Context, manager *Manager, collectionID int64, partitionIDs []int64, segmentIDs []int64, segmentFilter SegmentFilter) ([]Segment, error) {
 	collection := manager.Collection.Get(collectionID)
 	if collection == nil {
-		return nil, nil, WrapCollectionNotFound(collectionID)
+		return nil, merr.WrapErrCollectionNotFound(collectionID)
 	}
 
-	//validate partition
-	// no partition id specified, get all partition ids in collection
-	if len(partitionIDs) == 0 {
-		searchPartIDs = collection.GetPartitions()
-	} else {
-		collection.ExistPartition()
-		if collection.ExistPartition(partitionIDs...) {
-			searchPartIDs = partitionIDs
+	log.Ctx(ctx).Debug("read target partitions", zap.Int64("collectionID", collectionID), zap.Int64s("partitionIDs", partitionIDs))
+
+	// validate segment
+	segments := make([]Segment, 0, len(segmentIDs))
+	var err error
+	defer func() {
+		if err != nil {
+			manager.Segment.Unpin(segments)
 		}
-	}
-
-	log.Ctx(ctx).Debug("read target partitions", zap.Int64("collectionID", collectionID), zap.Int64s("partitionIDs", searchPartIDs))
-
-	// all partitions have been released
-	if len(searchPartIDs) == 0 && collection.GetLoadType() == querypb.LoadType_LoadPartition {
-		return searchPartIDs, newSegmentIDs, errors.New("partitions have been released , collectionID = " +
-			fmt.Sprintln(collectionID) + "target partitionIDs = " + fmt.Sprintln(searchPartIDs))
-	}
-
-	if len(searchPartIDs) == 0 && collection.GetLoadType() == querypb.LoadType_LoadCollection {
-		return searchPartIDs, newSegmentIDs, nil
-	}
-
-	//validate segment
+	}()
 	if len(segmentIDs) == 0 {
-		for _, partID := range searchPartIDs {
-			segments := manager.Segment.GetBy(WithPartition(partID), segmentFilter)
-			for _, seg := range segments {
-				newSegmentIDs = append(segmentIDs, seg.ID())
-			}
+		// legacy logic
+		segments, err = manager.Segment.GetAndPinBy(segmentFilter, SegmentFilterFunc(func(s Segment) bool {
+			return s.Collection() == collectionID
+		}))
+		if err != nil {
+			return nil, err
 		}
 	} else {
-		newSegmentIDs = segmentIDs
-		for _, segmentID := range newSegmentIDs {
-			segment := manager.Segment.Get(segmentID)
-			if segment == nil {
-				continue
-			}
-			if !funcutil.SliceContain(searchPartIDs, segment.Partition()) {
-				err := fmt.Errorf("segment %d belongs to partition %d, which is not in %v", segmentID, segment.Partition(), searchPartIDs)
-				return searchPartIDs, newSegmentIDs, err
-			}
+		segments, err = manager.Segment.GetAndPin(segmentIDs, segmentFilter)
+		if err != nil {
+			return nil, err
 		}
 	}
-	return searchPartIDs, newSegmentIDs, nil
+	return segments, nil
 }
 
-func validateOnHistorical(ctx context.Context, manager *Manager, collectionID int64, partitionIDs []int64, segmentIDs []int64) ([]int64, []int64, error) {
+func validateOnHistorical(ctx context.Context, manager *Manager, collectionID int64, partitionIDs []int64, segmentIDs []int64) ([]Segment, error) {
 	return validate(ctx, manager, collectionID, partitionIDs, segmentIDs, WithType(SegmentTypeSealed))
 }
 
-func validateOnStream(ctx context.Context, manager *Manager, collectionID int64, partitionIDs []int64, segmentIDs []int64) ([]int64, []int64, error) {
+func validateOnStream(ctx context.Context, manager *Manager, collectionID int64, partitionIDs []int64, segmentIDs []int64) ([]Segment, error) {
 	return validate(ctx, manager, collectionID, partitionIDs, segmentIDs, WithType(SegmentTypeGrowing))
 }

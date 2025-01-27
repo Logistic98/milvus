@@ -3,37 +3,49 @@ package segments
 import (
 	"context"
 
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/segcorepb"
 	"github.com/milvus-io/milvus/internal/util/funcutil"
+	"github.com/milvus-io/milvus/internal/util/segcore"
+	"github.com/milvus-io/milvus/pkg/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/proto/segcorepb"
 )
 
-type cntReducer struct {
-}
+type cntReducer struct{}
 
 func (r *cntReducer) Reduce(ctx context.Context, results []*internalpb.RetrieveResults) (*internalpb.RetrieveResults, error) {
 	cnt := int64(0)
+	allRetrieveCount := int64(0)
+	relatedDataSize := int64(0)
 	for _, res := range results {
+		allRetrieveCount += res.GetAllRetrieveCount()
+		relatedDataSize += res.GetCostAggregation().GetTotalRelatedDataSize()
 		c, err := funcutil.CntOfInternalResult(res)
 		if err != nil {
 			return nil, err
 		}
 		cnt += c
 	}
-	return funcutil.WrapCntToInternalResult(cnt), nil
+	res := funcutil.WrapCntToInternalResult(cnt)
+	res.AllRetrieveCount = allRetrieveCount
+	res.CostAggregation = &internalpb.CostAggregation{
+		TotalRelatedDataSize: relatedDataSize,
+	}
+	return res, nil
 }
 
-type cntReducerSegCore struct {
-}
+type cntReducerSegCore struct{}
 
-func (r *cntReducerSegCore) Reduce(ctx context.Context, results []*segcorepb.RetrieveResults) (*segcorepb.RetrieveResults, error) {
+func (r *cntReducerSegCore) Reduce(ctx context.Context, results []*segcorepb.RetrieveResults, _ []Segment, _ *segcore.RetrievePlan) (*segcorepb.RetrieveResults, error) {
 	cnt := int64(0)
+	allRetrieveCount := int64(0)
 	for _, res := range results {
+		allRetrieveCount += res.GetAllRetrieveCount()
 		c, err := funcutil.CntOfSegCoreResult(res)
 		if err != nil {
 			return nil, err
 		}
 		cnt += c
 	}
-	return funcutil.WrapCntToSegCoreResult(cnt), nil
+	res := funcutil.WrapCntToSegCoreResult(cnt)
+	res.AllRetrieveCount = allRetrieveCount
+	return res, nil
 }

@@ -3,11 +3,10 @@ package model
 import (
 	"testing"
 
-	"github.com/milvus-io/milvus/internal/proto/indexpb"
-
 	"github.com/stretchr/testify/assert"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus/pkg/proto/indexpb"
 )
 
 var (
@@ -32,20 +31,20 @@ var (
 	}
 
 	indexModel2 = &SegmentIndex{
-		CollectionID:  colID,
-		PartitionID:   partID,
-		SegmentID:     segmentID,
-		NumRows:       1025,
-		IndexID:       indexID,
-		BuildID:       buildID,
-		NodeID:        0,
-		IndexState:    commonpb.IndexState_Finished,
-		FailReason:    "",
-		IndexVersion:  0,
-		IsDeleted:     false,
-		CreateTime:    1,
-		IndexFileKeys: nil,
-		IndexSize:     0,
+		CollectionID:        colID,
+		PartitionID:         partID,
+		SegmentID:           segmentID,
+		NumRows:             1025,
+		IndexID:             indexID,
+		BuildID:             buildID,
+		NodeID:              0,
+		IndexState:          commonpb.IndexState_Finished,
+		FailReason:          "",
+		IndexVersion:        0,
+		IsDeleted:           false,
+		CreatedUTCTime:      1,
+		IndexFileKeys:       nil,
+		IndexSerializedSize: 0,
 	}
 )
 

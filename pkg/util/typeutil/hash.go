@@ -17,12 +17,17 @@
 package typeutil
 
 import (
+	"fmt"
 	"hash/crc32"
+	"math"
+	"strconv"
+	"strings"
 	"unsafe"
 
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
+	"github.com/cockroachdb/errors"
 	"github.com/spaolacci/murmur3"
 
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/pkg/common"
 )
 
@@ -71,6 +76,16 @@ func HashString2Uint32(v string) uint32 {
 	return crc32.ChecksumIEEE([]byte(subString))
 }
 
+// HashString2LessUint32 hashing a string to uint32 but less than uint32 max
+func HashString2LessUint32(v string) uint32 {
+	subString := v
+	if len(v) > substringLengthForCRC {
+		subString = v[:substringLengthForCRC]
+	}
+
+	return crc32.ChecksumIEEE([]byte(subString)) % math.MaxUint32
+}
+
 // HashPK2Channels hash primary keys to channels
 func HashPK2Channels(primaryKeys *schemapb.IDs, shardNames []string) []uint32 {
 	numShard := uint32(len(shardNames))
@@ -89,8 +104,63 @@ func HashPK2Channels(primaryKeys *schemapb.IDs, shardNames []string) []uint32 {
 			hashValues = append(hashValues, hash%numShard)
 		}
 	default:
-		//TODO::
+		// TODO::
 	}
 
 	return hashValues
+}
+
+// HashKey2Partitions hash partition keys to partitions
+func HashKey2Partitions(keys *schemapb.FieldData, partitionNames []string) ([]uint32, error) {
+	var hashValues []uint32
+	numPartitions := uint32(len(partitionNames))
+	switch keys.Field.(type) {
+	case *schemapb.FieldData_Scalars:
+		scalarField := keys.GetScalars()
+		switch scalarField.Data.(type) {
+		case *schemapb.ScalarField_LongData:
+			longKeys := scalarField.GetLongData().Data
+			for _, key := range longKeys {
+				value, _ := Hash32Int64(key)
+				hashValues = append(hashValues, value%numPartitions)
+			}
+		case *schemapb.ScalarField_StringData:
+			stringKeys := scalarField.GetStringData().Data
+			for _, key := range stringKeys {
+				value := HashString2Uint32(key)
+				hashValues = append(hashValues, value%numPartitions)
+			}
+		default:
+			return nil, errors.New("currently only support DataType Int64 or VarChar as partition key Field")
+		}
+	default:
+		return nil, errors.New("currently not support vector field as partition keys")
+	}
+
+	return hashValues, nil
+}
+
+// this method returns a static sequence for partitions for partiton key mode
+func RearrangePartitionsForPartitionKey(partitions map[string]int64) ([]string, []int64, error) {
+	// Make sure the order of the partition names got every time is the same
+	partitionNames := make([]string, len(partitions))
+	partitionIDs := make([]int64, len(partitions))
+	for partitionName, partitionID := range partitions {
+		splits := strings.Split(partitionName, "_")
+		if len(splits) < 2 {
+			return nil, nil, fmt.Errorf("bad default partion name in partition key mode: %s", partitionName)
+		}
+		index, err := strconv.ParseInt(splits[len(splits)-1], 10, 64)
+		if err != nil {
+			return nil, nil, err
+		}
+		if (index >= int64(len(partitions))) || (index < 0) {
+			return nil, nil, fmt.Errorf("illegal partition index in partition key mode: %s", partitionName)
+		}
+
+		partitionNames[index] = partitionName
+		partitionIDs[index] = partitionID
+	}
+
+	return partitionNames, partitionIDs, nil
 }

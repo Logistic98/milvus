@@ -18,7 +18,7 @@ const (
 )
 
 // UnaryTraceLoggerInterceptor adds a traced logger in unary rpc call ctx
-func UnaryTraceLoggerInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+func UnaryTraceLoggerInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 	newctx := withLevelAndTrace(ctx)
 	return handler(newctx, req)
 }
@@ -66,6 +66,8 @@ func withLevelAndTrace(ctx context.Context) context.Context {
 		if len(requestID) >= 1 {
 			// inject traceid in order to pass client request id
 			newctx = metadata.AppendToOutgoingContext(newctx, clientRequestIDKey, requestID[0])
+			// inject traceid from client for info/debug/warn/error logs
+			newctx = log.WithTraceID(newctx, requestID[0])
 		}
 	}
 	if !traceID.IsValid() {

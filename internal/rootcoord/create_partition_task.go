@@ -20,15 +20,15 @@ import (
 	"context"
 	"fmt"
 
-	pb "github.com/milvus-io/milvus/internal/proto/etcdpb"
-
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-
-	"github.com/milvus-io/milvus/internal/metastore/model"
-	"github.com/milvus-io/milvus/pkg/log"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus/internal/metastore/model"
+	"github.com/milvus-io/milvus/internal/util/proxyutil"
+	"github.com/milvus-io/milvus/internal/util/streamingutil"
+	"github.com/milvus-io/milvus/pkg/log"
+	pb "github.com/milvus-io/milvus/pkg/proto/etcdpb"
 )
 
 type createPartitionTask struct {
@@ -41,18 +41,18 @@ func (t *createPartitionTask) Prepare(ctx context.Context) error {
 	if err := CheckMsgType(t.Req.GetBase().GetMsgType(), commonpb.MsgType_CreatePartition); err != nil {
 		return err
 	}
-	collMeta, err := t.core.meta.GetCollectionByName(ctx, t.Req.GetCollectionName(), t.GetTs())
+	collMeta, err := t.core.meta.GetCollectionByName(ctx, t.Req.GetDbName(), t.Req.GetCollectionName(), t.GetTs())
 	if err != nil {
 		return err
 	}
 	t.collMeta = collMeta
-	return nil
+	return checkGeneralCapacity(ctx, 0, 1, 0, t.core)
 }
 
 func (t *createPartitionTask) Execute(ctx context.Context) error {
 	for _, partition := range t.collMeta.Partitions {
 		if partition.PartitionName == t.Req.GetPartitionName() {
-			log.Warn("add duplicate partition", zap.String("collection", t.Req.GetCollectionName()), zap.String("partition", t.Req.GetPartitionName()), zap.Uint64("ts", t.GetTs()))
+			log.Ctx(ctx).Warn("add duplicate partition", zap.String("collection", t.Req.GetCollectionName()), zap.String("partition", t.Req.GetPartitionName()), zap.Uint64("ts", t.GetTs()))
 			return nil
 		}
 	}
@@ -76,34 +76,70 @@ func (t *createPartitionTask) Execute(ctx context.Context) error {
 		State:                     pb.PartitionState_PartitionCreating,
 	}
 
-	undoTask := newBaseUndoTask(t.core.stepExecutor)
-	undoTask.AddStep(&expireCacheStep{
-		baseStep:        baseStep{core: t.core},
-		collectionNames: []string{t.collMeta.Name},
-		collectionID:    t.collMeta.CollectionID,
-		ts:              t.GetTs(),
-	}, &nullStep{})
-	undoTask.AddStep(&addPartitionMetaStep{
-		baseStep:  baseStep{core: t.core},
-		partition: partition,
-	}, &nullStep{}) // adding partition is atomic enough.
+	return executeCreatePartitionTaskSteps(ctx, t.core, partition, t.collMeta, t.Req.GetDbName(), t.GetTs())
+}
 
-	undoTask.AddStep(&syncNewCreatedPartitionStep{
-		baseStep:     baseStep{core: t.core},
-		collectionID: t.collMeta.CollectionID,
-		partitionID:  partID,
-	}, &releasePartitionsStep{
-		baseStep:     baseStep{core: t.core},
-		collectionID: t.collMeta.CollectionID,
+func (t *createPartitionTask) GetLockerKey() LockerKey {
+	collection := t.core.getCollectionIDStr(t.ctx, t.Req.GetDbName(), t.Req.GetCollectionName(), 0)
+	return NewLockerKeyChain(
+		NewClusterLockerKey(false),
+		NewDatabaseLockerKey(t.Req.GetDbName(), false),
+		NewCollectionLockerKey(collection, true),
+	)
+}
+
+func executeCreatePartitionTaskSteps(ctx context.Context,
+	core *Core,
+	partition *model.Partition,
+	col *model.Collection,
+	dbName string,
+	ts Timestamp,
+) error {
+	undoTask := newBaseUndoTask(core.stepExecutor)
+	partID := partition.PartitionID
+	collectionID := partition.CollectionID
+	undoTask.AddStep(&expireCacheStep{
+		baseStep:        baseStep{core: core},
+		dbName:          dbName,
+		collectionNames: []string{col.Name},
+		collectionID:    collectionID,
+		partitionName:   partition.PartitionName,
+		ts:              ts,
+		opts:            []proxyutil.ExpireCacheOpt{proxyutil.SetMsgType(commonpb.MsgType_CreatePartition)},
+	}, &nullStep{})
+
+	undoTask.AddStep(&addPartitionMetaStep{
+		baseStep:  baseStep{core: core},
+		partition: partition,
+	}, &removePartitionMetaStep{
+		baseStep:     baseStep{core: core},
+		dbID:         col.DBID,
+		collectionID: partition.CollectionID,
+		partitionID:  partition.PartitionID,
+		ts:           ts,
+	})
+
+	if streamingutil.IsStreamingServiceEnabled() {
+		undoTask.AddStep(&broadcastCreatePartitionMsgStep{
+			baseStep:  baseStep{core: core},
+			vchannels: col.VirtualChannelNames,
+			partition: partition,
+			ts:        ts,
+		}, &nullStep{})
+	}
+
+	undoTask.AddStep(&nullStep{}, &releasePartitionsStep{
+		baseStep:     baseStep{core: core},
+		collectionID: col.CollectionID,
 		partitionIDs: []int64{partID},
 	})
 
 	undoTask.AddStep(&changePartitionStateStep{
-		baseStep:     baseStep{core: t.core},
-		collectionID: t.collMeta.CollectionID,
+		baseStep:     baseStep{core: core},
+		collectionID: col.CollectionID,
 		partitionID:  partID,
 		state:        pb.PartitionState_PartitionCreated,
-		ts:           t.GetTs(),
+		ts:           ts,
 	}, &nullStep{})
 
 	return undoTask.Execute(ctx)

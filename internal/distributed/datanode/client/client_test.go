@@ -21,50 +21,40 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/errors"
-	"github.com/milvus-io/milvus/internal/util/mock"
-
-	"github.com/milvus-io/milvus/internal/proto/datapb"
+	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
 
-	"github.com/milvus-io/milvus/internal/proxy"
-	"github.com/stretchr/testify/assert"
+	"github.com/milvus-io/milvus/internal/util/mock"
+	"github.com/milvus-io/milvus/pkg/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
 func Test_NewClient(t *testing.T) {
-	proxy.Params.Init()
+	paramtable.Init()
 	ctx := context.Background()
-	client, err := NewClient(ctx, "")
+	client, err := NewClient(ctx, "", 1)
 	assert.Nil(t, client)
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 
-	client, err = NewClient(ctx, "test")
-	assert.Nil(t, err)
+	client, err = NewClient(ctx, "test", 2)
+	assert.NoError(t, err)
 	assert.NotNil(t, client)
-
-	err = client.Init()
-	assert.Nil(t, err)
-
-	err = client.Start()
-	assert.Nil(t, err)
-
-	err = client.Register()
-	assert.Nil(t, err)
 
 	checkFunc := func(retNotNil bool) {
 		retCheck := func(notNil bool, ret interface{}, err error) {
 			if notNil {
 				assert.NotNil(t, ret)
-				assert.Nil(t, err)
+				assert.NoError(t, err)
 			} else {
 				assert.Nil(t, ret)
-				assert.NotNil(t, err)
+				assert.Error(t, err)
 			}
 		}
 
-		r1, err := client.GetComponentStates(ctx)
+		r1, err := client.GetComponentStates(ctx, nil)
 		retCheck(retNotNil, r1, err)
 
-		r2, err := client.GetStatisticsChannel(ctx)
+		r2, err := client.GetStatisticsChannel(ctx, nil)
 		retCheck(retNotNil, r2, err)
 
 		r3, err := client.WatchDmChannels(ctx, nil)
@@ -76,37 +66,40 @@ func Test_NewClient(t *testing.T) {
 		r5, err := client.GetMetrics(ctx, nil)
 		retCheck(retNotNil, r5, err)
 
-		r6, err := client.Compaction(ctx, nil)
+		r6, err := client.CompactionV2(ctx, nil)
 		retCheck(retNotNil, r6, err)
-
-		r7, err := client.Import(ctx, nil)
-		retCheck(retNotNil, r7, err)
 
 		r8, err := client.ResendSegmentStats(ctx, nil)
 		retCheck(retNotNil, r8, err)
-
-		r9, err := client.AddImportSegment(ctx, nil)
-		retCheck(retNotNil, r9, err)
 
 		r10, err := client.ShowConfigurations(ctx, nil)
 		retCheck(retNotNil, r10, err)
 
 		r11, err := client.GetCompactionState(ctx, nil)
 		retCheck(retNotNil, r11, err)
+
+		r12, err := client.NotifyChannelOperation(ctx, nil)
+		retCheck(retNotNil, r12, err)
+
+		r13, err := client.CheckChannelOperationProgress(ctx, nil)
+		retCheck(retNotNil, r13, err)
+
+		r14, err := client.DropCompactionPlan(ctx, nil)
+		retCheck(retNotNil, r14, err)
 	}
 
-	client.grpcClient = &mock.GRPCClientBase[datapb.DataNodeClient]{
+	client.(*Client).grpcClient = &mock.GRPCClientBase[datapb.DataNodeClient]{
 		GetGrpcClientErr: errors.New("dummy"),
 	}
 
 	newFunc1 := func(cc *grpc.ClientConn) datapb.DataNodeClient {
 		return &mock.GrpcDataNodeClient{Err: nil}
 	}
-	client.grpcClient.SetNewGrpcClientFunc(newFunc1)
+	client.(*Client).grpcClient.SetNewGrpcClientFunc(newFunc1)
 
 	checkFunc(false)
 
-	client.grpcClient = &mock.GRPCClientBase[datapb.DataNodeClient]{
+	client.(*Client).grpcClient = &mock.GRPCClientBase[datapb.DataNodeClient]{
 		GetGrpcClientErr: nil,
 	}
 
@@ -114,21 +107,21 @@ func Test_NewClient(t *testing.T) {
 		return &mock.GrpcDataNodeClient{Err: errors.New("dummy")}
 	}
 
-	client.grpcClient.SetNewGrpcClientFunc(newFunc2)
+	client.(*Client).grpcClient.SetNewGrpcClientFunc(newFunc2)
 
 	checkFunc(false)
 
-	client.grpcClient = &mock.GRPCClientBase[datapb.DataNodeClient]{
+	client.(*Client).grpcClient = &mock.GRPCClientBase[datapb.DataNodeClient]{
 		GetGrpcClientErr: nil,
 	}
 
 	newFunc3 := func(cc *grpc.ClientConn) datapb.DataNodeClient {
 		return &mock.GrpcDataNodeClient{Err: nil}
 	}
-	client.grpcClient.SetNewGrpcClientFunc(newFunc3)
+	client.(*Client).grpcClient.SetNewGrpcClientFunc(newFunc3)
 
 	checkFunc(true)
 
-	err = client.Stop()
-	assert.Nil(t, err)
+	err = client.Close()
+	assert.NoError(t, err)
 }

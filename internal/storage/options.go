@@ -2,16 +2,22 @@ package storage
 
 // Option for setting params used by chunk manager client.
 type config struct {
-	address           string
-	bucketName        string
-	accessKeyID       string
-	secretAccessKeyID string
-	useSSL            bool
-	createBucket      bool
-	rootPath          string
-	useIAM            bool
-	cloudProvider     string
-	iamEndpoint       string
+	address              string
+	bucketName           string
+	accessKeyID          string
+	secretAccessKeyID    string
+	useSSL               bool
+	sslCACert            string
+	createBucket         bool
+	rootPath             string
+	useIAM               bool
+	cloudProvider        string
+	iamEndpoint          string
+	useVirtualHost       bool
+	region               string
+	requestTimeoutMs     int64
+	gcpCredentialJSON    string
+	gcpNativeWithoutAuth bool // used for Unit Testing
 }
 
 func newDefaultConfig() *config {
@@ -38,6 +44,7 @@ func AccessKeyID(accessKeyID string) Option {
 		c.accessKeyID = accessKeyID
 	}
 }
+
 func SecretAccessKeyID(secretAccessKeyID string) Option {
 	return func(c *config) {
 		c.secretAccessKeyID = secretAccessKeyID
@@ -47,6 +54,12 @@ func SecretAccessKeyID(secretAccessKeyID string) Option {
 func UseSSL(useSSL bool) Option {
 	return func(c *config) {
 		c.useSSL = useSSL
+	}
+}
+
+func SslCACert(sslCACert string) Option {
+	return func(c *config) {
+		c.sslCACert = sslCACert
 	}
 }
 
@@ -77,5 +90,29 @@ func CloudProvider(cloudProvider string) Option {
 func IAMEndpoint(iamEndpoint string) Option {
 	return func(c *config) {
 		c.iamEndpoint = iamEndpoint
+	}
+}
+
+func UseVirtualHost(useVirtualHost bool) Option {
+	return func(c *config) {
+		c.useVirtualHost = useVirtualHost
+	}
+}
+
+func Region(region string) Option {
+	return func(c *config) {
+		c.region = region
+	}
+}
+
+func RequestTimeout(requestTimeoutMs int64) Option {
+	return func(c *config) {
+		c.requestTimeoutMs = requestTimeoutMs
+	}
+}
+
+func GcpCredentialJSON(gcpCredentialJSON string) Option {
+	return func(c *config) {
+		c.gcpCredentialJSON = gcpCredentialJSON
 	}
 }

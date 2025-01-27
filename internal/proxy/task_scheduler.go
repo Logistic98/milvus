@@ -19,15 +19,20 @@ package proxy
 import (
 	"container/list"
 	"context"
-	"fmt"
+	"strconv"
 	"sync"
+	"time"
 
-	"github.com/cockroachdb/errors"
 	"go.opentelemetry.io/otel"
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/metrics"
 	"github.com/milvus-io/milvus/pkg/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/util/conc"
+	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/util/tsoutil"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
@@ -84,7 +89,7 @@ func (queue *baseTaskQueue) addUnissuedTask(t task) error {
 	defer queue.utLock.Unlock()
 
 	if queue.utFull() {
-		return errors.New("task queue is full")
+		return merr.WrapErrServiceRequestLimitExceeded(int32(queue.getMaxTaskNum()))
 	}
 	queue.unissuedTasks.PushBack(t)
 	queue.utBufChan <- 1
@@ -122,7 +127,7 @@ func (queue *baseTaskQueue) AddActiveTask(t task) {
 	tID := t.ID()
 	_, ok := queue.activeTasks[tID]
 	if ok {
-		log.Warn("Proxy task with tID already in active task list!", zap.Int64("ID", tID))
+		log.Ctx(t.TraceCtx()).Warn("Proxy task with tID already in active task list!", zap.Int64("ID", tID))
 	}
 
 	queue.activeTasks[tID] = t
@@ -137,7 +142,7 @@ func (queue *baseTaskQueue) PopActiveTask(taskID UniqueID) task {
 		return t
 	}
 
-	log.Warn("Proxy task not in active task list! ts", zap.Int64("taskID", taskID))
+	log.Ctx(context.TODO()).Warn("Proxy task not in active task list! ts", zap.Int64("taskID", taskID))
 	return t
 }
 
@@ -168,15 +173,26 @@ func (queue *baseTaskQueue) Enqueue(t task) error {
 		return err
 	}
 
-	ts, err := queue.tsoAllocatorIns.AllocOne(t.TraceCtx())
-	if err != nil {
-		return err
+	var ts Timestamp
+	var id UniqueID
+	if t.CanSkipAllocTimestamp() {
+		ts = tsoutil.ComposeTS(time.Now().UnixMilli(), 0)
+		id, err = globalMetaCache.AllocID(t.TraceCtx())
+		if err != nil {
+			return err
+		}
+	} else {
+		ts, err = queue.tsoAllocatorIns.AllocOne(t.TraceCtx())
+		if err != nil {
+			return err
+		}
+		// we always use same msg id and ts for now.
+		id = UniqueID(ts)
 	}
 	t.SetTs(ts)
+	t.SetID(id)
 
-	// we always use same msg id and ts for now.
-	t.SetID(UniqueID(ts))
-
+	t.SetOnEnqueueTime()
 	return queue.addUnissuedTask(t)
 }
 
@@ -206,6 +222,7 @@ func newBaseTaskQueue(tsoAllocatorIns tsoAllocator) *baseTaskQueue {
 	}
 }
 
+// ddTaskQueue represents queue for DDL task such as createCollection/createPartition/dropCollection/dropPartition/hasCollection/hasPartition
 type ddTaskQueue struct {
 	*baseTaskQueue
 	lock sync.Mutex
@@ -216,6 +233,7 @@ type pChanStatInfo struct {
 	tsSet map[Timestamp]struct{}
 }
 
+// dmTaskQueue represents queue for DML task such as insert/delete/upsert
 type dmTaskQueue struct {
 	*baseTaskQueue
 
@@ -228,27 +246,27 @@ func (queue *dmTaskQueue) Enqueue(t task) error {
 	//	1) Protect member pChanStatisticsInfos
 	//	2) Serialize the timestamp allocation for dml tasks
 
-	//1. preAdd will check whether provided task is valid or addable
-	//and get the current pChannels for this dmTask
+	// 1. set the current pChannels for this dmTask
 	dmt := t.(dmlTask)
-	pChannels, err := dmt.getChannels()
+	err := dmt.setChannels()
 	if err != nil {
-		log.Warn("getChannels failed when Enqueue", zap.Any("tID", t.ID()), zap.Error(err))
+		log.Ctx(t.TraceCtx()).Warn("setChannels failed when Enqueue", zap.Int64("taskID", t.ID()), zap.Error(err))
 		return err
 	}
 
-	//2. enqueue dml task
+	// 2. enqueue dml task
 	queue.statsLock.Lock()
 	defer queue.statsLock.Unlock()
 	err = queue.baseTaskQueue.Enqueue(t)
 	if err != nil {
 		return err
 	}
-	//3. if preAdd succeed, commit will use pChannels got previously when preAdding and will definitely succeed
+	// 3. commit will use pChannels got previously when preAdding and will definitely succeed
+	pChannels := dmt.getChannels()
 	queue.commitPChanStats(dmt, pChannels)
-	//there's indeed a possibility that the collection info cache was expired after preAddPChanStats
-	//but considering root coord knows everything about meta modification, invalid stats appended after the meta changed
-	//will be discarded by root coord and will not lead to inconsistent state
+	// there's indeed a possibility that the collection info cache was expired after preAddPChanStats
+	// but considering root coord knows everything about meta modification, invalid stats appended after the meta changed
+	// will be discarded by root coord and will not lead to inconsistent state
 	return nil
 }
 
@@ -261,16 +279,16 @@ func (queue *dmTaskQueue) PopActiveTask(taskID UniqueID) task {
 		defer queue.statsLock.Unlock()
 
 		delete(queue.activeTasks, taskID)
-		log.Debug("Proxy dmTaskQueue popPChanStats", zap.Any("taskID", t.ID()))
+		log.Ctx(t.TraceCtx()).Debug("Proxy dmTaskQueue popPChanStats", zap.Int64("taskID", t.ID()))
 		queue.popPChanStats(t)
 	} else {
-		log.Warn("Proxy task not in active task list!", zap.Any("taskID", taskID))
+		log.Ctx(context.TODO()).Warn("Proxy task not in active task list!", zap.Int64("taskID", taskID))
 	}
 	return t
 }
 
 func (queue *dmTaskQueue) commitPChanStats(dmt dmlTask, pChannels []pChan) {
-	//1. prepare new stat for all pChannels
+	// 1. prepare new stat for all pChannels
 	newStats := make(map[pChan]pChanStatistics)
 	beginTs := dmt.BeginTs()
 	endTs := dmt.EndTs()
@@ -280,7 +298,7 @@ func (queue *dmTaskQueue) commitPChanStats(dmt dmlTask, pChannels []pChan) {
 			maxTs: endTs,
 		}
 	}
-	//2. update stats for all pChannels
+	// 2. update stats for all pChannels
 	for cName, newStat := range newStats {
 		currentStat, ok := queue.pChanStatisticsInfos[cName]
 		if !ok {
@@ -304,12 +322,7 @@ func (queue *dmTaskQueue) commitPChanStats(dmt dmlTask, pChannels []pChan) {
 }
 
 func (queue *dmTaskQueue) popPChanStats(t task) {
-	channels, err := t.(dmlTask).getChannels()
-	if err != nil {
-		err = fmt.Errorf("get channels failed when popPChanStats, err=%w", err)
-		log.Error(err.Error())
-		panic(err)
-	}
+	channels := t.(dmlTask).getChannels()
 	taskTs := t.BeginTs()
 	for _, cName := range channels {
 		info, ok := queue.pChanStatisticsInfos[cName]
@@ -331,7 +344,6 @@ func (queue *dmTaskQueue) popPChanStats(t task) {
 }
 
 func (queue *dmTaskQueue) getPChanStatsInfo() (map[pChan]*pChanStatistics, error) {
-
 	ret := make(map[pChan]*pChanStatistics)
 	queue.statsLock.RLock()
 	defer queue.statsLock.RUnlock()
@@ -344,6 +356,7 @@ func (queue *dmTaskQueue) getPChanStatsInfo() (map[pChan]*pChanStatistics, error
 	return ret, nil
 }
 
+// dqTaskQueue represents queue for DQL task such as search/query
 type dqTaskQueue struct {
 	*baseTaskQueue
 }
@@ -379,6 +392,9 @@ type taskScheduler struct {
 	dmQueue *dmTaskQueue
 	dqQueue *dqTaskQueue
 
+	// data control queue, use for such as flush operation, which control the data status
+	dcQueue *ddTaskQueue
+
 	wg     sync.WaitGroup
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -403,6 +419,8 @@ func newTaskScheduler(ctx context.Context,
 	s.dmQueue = newDmTaskQueue(tsoAllocatorIns)
 	s.dqQueue = newDqTaskQueue(tsoAllocatorIns)
 
+	s.dcQueue = newDdTaskQueue(tsoAllocatorIns)
+
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -414,25 +432,16 @@ func (sched *taskScheduler) scheduleDdTask() task {
 	return sched.ddQueue.PopUnissuedTask()
 }
 
+func (sched *taskScheduler) scheduleDcTask() task {
+	return sched.dcQueue.PopUnissuedTask()
+}
+
 func (sched *taskScheduler) scheduleDmTask() task {
 	return sched.dmQueue.PopUnissuedTask()
 }
 
 func (sched *taskScheduler) scheduleDqTask() task {
 	return sched.dqQueue.PopUnissuedTask()
-}
-
-func (sched *taskScheduler) getTaskByReqID(reqID UniqueID) task {
-	if t := sched.ddQueue.getTaskByReqID(reqID); t != nil {
-		return t
-	}
-	if t := sched.dmQueue.getTaskByReqID(reqID); t != nil {
-		return t
-	}
-	if t := sched.dqQueue.getTaskByReqID(reqID); t != nil {
-		return t
-	}
-	return nil
 }
 
 func (sched *taskScheduler) processTask(t task, q taskQueue) {
@@ -448,6 +457,11 @@ func (sched *taskScheduler) processTask(t task, q taskQueue) {
 	}()
 	span.AddEvent("scheduler process PreExecute")
 
+	waitDuration := t.GetDurationInQueue()
+	metrics.ProxyReqInQueueLatency.
+		WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), t.Type().String()).
+		Observe(float64(waitDuration.Milliseconds()))
+
 	err := t.PreExecute(ctx)
 
 	defer func() {
@@ -455,7 +469,7 @@ func (sched *taskScheduler) processTask(t task, q taskQueue) {
 	}()
 	if err != nil {
 		span.RecordError(err)
-		log.Ctx(ctx).Error("Failed to pre-execute task: " + err.Error())
+		log.Ctx(ctx).Warn("Failed to pre-execute task: " + err.Error())
 		return
 	}
 
@@ -463,16 +477,15 @@ func (sched *taskScheduler) processTask(t task, q taskQueue) {
 	err = t.Execute(ctx)
 	if err != nil {
 		span.RecordError(err)
-		log.Ctx(ctx).Error("Failed to execute task: ", zap.Error(err))
+		log.Ctx(ctx).Warn("Failed to execute task: ", zap.Error(err))
 		return
 	}
 
 	span.AddEvent("scheduler process PostExecute")
 	err = t.PostExecute(ctx)
-
 	if err != nil {
 		span.RecordError(err)
-		log.Ctx(ctx).Error("Failed to post-execute task: ", zap.Error(err))
+		log.Ctx(ctx).Warn("Failed to post-execute task: ", zap.Error(err))
 		return
 	}
 }
@@ -480,6 +493,8 @@ func (sched *taskScheduler) processTask(t task, q taskQueue) {
 // definitionLoop schedules the ddl tasks.
 func (sched *taskScheduler) definitionLoop() {
 	defer sched.wg.Done()
+
+	pool := conc.NewPool[struct{}](paramtable.Get().ProxyCfg.DDLConcurrency.GetAsInt(), conc.WithExpiryDuration(time.Minute))
 	for {
 		select {
 		case <-sched.ctx.Done():
@@ -487,7 +502,31 @@ func (sched *taskScheduler) definitionLoop() {
 		case <-sched.ddQueue.utChan():
 			if !sched.ddQueue.utEmpty() {
 				t := sched.scheduleDdTask()
-				sched.processTask(t, sched.ddQueue)
+				pool.Submit(func() (struct{}, error) {
+					sched.processTask(t, sched.ddQueue)
+					return struct{}{}, nil
+				})
+			}
+		}
+	}
+}
+
+// controlLoop schedule the data control operation, such as flush
+func (sched *taskScheduler) controlLoop() {
+	defer sched.wg.Done()
+
+	pool := conc.NewPool[struct{}](paramtable.Get().ProxyCfg.DCLConcurrency.GetAsInt(), conc.WithExpiryDuration(time.Minute))
+	for {
+		select {
+		case <-sched.ctx.Done():
+			return
+		case <-sched.dcQueue.utChan():
+			if !sched.dcQueue.utEmpty() {
+				t := sched.scheduleDcTask()
+				pool.Submit(func() (struct{}, error) {
+					sched.processTask(t, sched.dcQueue)
+					return struct{}{}, nil
+				})
 			}
 		}
 	}
@@ -495,6 +534,7 @@ func (sched *taskScheduler) definitionLoop() {
 
 func (sched *taskScheduler) manipulationLoop() {
 	defer sched.wg.Done()
+	pool := conc.NewPool[struct{}](paramtable.Get().ProxyCfg.MaxTaskNum.GetAsInt())
 	for {
 		select {
 		case <-sched.ctx.Done():
@@ -502,7 +542,10 @@ func (sched *taskScheduler) manipulationLoop() {
 		case <-sched.dmQueue.utChan():
 			if !sched.dmQueue.utEmpty() {
 				t := sched.scheduleDmTask()
-				go sched.processTask(t, sched.dmQueue)
+				pool.Submit(func() (struct{}, error) {
+					sched.processTask(t, sched.dmQueue)
+					return struct{}{}, nil
+				})
 			}
 		}
 	}
@@ -511,6 +554,7 @@ func (sched *taskScheduler) manipulationLoop() {
 func (sched *taskScheduler) queryLoop() {
 	defer sched.wg.Done()
 
+	pool := conc.NewPool[struct{}](paramtable.Get().ProxyCfg.MaxTaskNum.GetAsInt(), conc.WithExpiryDuration(time.Minute))
 	for {
 		select {
 		case <-sched.ctx.Done():
@@ -518,9 +562,12 @@ func (sched *taskScheduler) queryLoop() {
 		case <-sched.dqQueue.utChan():
 			if !sched.dqQueue.utEmpty() {
 				t := sched.scheduleDqTask()
-				go sched.processTask(t, sched.dqQueue)
+				pool.Submit(func() (struct{}, error) {
+					sched.processTask(t, sched.dqQueue)
+					return struct{}{}, nil
+				})
 			} else {
-				log.Debug("query queue is empty ...")
+				log.Ctx(context.TODO()).Debug("query queue is empty ...")
 			}
 		}
 	}
@@ -529,6 +576,9 @@ func (sched *taskScheduler) queryLoop() {
 func (sched *taskScheduler) Start() error {
 	sched.wg.Add(1)
 	go sched.definitionLoop()
+
+	sched.wg.Add(1)
+	go sched.controlLoop()
 
 	sched.wg.Add(1)
 	go sched.manipulationLoop()

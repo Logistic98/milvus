@@ -18,94 +18,67 @@ package job
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/samber/lo"
+	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
+	"github.com/milvus-io/milvus/internal/querycoordv2/checkers"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
-	"github.com/milvus-io/milvus/internal/querycoordv2/session"
+	"github.com/milvus-io/milvus/internal/querycoordv2/observers"
+	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 // waitCollectionReleased blocks until
 // all channels and segments of given collection(partitions) are released,
 // empty partition list means wait for collection released
-func waitCollectionReleased(dist *meta.DistributionManager, collection int64, partitions ...int64) {
+func waitCollectionReleased(dist *meta.DistributionManager, checkerController *checkers.CheckerController, collection int64, partitions ...int64) {
 	partitionSet := typeutil.NewUniqueSet(partitions...)
 	for {
 		var (
 			channels []*meta.DmChannel
-			segments []*meta.Segment = dist.SegmentDistManager.GetByCollection(collection)
+			segments []*meta.Segment = dist.SegmentDistManager.GetByFilter(meta.WithCollectionID(collection))
 		)
 		if partitionSet.Len() > 0 {
 			segments = lo.Filter(segments, func(segment *meta.Segment, _ int) bool {
 				return partitionSet.Contain(segment.GetPartitionID())
 			})
 		} else {
-			channels = dist.ChannelDistManager.GetByCollection(collection)
+			channels = dist.ChannelDistManager.GetByCollectionAndFilter(collection)
 		}
 
 		if len(channels)+len(segments) == 0 {
 			break
+		} else {
+			log.Info("wait for release done", zap.Int64("collection", collection),
+				zap.Int64s("partitions", partitions),
+				zap.Int("channel", len(channels)),
+				zap.Int("segments", len(segments)),
+			)
 		}
 
+		// trigger check more frequently
+		checkerController.Check()
 		time.Sleep(200 * time.Millisecond)
 	}
 }
 
-func loadPartitions(ctx context.Context, meta *meta.Meta, cluster session.Cluster,
-	ignoreErr bool, collection int64, partitions ...int64) error {
-	replicas := meta.ReplicaManager.GetByCollection(collection)
-	loadReq := &querypb.LoadPartitionsRequest{
-		Base: &commonpb.MsgBase{
-			MsgType: commonpb.MsgType_LoadPartitions,
-		},
-		CollectionID: collection,
-		PartitionIDs: partitions,
+func waitCurrentTargetUpdated(ctx context.Context, targetObserver *observers.TargetObserver, collection int64) error {
+	// manual trigger update next target
+	ready, err := targetObserver.UpdateNextTarget(collection)
+	if err != nil {
+		log.Warn("failed to update next target for sync partition job", zap.Error(err))
+		return err
 	}
-	for _, replica := range replicas {
-		for _, node := range replica.GetNodes() {
-			status, err := cluster.LoadPartitions(ctx, node, loadReq)
-			if ignoreErr {
-				continue
-			}
-			if err != nil {
-				return err
-			}
-			if status.GetErrorCode() != commonpb.ErrorCode_Success {
-				return fmt.Errorf("QueryNode failed to loadPartition, nodeID=%d, err=%s", node, status.GetReason())
-			}
-		}
-	}
-	return nil
-}
 
-func releasePartitions(ctx context.Context, meta *meta.Meta, cluster session.Cluster,
-	ignoreErr bool, collection int64, partitions ...int64) error {
-	replicas := meta.ReplicaManager.GetByCollection(collection)
-	releaseReq := &querypb.ReleasePartitionsRequest{
-		Base: &commonpb.MsgBase{
-			MsgType: commonpb.MsgType_ReleasePartitions,
-		},
-		CollectionID: collection,
-		PartitionIDs: partitions,
+	// accelerate check
+	targetObserver.TriggerUpdateCurrentTarget(collection)
+	// wait current target ready
+	select {
+	case <-ready:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	for _, replica := range replicas {
-		for _, node := range replica.GetNodes() {
-			status, err := cluster.ReleasePartitions(ctx, node, releaseReq)
-			if ignoreErr {
-				continue
-			}
-			if err != nil {
-				return err
-			}
-			if status.GetErrorCode() != commonpb.ErrorCode_Success {
-				return fmt.Errorf("QueryNode failed to releasePartitions, nodeID=%d, err=%s", node, status.GetReason())
-			}
-		}
-	}
-	return nil
 }

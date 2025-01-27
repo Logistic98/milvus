@@ -86,7 +86,7 @@ class TypedScalarIndexCreatorTest : public ::testing::Test {
 using ScalarT = ::testing::
     Types<bool, int8_t, int16_t, int32_t, int64_t, float, double, std::string>;
 
-TYPED_TEST_CASE_P(TypedScalarIndexCreatorTest);
+TYPED_TEST_SUITE_P(TypedScalarIndexCreatorTest);
 
 TYPED_TEST_P(TypedScalarIndexCreatorTest, Dummy) {
     using T = TypeParam;
@@ -100,12 +100,21 @@ TYPED_TEST_P(TypedScalarIndexCreatorTest, Constructor) {
     for (const auto& tp : GenParams<T>()) {
         auto type_params = tp.first;
         auto index_params = tp.second;
-        auto serialized_type_params = generate_type_params(type_params);
-        auto serialized_index_params = generate_index_params(index_params);
+
+        milvus::Config config;
+        for (auto iter = index_params.begin(); iter != index_params.end();
+             ++iter) {
+            config[iter->first] = iter->second;
+        }
+        for (auto iter = type_params.begin(); iter != type_params.end();
+             ++iter) {
+            config[iter->first] = iter->second;
+        }
+
         auto creator = milvus::indexbuilder::CreateScalarIndex(
             milvus::DataType(dtype),
-            serialized_type_params.c_str(),
-            serialized_index_params.c_str());
+            config,
+            milvus::storage::FileManagerContext());
     }
 }
 
@@ -115,28 +124,36 @@ TYPED_TEST_P(TypedScalarIndexCreatorTest, Codec) {
     for (const auto& tp : GenParams<T>()) {
         auto type_params = tp.first;
         auto index_params = tp.second;
-        auto serialized_type_params = generate_type_params(type_params);
-        auto serialized_index_params = generate_index_params(index_params);
+
+        milvus::Config config;
+        for (auto iter = index_params.begin(); iter != index_params.end();
+             ++iter) {
+            config[iter->first] = iter->second;
+        }
+        for (auto iter = type_params.begin(); iter != type_params.end();
+             ++iter) {
+            config[iter->first] = iter->second;
+        }
         auto creator = milvus::indexbuilder::CreateScalarIndex(
             milvus::DataType(dtype),
-            serialized_type_params.c_str(),
-            serialized_index_params.c_str());
-        auto arr = GenArr<T>(nb);
+            config,
+            milvus::storage::FileManagerContext());
+        auto arr = GenSortedArr<T>(nb);
         build_index<T>(creator, arr);
         auto binary_set = creator->Serialize();
         auto copy_creator = milvus::indexbuilder::CreateScalarIndex(
             milvus::DataType(dtype),
-            serialized_type_params.c_str(),
-            serialized_index_params.c_str());
+            config,
+            milvus::storage::FileManagerContext());
         copy_creator->Load(binary_set);
     }
 }
 
-REGISTER_TYPED_TEST_CASE_P(TypedScalarIndexCreatorTest,
-                           Dummy,
-                           Constructor,
-                           Codec);
+REGISTER_TYPED_TEST_SUITE_P(TypedScalarIndexCreatorTest,
+                            Dummy,
+                            Constructor,
+                            Codec);
 
-INSTANTIATE_TYPED_TEST_CASE_P(ArithmeticCheck,
-                              TypedScalarIndexCreatorTest,
-                              ScalarT);
+INSTANTIATE_TYPED_TEST_SUITE_P(ArithmeticCheck,
+                               TypedScalarIndexCreatorTest,
+                               ScalarT);

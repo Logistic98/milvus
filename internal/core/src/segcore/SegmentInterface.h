@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <deque>
 #include <memory>
 #include <string>
@@ -18,8 +19,8 @@
 #include <vector>
 #include <index/ScalarIndex.h>
 
-#include "DeletedRecord.h"
 #include "FieldIndexing.h"
+#include "common/Common.h"
 #include "common/Schema.h"
 #include "common/Span.h"
 #include "common/SystemProperty.h"
@@ -33,8 +34,17 @@
 #include "pb/schema.pb.h"
 #include "pb/segcore.pb.h"
 #include "index/IndexInfo.h"
+#include "index/SkipIndex.h"
+#include "mmap/Column.h"
+#include "index/TextMatchIndex.h"
 
 namespace milvus::segcore {
+
+struct SegmentStats {
+    // we stat the memory size used by the segment,
+    // including the insert data and delete data.
+    std::atomic<size_t> mem_size{};
+};
 
 // common interface of SegmentSealed and SegmentGrowing used by C API
 class SegmentInterface {
@@ -47,16 +57,28 @@ class SegmentInterface {
     virtual void
     FillTargetEntry(const query::Plan* plan, SearchResult& results) const = 0;
 
+    virtual bool
+    Contain(const PkType& pk) const = 0;
+
     virtual std::unique_ptr<SearchResult>
     Search(const query::Plan* Plan,
            const query::PlaceholderGroup* placeholder_group,
            Timestamp timestamp) const = 0;
 
     virtual std::unique_ptr<proto::segcore::RetrieveResults>
-    Retrieve(const query::RetrievePlan* Plan, Timestamp timestamp) const = 0;
+    Retrieve(tracer::TraceContext* trace_ctx,
+             const query::RetrievePlan* Plan,
+             Timestamp timestamp,
+             int64_t limit_size,
+             bool ignore_non_pk) const = 0;
 
-    // TODO: memory use is not correct when load string or load string index
-    virtual int64_t
+    virtual std::unique_ptr<proto::segcore::RetrieveResults>
+    Retrieve(tracer::TraceContext* trace_ctx,
+             const query::RetrievePlan* Plan,
+             const int64_t* offsets,
+             int64_t size) const = 0;
+
+    virtual size_t
     GetMemoryUsageInBytes() const = 0;
 
     virtual int64_t
@@ -72,9 +94,17 @@ class SegmentInterface {
     get_real_count() const = 0;
 
     virtual int64_t
-    PreDelete(int64_t size) = 0;
+    get_field_avg_size(FieldId field_id) const = 0;
 
-    virtual Status
+    virtual void
+    set_field_avg_size(FieldId field_id,
+                       int64_t num_rows,
+                       int64_t field_size) = 0;
+
+    //  virtual int64_t
+    //  PreDelete(int64_t size) = 0;
+
+    virtual SegcoreError
     Delete(int64_t reserved_offset,
            int64_t size,
            const IdArray* pks,
@@ -83,11 +113,26 @@ class SegmentInterface {
     virtual void
     LoadDeletedRecord(const LoadDeletedRecordInfo& info) = 0;
 
+    virtual void
+    LoadFieldData(const LoadFieldDataInfo& info) = 0;
+
     virtual int64_t
     get_segment_id() const = 0;
 
     virtual SegmentType
     type() const = 0;
+
+    virtual bool
+    HasRawData(int64_t field_id) const = 0;
+
+    virtual bool
+    is_nullable(FieldId field_id) const = 0;
+
+    virtual void
+    CreateTextIndex(FieldId field_id) = 0;
+
+    virtual index::TextMatchIndex*
+    GetTextIndex(FieldId field_id) const = 0;
 };
 
 // internal API for DSL calculation
@@ -100,6 +145,82 @@ class SegmentInternalInterface : public SegmentInterface {
         return static_cast<Span<T>>(chunk_data_impl(field_id, chunk_id));
     }
 
+    template <typename ViewType>
+    std::pair<std::vector<ViewType>, FixedVector<bool>>
+    chunk_view(FieldId field_id, int64_t chunk_id) const {
+        auto [string_views, valid_data] = chunk_view_impl(field_id, chunk_id);
+        if constexpr (std::is_same_v<ViewType, std::string_view>) {
+            return std::make_pair(std::move(string_views),
+                                  std::move(valid_data));
+        } else {
+            std::vector<ViewType> res;
+            res.reserve(string_views.size());
+            for (const auto& view : string_views) {
+                res.emplace_back(view);
+            }
+            return std::make_pair(res, valid_data);
+        }
+    }
+
+    template <typename ViewType>
+    std::pair<std::vector<ViewType>, FixedVector<bool>>
+    get_batch_views(FieldId field_id,
+                    int64_t chunk_id,
+                    int64_t start_offset,
+                    int64_t length) const {
+        if (this->type() == SegmentType::Growing) {
+            PanicInfo(ErrorCode::Unsupported,
+                      "get chunk views not supported for growing segment");
+        }
+        auto chunk_info =
+            get_chunk_buffer(field_id, chunk_id, start_offset, length);
+        BufferView buffer = chunk_info.first;
+        std::vector<ViewType> res;
+        res.reserve(length);
+        if (buffer.data_.index() == 1) {
+            char* pos = std::get<1>(buffer.data_).first;
+            for (size_t j = 0; j < length; j++) {
+                uint32_t size;
+                size = *reinterpret_cast<uint32_t*>(pos);
+                pos += sizeof(uint32_t);
+                res.emplace_back(ViewType(pos, size));
+                pos += size;
+            }
+        } else {
+            auto elements = std::get<0>(buffer.data_);
+            for (auto& element : elements) {
+                for (int i = element.start_; i < element.end_; i++) {
+                    res.emplace_back(ViewType(
+                        element.data_ + element.offsets_[i],
+                        element.offsets_[i + 1] - element.offsets_[i]));
+                }
+            }
+        }
+        return std::make_pair(res, chunk_info.second);
+    }
+
+    template <typename ViewType>
+    std::pair<std::vector<ViewType>, FixedVector<bool>>
+    get_views_by_offsets(FieldId field_id,
+                         int64_t chunk_id,
+                         const FixedVector<int32_t>& offsets) const {
+        if (this->type() == SegmentType::Growing) {
+            PanicInfo(ErrorCode::Unsupported,
+                      "get chunk views not supported for growing segment");
+        }
+        auto chunk_view = chunk_view_by_offsets(field_id, chunk_id, offsets);
+        if constexpr (std::is_same_v<ViewType, std::string_view>) {
+            return chunk_view;
+        } else {
+            std::vector<ViewType> res;
+            res.reserve(chunk_view.first.size());
+            for (const auto& view : chunk_view.first) {
+                res.emplace_back(view);
+            }
+            return {res, chunk_view.second};
+        }
+    }
+
     template <typename T>
     const index::ScalarIndex<T>&
     chunk_scalar_index(FieldId field_id, int64_t chunk_id) const {
@@ -109,6 +230,13 @@ class SegmentInternalInterface : public SegmentInterface {
         auto ptr = dynamic_cast<const IndexType*>(base_ptr);
         AssertInfo(ptr, "entry mismatch");
         return *ptr;
+    }
+
+    // union(segment_id, field_id) as unique id
+    virtual std::string
+    GetUniqueFieldId(int64_t field_id) const {
+        return std::to_string(get_segment_id()) + "_" +
+               std::to_string(field_id);
     }
 
     std::unique_ptr<SearchResult>
@@ -125,8 +253,17 @@ class SegmentInternalInterface : public SegmentInterface {
                     SearchResult& results) const override;
 
     std::unique_ptr<proto::segcore::RetrieveResults>
-    Retrieve(const query::RetrievePlan* plan,
-             Timestamp timestamp) const override;
+    Retrieve(tracer::TraceContext* trace_ctx,
+             const query::RetrievePlan* Plan,
+             Timestamp timestamp,
+             int64_t limit_size,
+             bool ignore_non_pk) const override;
+
+    std::unique_ptr<proto::segcore::RetrieveResults>
+    Retrieve(tracer::TraceContext* trace_ctx,
+             const query::RetrievePlan* Plan,
+             const int64_t* offsets,
+             int64_t size) const override;
 
     virtual bool
     HasIndex(FieldId field_id) const = 0;
@@ -140,6 +277,43 @@ class SegmentInternalInterface : public SegmentInterface {
     int64_t
     get_real_count() const override;
 
+    int64_t
+    get_field_avg_size(FieldId field_id) const override;
+
+    void
+    set_field_avg_size(FieldId field_id,
+                       int64_t num_rows,
+                       int64_t field_size) override;
+    virtual bool
+    is_chunked() const {
+        return false;
+    }
+
+    const SkipIndex&
+    GetSkipIndex() const;
+
+    void
+    LoadPrimitiveSkipIndex(FieldId field_id,
+                           int64_t chunk_id,
+                           DataType data_type,
+                           const void* chunk_data,
+                           const bool* valid_data,
+                           int64_t count);
+
+    template <typename T>
+    void
+    LoadStringSkipIndex(FieldId field_id,
+                        int64_t chunk_id,
+                        const T& var_column) {
+        skip_index_.LoadString(field_id, chunk_id, var_column);
+    }
+
+    virtual DataType
+    GetFieldDataType(FieldId fieldId) const = 0;
+
+    index::TextMatchIndex*
+    GetTextIndex(FieldId field_id) const override;
+
  public:
     virtual void
     vector_search(SearchInfo& search_info,
@@ -150,7 +324,7 @@ class SegmentInternalInterface : public SegmentInterface {
                   SearchResult& output) const = 0;
 
     virtual void
-    mask_with_delete(BitsetType& bitset,
+    mask_with_delete(BitsetTypeView& bitset,
                      int64_t ins_barrier,
                      Timestamp timestamp) const = 0;
 
@@ -162,13 +336,23 @@ class SegmentInternalInterface : public SegmentInterface {
     virtual int64_t
     num_chunk_data(FieldId field_id) const = 0;
 
+    virtual int64_t
+    num_rows_until_chunk(FieldId field_id, int64_t chunk_id) const = 0;
+
+    // bitset 1 means not hit. 0 means hit.
     virtual void
-    mask_with_timestamps(BitsetType& bitset_chunk,
+    mask_with_timestamps(BitsetTypeView& bitset_chunk,
                          Timestamp timestamp) const = 0;
 
     // count of chunks
     virtual int64_t
-    num_chunk() const = 0;
+    num_chunk(FieldId field_id) const = 0;
+
+    virtual int64_t
+    chunk_size(FieldId field_id, int64_t chunk_id) const = 0;
+
+    virtual std::pair<int64_t, int64_t>
+    get_chunk_by_offset(FieldId field_id, int64_t offset) const = 0;
 
     // element size in each chunk
     virtual int64_t
@@ -177,24 +361,95 @@ class SegmentInternalInterface : public SegmentInterface {
     virtual int64_t
     get_active_count(Timestamp ts) const = 0;
 
-    virtual std::vector<SegOffset>
-    search_ids(const BitsetType& view, Timestamp timestamp) const = 0;
-
-    virtual std::vector<SegOffset>
-    search_ids(const BitsetView& view, Timestamp timestamp) const = 0;
-
     virtual std::pair<std::unique_ptr<IdArray>, std::vector<SegOffset>>
     search_ids(const IdArray& id_array, Timestamp timestamp) const = 0;
 
+    /**
+     * Apply timestamp filtering on bitset, the query can't see an entity whose
+     * timestamp is bigger than the timestamp of query.
+     *
+     * @param bitset The final bitset after scalar filtering and delta filtering,
+     *  `false` means that the entity will be filtered out.
+     * @param timestamp The timestamp of query.
+     */
+    void
+    timestamp_filter(BitsetType& bitset, Timestamp timestamp) const;
+
+    /**
+     * Apply timestamp filtering on bitset, the query can't see an entity whose
+     * timestamp is bigger than the timestamp of query. The passed offsets are
+     * all candidate entities.
+     *
+     * @param bitset The final bitset after scalar filtering and delta filtering,
+     *  `true` means that the entity will be filtered out.
+     * @param offsets The segment offsets of all candidates.
+     * @param timestamp The timestamp of query.
+     */
+    void
+    timestamp_filter(BitsetType& bitset,
+                     const std::vector<int64_t>& offsets,
+                     Timestamp timestamp) const;
+
+    /**
+     * Sort all candidates in ascending order, and then return the limit smallest.
+     * Bitset is used to check if the candidate will be filtered out. `false_filtered_out`
+     * determines how to filter out candidates. If `false_filtered_out` is true, we will
+     * filter all candidates whose related bit is false.
+     *
+     * @param limit
+     * @param bitset
+     * @param false_filtered_out
+     * @return All candidates offsets.
+     */
+    virtual std::pair<std::vector<OffsetMap::OffsetType>, bool>
+    find_first(int64_t limit, const BitsetType& bitset) const = 0;
+
+    void
+    FillTargetEntry(
+        tracer::TraceContext* trace_ctx,
+        const query::RetrievePlan* plan,
+        const std::unique_ptr<proto::segcore::RetrieveResults>& results,
+        const int64_t* offsets,
+        int64_t size,
+        bool ignore_non_pk,
+        bool fill_ids) const;
+
+    // return whether field mmap or not
+    virtual bool
+    is_mmap_field(FieldId field_id) const = 0;
+
  protected:
+    // todo: use an Unified struct for all type in growing/seal segment to store data and valid_data.
     // internal API: return chunk_data in span
     virtual SpanBase
     chunk_data_impl(FieldId field_id, int64_t chunk_id) const = 0;
 
+    // internal API: return chunk string views in vector
+    virtual std::pair<std::vector<std::string_view>, FixedVector<bool>>
+    chunk_view_impl(FieldId field_id, int64_t chunk_id) const = 0;
+
+    // internal API: return buffer reference to field chunk data located from start_offset
+    virtual std::pair<BufferView, FixedVector<bool>>
+    get_chunk_buffer(FieldId field_id,
+                     int64_t chunk_id,
+                     int64_t start_offset,
+                     int64_t length) const = 0;
+
+    virtual std::pair<std::vector<std::string_view>, FixedVector<bool>>
+    chunk_view_by_offsets(FieldId field_id,
+                          int64_t chunk_id,
+                          const FixedVector<int32_t>& offsets) const = 0;
+
     // internal API: return chunk_index in span, support scalar index only
     virtual const index::IndexBase*
     chunk_index_impl(FieldId field_id, int64_t chunk_id) const = 0;
+    virtual void
+    check_search(const query::Plan* plan) const = 0;
 
+    virtual const ConcurrentVector<Timestamp>&
+    get_timestamps() const = 0;
+
+ public:
     // calculate output[i] = Vec[seg_offsets[i]}, where Vec binds to system_type
     virtual void
     bulk_subscript(SystemFieldType system_type,
@@ -208,11 +463,29 @@ class SegmentInternalInterface : public SegmentInterface {
                    const int64_t* seg_offsets,
                    int64_t count) const = 0;
 
-    virtual void
-    check_search(const query::Plan* plan) const = 0;
+    virtual std::unique_ptr<DataArray>
+    bulk_subscript(
+        FieldId field_ids,
+        const int64_t* seg_offsets,
+        int64_t count,
+        const std::vector<std::string>& dynamic_field_names) const = 0;
+
+    virtual std::vector<SegOffset>
+    search_pk(const PkType& pk, Timestamp timestamp) const = 0;
+
+    virtual std::vector<SegOffset>
+    search_pk(const PkType& pk, int64_t insert_barrier) const = 0;
 
  protected:
     mutable std::shared_mutex mutex_;
+    // fieldID -> std::pair<num_rows, avg_size>
+    std::unordered_map<FieldId, std::pair<int64_t, int64_t>>
+        variable_fields_avg_size_;  // bytes;
+    SkipIndex skip_index_;
+
+    // text-indexes used to do match.
+    std::unordered_map<FieldId, std::unique_ptr<index::TextMatchIndex>>
+        text_indexes_;
 };
 
 }  // namespace milvus::segcore

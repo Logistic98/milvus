@@ -7,17 +7,18 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
+	"github.com/stretchr/testify/assert"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	grpcproxyclient "github.com/milvus-io/milvus/internal/distributed/proxy/client"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/proxypb"
 	"github.com/milvus-io/milvus/internal/util/dependency"
 	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/proto/proxypb"
 	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
 	"github.com/milvus-io/milvus/pkg/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
-	"github.com/stretchr/testify/assert"
 )
 
 func TestProxyRpcLimit(t *testing.T) {
@@ -32,11 +33,12 @@ func TestProxyRpcLimit(t *testing.T) {
 	localMsg := true
 	factory := dependency.NewDefaultFactory(localMsg)
 
+	bt := paramtable.NewBaseTable(paramtable.SkipRemote(true))
 	base := &paramtable.ComponentParam{}
-	base.Init()
+	base.Init(bt)
 	var p paramtable.GrpcServerConfig
 	assert.NoError(t, err)
-	p.Init(typeutil.ProxyRole, &base.BaseTable)
+	p.Init(typeutil.ProxyRole, bt)
 	base.Save("proxy.grpc.serverMaxRecvSize", "1")
 
 	assert.Equal(t, p.ServerMaxRecvSize.GetAsInt(), 1)
@@ -52,9 +54,9 @@ func TestProxyRpcLimit(t *testing.T) {
 	go testServer.startGrpc(ctx, &wg, &p)
 	assert.NoError(t, testServer.waitForGrpcReady())
 	defer testServer.grpcServer.Stop()
-	client, err := grpcproxyclient.NewClient(ctx, "localhost:"+p.Port.GetValue())
+	client, err := grpcproxyclient.NewClient(ctx, "localhost:"+p.Port.GetValue(), 1)
 	assert.NoError(t, err)
-	proxy.stateCode.Store(commonpb.StateCode_Healthy)
+	proxy.UpdateStateCode(commonpb.StateCode_Healthy)
 
 	rates := make([]*internalpb.Rate, 0)
 
@@ -63,7 +65,12 @@ func TestProxyRpcLimit(t *testing.T) {
 			commonpbutil.WithMsgID(int64(0)),
 			commonpbutil.WithTimeStamp(0),
 		),
-		Rates: rates,
+		Rates: []*proxypb.CollectionRate{
+			{
+				Collection: 1,
+				Rates:      rates,
+			},
+		},
 	}
 	_, err = client.SetRates(ctx, req)
 	// should be limited because of the rpc limit

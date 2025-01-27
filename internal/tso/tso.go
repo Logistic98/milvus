@@ -36,11 +36,11 @@ import (
 	"unsafe"
 
 	"github.com/cockroachdb/errors"
-	"github.com/milvus-io/milvus/pkg/util/tsoutil"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/internal/kv"
+	"github.com/milvus-io/milvus/pkg/kv"
 	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/tsoutil"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
@@ -75,13 +75,13 @@ type timestampOracle struct {
 }
 
 func (t *timestampOracle) loadTimestamp() (time.Time, error) {
-	strData, err := t.txnKV.Load(t.key)
+	strData, err := t.txnKV.Load(context.TODO(), t.key)
 	if err != nil {
 		// intend to return nil
 		return typeutil.ZeroTime, nil
 	}
 
-	var binData = []byte(strData)
+	binData := []byte(strData)
 	if len(binData) == 0 {
 		return typeutil.ZeroTime, nil
 	}
@@ -91,9 +91,9 @@ func (t *timestampOracle) loadTimestamp() (time.Time, error) {
 // save timestamp, if lastTs is 0, we think the timestamp doesn't exist, so create it,
 // otherwise, update it.
 func (t *timestampOracle) saveTimestamp(ts time.Time) error {
-	//we use big endian here for compatibility issues
+	// we use big endian here for compatibility issues
 	data := typeutil.Uint64ToBytesBigEndian(uint64(ts.UnixNano()))
-	err := t.txnKV.Save(t.key, string(data))
+	err := t.txnKV.Save(context.TODO(), t.key, string(data))
 	if err != nil {
 		return errors.WithStack(err)
 	}

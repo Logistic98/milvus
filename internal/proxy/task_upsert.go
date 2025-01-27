@@ -24,22 +24,25 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-	"github.com/milvus-io/milvus-proto/go-api/msgpb"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/allocator"
+	"github.com/milvus-io/milvus/internal/util/function"
 	"github.com/milvus-io/milvus/pkg/common"
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/metrics"
 	"github.com/milvus-io/milvus/pkg/mq/msgstream"
 	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/util/merr"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/util/timerecord"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 type upsertTask struct {
+	baseTask
 	Condition
 
 	upsertMsg *msgstream.UpsertMsg
@@ -48,17 +51,22 @@ type upsertTask struct {
 
 	ctx context.Context
 
-	timestamps    []uint64
-	rowIDs        []int64
-	result        *milvuspb.MutationResult
-	idAllocator   *allocator.IDAllocator
-	segIDAssigner *segIDAssigner
-	collectionID  UniqueID
-	chMgr         channelsMgr
-	chTicker      channelsTimeTicker
-	vChannels     []vChan
-	pChannels     []pChan
-	schema        *schemapb.CollectionSchema
+	timestamps       []uint64
+	rowIDs           []int64
+	result           *milvuspb.MutationResult
+	idAllocator      *allocator.IDAllocator
+	segIDAssigner    *segIDAssigner
+	collectionID     UniqueID
+	chMgr            channelsMgr
+	chTicker         channelsTimeTicker
+	vChannels        []vChan
+	pChannels        []pChan
+	schema           *schemaInfo
+	partitionKeyMode bool
+	partitionKeys    *schemapb.FieldData
+	// automatic generate pk as new pk wehen autoID == true
+	// delete task need use the oldIds
+	oldIds *schemapb.IDs
 }
 
 // TraceCtx returns upsertTask context
@@ -98,10 +106,7 @@ func (it *upsertTask) EndTs() Timestamp {
 func (it *upsertTask) getPChanStats() (map[pChan]pChanStatistics, error) {
 	ret := make(map[pChan]pChanStatistics)
 
-	channels, err := it.getChannels()
-	if err != nil {
-		return ret, err
-	}
+	channels := it.getChannels()
 
 	beginTs := it.BeginTs()
 	endTs := it.EndTs()
@@ -115,43 +120,54 @@ func (it *upsertTask) getPChanStats() (map[pChan]pChanStatistics, error) {
 	return ret, nil
 }
 
-func (it *upsertTask) getChannels() ([]pChan, error) {
-	if len(it.pChannels) != 0 {
-		return it.pChannels, nil
-	}
-	collID, err := globalMetaCache.GetCollectionID(it.ctx, it.req.CollectionName)
+func (it *upsertTask) setChannels() error {
+	collID, err := globalMetaCache.GetCollectionID(it.ctx, it.req.GetDbName(), it.req.CollectionName)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	channels, err := it.chMgr.getChannels(collID)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	it.pChannels = channels
-	return channels, nil
+	return nil
+}
+
+func (it *upsertTask) getChannels() []pChan {
+	return it.pChannels
 }
 
 func (it *upsertTask) OnEnqueue() error {
+	if it.req.Base == nil {
+		it.req.Base = commonpbutil.NewMsgBase()
+	}
+	it.req.Base.MsgType = commonpb.MsgType_Upsert
+	it.req.Base.SourceID = paramtable.GetNodeID()
 	return nil
 }
 
 func (it *upsertTask) insertPreExecute(ctx context.Context) error {
 	collectionName := it.upsertMsg.InsertMsg.CollectionName
 	if err := validateCollectionName(collectionName); err != nil {
-		log.Error("valid collection name failed", zap.String("collectionName", collectionName), zap.Error(err))
+		log.Ctx(ctx).Error("valid collection name failed", zap.String("collectionName", collectionName), zap.Error(err))
 		return err
 	}
 
-	partitionTag := it.upsertMsg.InsertMsg.PartitionName
-	if err := validatePartitionTag(partitionTag, true); err != nil {
-		log.Error("valid partition name failed", zap.String("partition name", partitionTag), zap.Error(err))
-		return err
+	// Calculate embedding fields
+	if function.HasNonBM25Functions(it.schema.CollectionSchema.Functions, []int64{}) {
+		exec, err := function.NewFunctionExecutor(it.schema.CollectionSchema)
+		if err != nil {
+			return err
+		}
+		if err := exec.ProcessInsert(it.upsertMsg.InsertMsg); err != nil {
+			return err
+		}
 	}
 	rowNums := uint32(it.upsertMsg.InsertMsg.NRows())
 	// set upsertTask.insertRequest.rowIDs
 	tr := timerecord.NewTimeRecorder("applyPK")
 	rowIDBegin, rowIDEnd, _ := it.idAllocator.Alloc(rowNums)
-	metrics.ProxyApplyPrimaryKeyLatency.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10)).Observe(float64(tr.ElapseSpan()))
+	metrics.ProxyApplyPrimaryKeyLatency.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10)).Observe(float64(tr.ElapseSpan().Milliseconds()))
 
 	it.upsertMsg.InsertMsg.RowIDs = make([]UniqueID, rowNums)
 	it.rowIDs = make([]UniqueID, rowNums)
@@ -175,26 +191,50 @@ func (it *upsertTask) insertPreExecute(ctx context.Context) error {
 	}
 	it.result.SuccIndex = sliceIndex
 
-	// check primaryFieldData whether autoID is true or not
-	// only allow support autoID == false
-	var err error
-	it.result.IDs, err = checkPrimaryFieldData(it.schema, it.result, it.upsertMsg.InsertMsg, false)
-	log := log.Ctx(ctx).With(zap.String("collectionName", it.upsertMsg.InsertMsg.CollectionName))
-	if err != nil {
-		log.Error("check primary field data and hash primary key failed when upsert",
-			zap.Error(err))
-		return err
-	}
-	// set field ID to insert field data
-	err = fillFieldIDBySchema(it.upsertMsg.InsertMsg.GetFieldsData(), it.schema)
-	if err != nil {
-		log.Error("insert set fieldID to fieldData failed when upsert",
-			zap.Error(err))
-		return err
+	if it.schema.EnableDynamicField {
+		err := checkDynamicFieldData(it.schema.CollectionSchema, it.upsertMsg.InsertMsg)
+		if err != nil {
+			return err
+		}
 	}
 
-	if err := newValidateUtil(withNANCheck()).
-		Validate(it.upsertMsg.InsertMsg.GetFieldsData(), it.schema, it.upsertMsg.InsertMsg.NRows()); err != nil {
+	// use the passed pk as new pk when autoID == false
+	// automatic generate pk as new pk wehen autoID == true
+	var err error
+	it.result.IDs, it.oldIds, err = checkUpsertPrimaryFieldData(it.schema.CollectionSchema, it.upsertMsg.InsertMsg)
+	log := log.Ctx(ctx).With(zap.String("collectionName", it.upsertMsg.InsertMsg.CollectionName))
+	if err != nil {
+		log.Warn("check primary field data and hash primary key failed when upsert",
+			zap.Error(err))
+		return merr.WrapErrAsInputErrorWhen(err, merr.ErrParameterInvalid)
+	}
+	// set field ID to insert field data
+	err = fillFieldPropertiesBySchema(it.upsertMsg.InsertMsg.GetFieldsData(), it.schema.CollectionSchema)
+	if err != nil {
+		log.Warn("insert set fieldID to fieldData failed when upsert",
+			zap.Error(err))
+		return merr.WrapErrAsInputErrorWhen(err, merr.ErrParameterInvalid)
+	}
+
+	if it.partitionKeyMode {
+		fieldSchema, _ := typeutil.GetPartitionKeyFieldSchema(it.schema.CollectionSchema)
+		it.partitionKeys, err = getPartitionKeyFieldData(fieldSchema, it.upsertMsg.InsertMsg)
+		if err != nil {
+			log.Warn("get partition keys from insert request failed",
+				zap.String("collectionName", collectionName),
+				zap.Error(err))
+			return err
+		}
+	} else {
+		partitionTag := it.upsertMsg.InsertMsg.PartitionName
+		if err = validatePartitionTag(partitionTag, true); err != nil {
+			log.Warn("valid partition name failed", zap.String("partition name", partitionTag), zap.Error(err))
+			return err
+		}
+	}
+
+	if err := newValidateUtil(withNANCheck(), withOverflowCheck(), withMaxLenCheck()).
+		Validate(it.upsertMsg.InsertMsg.GetFieldsData(), it.schema.schemaHelper, it.upsertMsg.InsertMsg.NRows()); err != nil {
 		return err
 	}
 
@@ -209,10 +249,10 @@ func (it *upsertTask) deletePreExecute(ctx context.Context) error {
 		zap.String("collectionName", collName))
 
 	if err := validateCollectionName(collName); err != nil {
-		log.Info("Invalid collection name", zap.Error(err))
+		log.Info("Invalid collectionName", zap.Error(err))
 		return err
 	}
-	collID, err := globalMetaCache.GetCollectionID(ctx, collName)
+	collID, err := globalMetaCache.GetCollectionID(ctx, it.req.GetDbName(), collName)
 	if err != nil {
 		log.Info("Failed to get collection id", zap.Error(err))
 		return err
@@ -220,21 +260,24 @@ func (it *upsertTask) deletePreExecute(ctx context.Context) error {
 	it.upsertMsg.DeleteMsg.CollectionID = collID
 	it.collectionID = collID
 
-	// If partitionName is not empty, partitionID will be set.
-	if len(it.upsertMsg.DeleteMsg.PartitionName) > 0 {
+	if it.partitionKeyMode {
+		// multi entities with same pk and diff partition keys may be hashed to multi physical partitions
+		// if deleteMsg.partitionID = common.InvalidPartition,
+		// all segments with this pk under the collection will have the delete record
+		it.upsertMsg.DeleteMsg.PartitionID = common.AllPartitionsID
+	} else {
+		// partition name could be defaultPartitionName or name specified by sdk
 		partName := it.upsertMsg.DeleteMsg.PartitionName
 		if err := validatePartitionTag(partName, true); err != nil {
-			log.Info("Invalid partition name", zap.String("partitionName", partName), zap.Error(err))
+			log.Warn("Invalid partition name", zap.String("partitionName", partName), zap.Error(err))
 			return err
 		}
-		partID, err := globalMetaCache.GetPartitionID(ctx, collName, partName)
+		partID, err := globalMetaCache.GetPartitionID(ctx, it.req.GetDbName(), collName, partName)
 		if err != nil {
-			log.Info("Failed to get partition id", zap.String("collectionName", collName), zap.String("partitionName", partName), zap.Error(err))
+			log.Warn("Failed to get partition id", zap.String("collectionName", collName), zap.String("partitionName", partName), zap.Error(err))
 			return err
 		}
 		it.upsertMsg.DeleteMsg.PartitionID = partID
-	} else {
-		it.upsertMsg.DeleteMsg.PartitionID = common.InvalidPartitionID
 	}
 
 	it.upsertMsg.DeleteMsg.Timestamps = make([]uint64, it.upsertMsg.DeleteMsg.NumRows)
@@ -248,28 +291,64 @@ func (it *upsertTask) deletePreExecute(ctx context.Context) error {
 func (it *upsertTask) PreExecute(ctx context.Context) error {
 	ctx, sp := otel.Tracer(typeutil.ProxyRole).Start(ctx, "Proxy-Upsert-PreExecute")
 	defer sp.End()
-	log := log.Ctx(ctx).With(zap.String("collectionName", it.req.CollectionName))
+
+	collectionName := it.req.CollectionName
+	log := log.Ctx(ctx).With(zap.String("collectionName", collectionName))
 
 	it.result = &milvuspb.MutationResult{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-		},
+		Status: merr.Success(),
 		IDs: &schemapb.IDs{
 			IdField: nil,
 		},
 		Timestamp: it.EndTs(),
 	}
 
-	schema, err := globalMetaCache.GetCollectionSchema(ctx, it.req.CollectionName)
+	replicateID, err := GetReplicateID(ctx, it.req.GetDbName(), collectionName)
 	if err != nil {
-		log.Info("Failed to get collection schema", zap.Error(err))
+		log.Warn("get replicate info failed", zap.String("collectionName", collectionName), zap.Error(err))
+		return merr.WrapErrAsInputErrorWhen(err, merr.ErrCollectionNotFound, merr.ErrDatabaseNotFound)
+	}
+	if replicateID != "" {
+		return merr.WrapErrCollectionReplicateMode("upsert")
+	}
+
+	schema, err := globalMetaCache.GetCollectionSchema(ctx, it.req.GetDbName(), collectionName)
+	if err != nil {
+		log.Warn("Failed to get collection schema",
+			zap.String("collectionName", collectionName),
+			zap.Error(err))
 		return err
 	}
 	it.schema = schema
 
+	it.partitionKeyMode, err = isPartitionKeyMode(ctx, it.req.GetDbName(), collectionName)
+	if err != nil {
+		log.Warn("check partition key mode failed",
+			zap.String("collectionName", collectionName),
+			zap.Error(err))
+		return err
+	}
+	if it.partitionKeyMode {
+		if len(it.req.GetPartitionName()) > 0 {
+			return errors.New("not support manually specifying the partition names if partition key mode is used")
+		}
+	} else {
+		// set default partition name if not use partition key
+		// insert to _default partition
+		partitionTag := it.req.GetPartitionName()
+		if len(partitionTag) <= 0 {
+			pinfo, err := globalMetaCache.GetPartitionInfo(ctx, it.req.GetDbName(), collectionName, "")
+			if err != nil {
+				log.Warn("get partition info failed", zap.String("collectionName", collectionName), zap.Error(err))
+				return err
+			}
+			it.req.PartitionName = pinfo.name
+		}
+	}
+
 	it.upsertMsg = &msgstream.UpsertMsg{
 		InsertMsg: &msgstream.InsertMsg{
-			InsertRequest: msgpb.InsertRequest{
+			InsertRequest: &msgpb.InsertRequest{
 				Base: commonpbutil.NewMsgBase(
 					commonpbutil.WithMsgType(commonpb.MsgType_Insert),
 					commonpbutil.WithSourceID(paramtable.GetNodeID()),
@@ -279,10 +358,11 @@ func (it *upsertTask) PreExecute(ctx context.Context) error {
 				FieldsData:     it.req.FieldsData,
 				NumRows:        uint64(it.req.NumRows),
 				Version:        msgpb.InsertDataVersion_ColumnBased,
+				DbName:         it.req.DbName,
 			},
 		},
 		DeleteMsg: &msgstream.DeleteMsg{
-			DeleteRequest: msgpb.DeleteRequest{
+			DeleteRequest: &msgpb.DeleteRequest{
 				Base: commonpbutil.NewMsgBase(
 					commonpbutil.WithMsgType(commonpb.MsgType_Delete),
 					commonpbutil.WithSourceID(paramtable.GetNodeID()),
@@ -297,20 +377,20 @@ func (it *upsertTask) PreExecute(ctx context.Context) error {
 	}
 	err = it.insertPreExecute(ctx)
 	if err != nil {
-		log.Info("Fail to insertPreExecute", zap.Error(err))
+		log.Warn("Fail to insertPreExecute", zap.Error(err))
 		return err
 	}
 
 	err = it.deletePreExecute(ctx)
 	if err != nil {
-		log.Info("Fail to deletePreExecute", zap.Error(err))
+		log.Warn("Fail to deletePreExecute", zap.Error(err))
 		return err
 	}
 
 	it.result.DeleteCnt = it.upsertMsg.DeleteMsg.NumRows
 	it.result.InsertCnt = int64(it.upsertMsg.InsertMsg.NumRows)
 	if it.result.DeleteCnt != it.result.InsertCnt {
-		log.Error("DeleteCnt and InsertCnt are not the same when upsert",
+		log.Info("DeleteCnt and InsertCnt are not the same when upsert",
 			zap.Int64("DeleteCnt", it.result.DeleteCnt),
 			zap.Int64("InsertCnt", it.result.InsertCnt))
 	}
@@ -324,39 +404,25 @@ func (it *upsertTask) insertExecute(ctx context.Context, msgPack *msgstream.MsgP
 	defer tr.Elapse("insert execute done when insertExecute")
 
 	collectionName := it.upsertMsg.InsertMsg.CollectionName
-	collID, err := globalMetaCache.GetCollectionID(ctx, collectionName)
+	collID, err := globalMetaCache.GetCollectionID(ctx, it.req.GetDbName(), collectionName)
 	if err != nil {
 		return err
 	}
 	it.upsertMsg.InsertMsg.CollectionID = collID
 	log := log.Ctx(ctx).With(
 		zap.Int64("collectionID", collID))
-	var partitionID UniqueID
-	if len(it.upsertMsg.InsertMsg.PartitionName) > 0 {
-		partitionID, err = globalMetaCache.GetPartitionID(ctx, collectionName, it.req.PartitionName)
-		if err != nil {
-			return err
-		}
-	} else {
-		partitionID, err = globalMetaCache.GetPartitionID(ctx, collectionName, Params.CommonCfg.DefaultPartitionName.GetValue())
-		if err != nil {
-			return err
-		}
-	}
-	it.upsertMsg.InsertMsg.PartitionID = partitionID
 	getCacheDur := tr.RecordSpan()
 
-	_, err = it.chMgr.getOrCreateDmlStream(collID)
+	_, err = it.chMgr.getOrCreateDmlStream(ctx, collID)
 	if err != nil {
 		return err
 	}
 	getMsgStreamDur := tr.RecordSpan()
 	channelNames, err := it.chMgr.getVChannels(collID)
 	if err != nil {
-		log.Error("get vChannels failed when insertExecute",
+		log.Warn("get vChannels failed when insertExecute",
 			zap.Error(err))
-		it.result.Status.ErrorCode = commonpb.ErrorCode_UnexpectedError
-		it.result.Status.Reason = err.Error()
+		it.result.Status = merr.Status(err)
 		return err
 	}
 
@@ -364,19 +430,22 @@ func (it *upsertTask) insertExecute(ctx context.Context, msgPack *msgstream.MsgP
 		zap.String("collection", it.req.GetCollectionName()),
 		zap.String("partition", it.req.GetPartitionName()),
 		zap.Int64("collection_id", collID),
-		zap.Int64("partition_id", partitionID),
 		zap.Strings("virtual_channels", channelNames),
 		zap.Int64("task_id", it.ID()),
 		zap.Duration("get cache duration", getCacheDur),
 		zap.Duration("get msgStream duration", getMsgStreamDur))
 
 	// assign segmentID for insert data and repack data by segmentID
-	insertMsgPack, err := assignSegmentID(it.TraceCtx(), it.upsertMsg.InsertMsg, it.result, channelNames, it.idAllocator, it.segIDAssigner)
+	var insertMsgPack *msgstream.MsgPack
+	if it.partitionKeys == nil {
+		insertMsgPack, err = repackInsertData(it.TraceCtx(), channelNames, it.upsertMsg.InsertMsg, it.result, it.idAllocator, it.segIDAssigner)
+	} else {
+		insertMsgPack, err = repackInsertDataWithPartitionKey(it.TraceCtx(), channelNames, it.partitionKeys, it.upsertMsg.InsertMsg, it.result, it.idAllocator, it.segIDAssigner)
+	}
 	if err != nil {
-		log.Error("assign segmentID and repack insert data failed when insertExecute",
+		log.Warn("assign segmentID and repack insert data failed when insertExecute",
 			zap.Error(err))
-		it.result.Status.ErrorCode = commonpb.ErrorCode_UnexpectedError
-		it.result.Status.Reason = err.Error()
+		it.result.Status = merr.Status(err)
 		return err
 	}
 	assignSegmentIDDur := tr.RecordSpan()
@@ -400,11 +469,10 @@ func (it *upsertTask) deleteExecute(ctx context.Context, msgPack *msgstream.MsgP
 	channelNames, err := it.chMgr.getVChannels(collID)
 	if err != nil {
 		log.Warn("get vChannels failed when deleteExecute", zap.Error(err))
-		it.result.Status.ErrorCode = commonpb.ErrorCode_UnexpectedError
-		it.result.Status.Reason = err.Error()
+		it.result.Status = merr.Status(err)
 		return err
 	}
-	it.upsertMsg.DeleteMsg.PrimaryKeys = it.result.IDs
+	it.upsertMsg.DeleteMsg.PrimaryKeys = it.oldIds
 	it.upsertMsg.DeleteMsg.HashValues = typeutil.HashPK2Channels(it.upsertMsg.DeleteMsg.PrimaryKeys, channelNames)
 
 	// repack delete msg by dmChannel
@@ -420,9 +488,9 @@ func (it *upsertTask) deleteExecute(ctx context.Context, msgPack *msgstream.MsgP
 		if !ok {
 			msgid, err := it.idAllocator.AllocOne()
 			if err != nil {
-				errors.Wrap(err, "failed to allocate MsgID for delete of upsert")
+				return errors.Wrap(err, "failed to allocate MsgID for delete of upsert")
 			}
-			sliceRequest := msgpb.DeleteRequest{
+			sliceRequest := &msgpb.DeleteRequest{
 				Base: commonpbutil.NewMsgBase(
 					commonpbutil.WithMsgType(commonpb.MsgType_Delete),
 					commonpbutil.WithTimeStamp(ts),
@@ -478,7 +546,7 @@ func (it *upsertTask) Execute(ctx context.Context) (err error) {
 	log := log.Ctx(ctx).With(zap.String("collectionName", it.req.CollectionName))
 
 	tr := timerecord.NewTimeRecorder(fmt.Sprintf("proxy execute upsert %d", it.ID()))
-	stream, err := it.chMgr.getOrCreateDmlStream(it.collectionID)
+	stream, err := it.chMgr.getOrCreateDmlStream(ctx, it.collectionID)
 	if err != nil {
 		return err
 	}
@@ -488,21 +556,20 @@ func (it *upsertTask) Execute(ctx context.Context) (err error) {
 	}
 	err = it.insertExecute(ctx, msgPack)
 	if err != nil {
-		log.Info("Fail to insertExecute", zap.Error(err))
+		log.Warn("Fail to insertExecute", zap.Error(err))
 		return err
 	}
 
 	err = it.deleteExecute(ctx, msgPack)
 	if err != nil {
-		log.Info("Fail to deleteExecute", zap.Error(err))
+		log.Warn("Fail to deleteExecute", zap.Error(err))
 		return err
 	}
 
 	tr.RecordSpan()
-	err = stream.Produce(msgPack)
+	err = stream.Produce(ctx, msgPack)
 	if err != nil {
-		it.result.Status.ErrorCode = commonpb.ErrorCode_UnexpectedError
-		it.result.Status.Reason = err.Error()
+		it.result.Status = merr.Status(err)
 		return err
 	}
 	sendMsgDur := tr.RecordSpan()

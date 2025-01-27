@@ -19,6 +19,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/util/merr"
 )
 
@@ -26,34 +27,69 @@ import (
 // fn is the func to run.
 // Option can control the retry times and timeout.
 func Do(ctx context.Context, fn func() error, opts ...Option) error {
-	log := log.Ctx(ctx)
+	if !funcutil.CheckCtxValid(ctx) {
+		return ctx.Err()
+	}
 
+	log := log.Ctx(ctx)
 	c := newDefaultConfig()
 
 	for _, opt := range opts {
 		opt(c)
 	}
 
-	var el error
+	var lastErr error
 
-	for i := uint(0); i < c.attempts; i++ {
+	for i := uint(0); c.attempts == 0 || i < c.attempts; i++ {
 		if err := fn(); err != nil {
-			if i%10 == 0 {
-				log.Error("retry func failed", zap.Uint("retry time", i), zap.Error(err))
+			if i%4 == 0 {
+				log.Warn("retry func failed", zap.Uint("retried", i), zap.Error(err))
 			}
-
-			err = errors.Wrapf(err, "attempt #%d", i)
-			el = merr.Combine(el, err)
 
 			if !IsRecoverable(err) {
-				return el
+				isContextErr := errors.IsAny(err, context.Canceled, context.DeadlineExceeded)
+				log.Warn("retry func failed, not be recoverable",
+					zap.Uint("retried", i),
+					zap.Uint("attempt", c.attempts),
+					zap.Bool("isContextErr", isContextErr),
+				)
+				if isContextErr && lastErr != nil {
+					return lastErr
+				}
+				return err
 			}
+			if c.isRetryErr != nil && !c.isRetryErr(err) {
+				log.Warn("retry func failed, not be retryable",
+					zap.Uint("retried", i),
+					zap.Uint("attempt", c.attempts),
+				)
+				return err
+			}
+
+			deadline, ok := ctx.Deadline()
+			if ok && time.Until(deadline) < c.sleep {
+				isContextErr := errors.IsAny(err, context.Canceled, context.DeadlineExceeded)
+				log.Warn("retry func failed, deadline",
+					zap.Uint("retried", i),
+					zap.Uint("attempt", c.attempts),
+					zap.Bool("isContextErr", isContextErr),
+				)
+				if isContextErr && lastErr != nil {
+					return lastErr
+				}
+				return err
+			}
+
+			lastErr = err
 
 			select {
 			case <-time.After(c.sleep):
 			case <-ctx.Done():
-				el = merr.Combine(el, errors.Wrapf(ctx.Err(), "context done during sleep after run#%d", i))
-				return el
+				log.Warn("retry func failed, ctx done",
+					zap.Uint("retried", i),
+					zap.Uint("attempt", c.attempts),
+				)
+				return lastErr
 			}
 
 			c.sleep *= 2
@@ -64,7 +100,69 @@ func Do(ctx context.Context, fn func() error, opts ...Option) error {
 			return nil
 		}
 	}
-	return el
+	if lastErr != nil {
+		log.Warn("retry func failed, reach max retry",
+			zap.Uint("attempt", c.attempts),
+		)
+	}
+	return lastErr
+}
+
+// Do will run function with retry mechanism.
+// fn is the func to run, return err and shouldRetry flag.
+// Option can control the retry times and timeout.
+func Handle(ctx context.Context, fn func() (bool, error), opts ...Option) error {
+	if !funcutil.CheckCtxValid(ctx) {
+		return ctx.Err()
+	}
+
+	log := log.Ctx(ctx)
+	c := newDefaultConfig()
+
+	for _, opt := range opts {
+		opt(c)
+	}
+
+	var lastErr error
+	for i := uint(0); i < c.attempts; i++ {
+		if shouldRetry, err := fn(); err != nil {
+			if i%4 == 0 {
+				log.Warn("retry func failed", zap.Uint("retried", i), zap.Error(err))
+			}
+
+			if !shouldRetry {
+				if errors.IsAny(err, context.Canceled, context.DeadlineExceeded) && lastErr != nil {
+					return lastErr
+				}
+				return err
+			}
+
+			deadline, ok := ctx.Deadline()
+			if ok && time.Until(deadline) < c.sleep {
+				// to avoid sleep until ctx done
+				if errors.IsAny(err, context.Canceled, context.DeadlineExceeded) && lastErr != nil {
+					return lastErr
+				}
+				return err
+			}
+
+			lastErr = err
+
+			select {
+			case <-time.After(c.sleep):
+			case <-ctx.Done():
+				return lastErr
+			}
+
+			c.sleep *= 2
+			if c.sleep > c.maxSleepTime {
+				c.sleep = c.maxSleepTime
+			}
+		} else {
+			return nil
+		}
+	}
+	return lastErr
 }
 
 // errUnrecoverable is error instance for unrecoverable.

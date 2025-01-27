@@ -17,17 +17,22 @@ func NewChunkManagerFactoryWithParam(params *paramtable.ComponentParam) *ChunkMa
 	if params.CommonCfg.StorageType.GetValue() == "local" {
 		return NewChunkManagerFactory("local", RootPath(params.LocalStorageCfg.Path.GetValue()))
 	}
-	return NewChunkManagerFactory("minio",
+	return NewChunkManagerFactory(params.CommonCfg.StorageType.GetValue(),
 		RootPath(params.MinioCfg.RootPath.GetValue()),
 		Address(params.MinioCfg.Address.GetValue()),
 		AccessKeyID(params.MinioCfg.AccessKeyID.GetValue()),
 		SecretAccessKeyID(params.MinioCfg.SecretAccessKey.GetValue()),
 		UseSSL(params.MinioCfg.UseSSL.GetAsBool()),
+		SslCACert(params.MinioCfg.SslCACert.GetValue()),
 		BucketName(params.MinioCfg.BucketName.GetValue()),
 		UseIAM(params.MinioCfg.UseIAM.GetAsBool()),
 		CloudProvider(params.MinioCfg.CloudProvider.GetValue()),
 		IAMEndpoint(params.MinioCfg.IAMEndpoint.GetValue()),
-		CreateBucket(true))
+		UseVirtualHost(params.MinioCfg.UseVirtualHost.GetAsBool()),
+		Region(params.MinioCfg.Region.GetValue()),
+		RequestTimeout(params.MinioCfg.RequestTimeoutMs.GetAsInt64()),
+		CreateBucket(true),
+		GcpCredentialJSON(params.MinioCfg.GcpCredentialJSON.GetValue()))
 }
 
 func NewChunkManagerFactory(persistentStorage string, opts ...Option) *ChunkManagerFactory {
@@ -45,8 +50,8 @@ func (f *ChunkManagerFactory) newChunkManager(ctx context.Context, engine string
 	switch engine {
 	case "local":
 		return NewLocalChunkManager(RootPath(f.config.rootPath)), nil
-	case "minio":
-		return newMinioChunkManagerWithConfig(ctx, f.config)
+	case "remote", "minio", "opendal":
+		return NewRemoteChunkManager(ctx, f.config)
 	default:
 		return nil, errors.New("no chunk manager implemented with engine: " + engine)
 	}

@@ -24,14 +24,13 @@ import (
 
 	"github.com/cockroachdb/errors"
 
+	kvfactory "github.com/milvus-io/milvus/internal/util/dependency/kv"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
 var Params *paramtable.ComponentParam = paramtable.Get()
 
-var (
-	ErrFailedAllocateID = errors.New("failed to allocate ID")
-)
+var ErrFailedAllocateID = errors.New("failed to allocate ID")
 
 // GenerateEtcdConfig returns a etcd config with a random root path,
 // NOTE: for test only
@@ -40,7 +39,11 @@ func GenerateEtcdConfig() *paramtable.EtcdConfig {
 	rand.Seed(time.Now().UnixNano())
 	suffix := "-test-querycoord" + strconv.FormatInt(rand.Int63(), 10)
 
-	Params.BaseTable.Save("etcd.rootPath", config.MetaRootPath.GetValue()+suffix)
+	Params.Save("etcd.rootPath", config.MetaRootPath.GetValue()+suffix)
+	// Due to switching etcd path mid test cases, we need to update the cached client
+	// that is used by default
+	kvfactory.CloseEtcdClient()
+
 	return &Params.EtcdCfg
 }
 

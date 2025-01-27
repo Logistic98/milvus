@@ -18,13 +18,21 @@
 
 #include <memory>
 #include <boost/dynamic_bitset.hpp>
+#include "common/FieldData.h"
+#include "common/EasyAssert.h"
+#include "knowhere/comp/index_param.h"
 #include "knowhere/dataset.h"
+#include "knowhere/index/index_factory.h"
+#include "common/Tracer.h"
 #include "common/Types.h"
+#include "index/Meta.h"
+#include "index/IndexStats.h"
 
 namespace milvus::index {
 
 class IndexBase {
  public:
+    IndexBase() = default;
     virtual ~IndexBase() = default;
 
     virtual BinarySet
@@ -34,17 +42,41 @@ class IndexBase {
     Load(const BinarySet& binary_set, const Config& config = {}) = 0;
 
     virtual void
-    BuildWithRawData(size_t n,
-                     const void* values,
-                     const Config& config = {}) = 0;
+    Load(milvus::tracer::TraceContext ctx, const Config& config = {}) = 0;
+
+    virtual void
+    BuildWithRawDataForUT(size_t n,
+                          const void* values,
+                          const Config& config = {}) = 0;
 
     virtual void
     BuildWithDataset(const DatasetPtr& dataset, const Config& config = {}) = 0;
 
+    virtual void
+    Build(const Config& config = {}) = 0;
+
     virtual int64_t
     Count() = 0;
 
+    virtual IndexStatsPtr
+    Upload(const Config& config = {}) = 0;
+
+    virtual const bool
+    HasRawData() const = 0;
+
+    virtual bool
+    IsMmapSupported() const = 0;
+
+    const IndexType&
+    Type() const {
+        return index_type_;
+    }
+
  protected:
+    explicit IndexBase(IndexType index_type)
+        : index_type_(std::move(index_type)) {
+    }
+
     IndexType index_type_ = "";
 };
 

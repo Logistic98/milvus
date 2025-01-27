@@ -26,10 +26,6 @@ if [[ $(uname -s) == "Darwin" ]]; then
     export MallocNanoZone=0
 fi
 
-if [[ "$(uname -m)" == "arm64" ]]; then
-  APPLE_SILICON_FLAG="-tags dynamic"
-fi
-
 # ignore MinIO,S3 unittests
 MILVUS_DIR="${ROOT_DIR}/internal/"
 PKG_DIR="${ROOT_DIR}/pkg/"
@@ -64,106 +60,120 @@ done
 
 function test_proxy()
 {
-go test -race -cover ${APPLE_SILICON_FLAG} "${MILVUS_DIR}/proxy/..." -failfast -count=1
-go test -race -cover ${APPLE_SILICON_FLAG} "${MILVUS_DIR}/distributed/proxy/..." -failfast -count=1
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/proxy/..." -failfast -count=1 -ldflags="-r ${RPATH}"
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/distributed/proxy/..." -failfast -count=1 -ldflags="-r ${RPATH}"
 }
 
 function test_querynode()
 {
-go test -race -cover ${APPLE_SILICON_FLAG} "${MILVUS_DIR}/querynode/..." -failfast -count=1
-go test -race -cover ${APPLE_SILICON_FLAG} "${MILVUS_DIR}/distributed/querynodev2/..." -failfast -count=1
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/querynodev2/..." -failfast -count=1 -ldflags="-r ${RPATH}"
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/distributed/querynode/..." -failfast -count=1 -ldflags="-r ${RPATH}"
 }
 
 
 function test_kv()
 {
-go test -race -cover ${APPLE_SILICON_FLAG} "${MILVUS_DIR}/kv/..." -failfast -count=1
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/kv/..." -failfast -count=1 -ldflags="-r ${RPATH}"
 }
 
 function test_mq()
 {
-go test -race -cover ${APPLE_SILICON_FLAG} $(go list "${MILVUS_DIR}/mq/..." | grep -v kafka)  -failfast -count=1
+go test -race -cover -tags dynamic,test $(go list "${MILVUS_DIR}/mq/..." | grep -v kafka)  -failfast -count=1 -ldflags="-r ${RPATH}"
 }
 
 function test_storage()
 {
-go test -race -cover ${APPLE_SILICON_FLAG} "${MILVUS_DIR}/storage" -failfast -count=1
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/storage" -failfast -count=1 -ldflags="-r ${RPATH}"
 }
 
 function test_allocator()
 {
-go test -race -cover ${APPLE_SILICON_FLAG} "${MILVUS_DIR}/allocator/..." -failfast -count=1
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/allocator/..." -failfast -count=1 -ldflags="-r ${RPATH}"
 }
 
 function test_tso()
 {
-go test -race -cover ${APPLE_SILICON_FLAG} "${MILVUS_DIR}/tso/..." -failfast -count=1
-}
-
-function test_config()
-{
-go test -race -cover ${APPLE_SILICON_FLAG} "${MILVUS_DIR}/config/..." -failfast -count=1
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/tso/..." -failfast -count=1 -ldflags="-r ${RPATH}"
 }
 
 function test_util()
 {
-go test -race -cover ${APPLE_SILICON_FLAG} "${MILVUS_DIR}/util/funcutil/..." -failfast -count=1
-go test -race -cover ${APPLE_SILICON_FLAG} "${MILVUS_DIR}/util/paramtable/..." -failfast -count=1
-go test -race -cover ${APPLE_SILICON_FLAG} "${MILVUS_DIR}/util/retry/..." -failfast -count=1
-go test -race -cover ${APPLE_SILICON_FLAG} "${MILVUS_DIR}/util/sessionutil/..." -failfast -count=1
-go test -race -cover ${APPLE_SILICON_FLAG} "${MILVUS_DIR}/util/typeutil/..." -failfast -count=1
-go test -race -cover ${APPLE_SILICON_FLAG} "${MILVUS_DIR}/util/importutil/..." -failfast -count=1
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/util/funcutil/..." -failfast -count=1  -ldflags="-r ${RPATH}"
+pushd pkg
+go test -race -cover -tags dynamic,test "${PKG_DIR}/util/retry/..." -failfast -count=1  -ldflags="-r ${RPATH}"
+popd
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/util/sessionutil/..." -failfast -count=1  -ldflags="-r ${RPATH}"
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/util/typeutil/..." -failfast -count=1  -ldflags="-r ${RPATH}"
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/util/importutilv2/..." -failfast -count=1  -ldflags="-r ${RPATH}"
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/util/proxyutil/..." -failfast -count=1  -ldflags="-r ${RPATH}"
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/util/initcore/..." -failfast -count=1  -ldflags="-r ${RPATH}"
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/util/cgo/..." -failfast -count=1  -ldflags="-r ${RPATH}"
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/util/streamingutil/..." -failfast -count=1  -ldflags="-r ${RPATH}"
 }
 
 function test_pkg()
 {
-go test -race -cover ${APPLE_SILICON_FLAG} "${PKG_DIR}/common/..." -failfast -count=1
-go test -race -cover ${APPLE_SILICON_FLAG} "${PKG_DIR}/config/..." -failfast -count=1
-go test -race -cover ${APPLE_SILICON_FLAG} "${PKG_DIR}/log/..." -failfast -count=1
-go test -race -cover ${APPLE_SILICON_FLAG} "${PKG_DIR}/mq/..." -failfast -count=1
-go test -race -cover ${APPLE_SILICON_FLAG} "${PKG_DIR}/tracer/..." -failfast -count=1
-go test -race -cover ${APPLE_SILICON_FLAG} "${PKG_DIR}/util/..." -failfast -count=1
+pushd pkg
+go test -race -cover -tags dynamic,test "${PKG_DIR}/common/..." -failfast -count=1   -ldflags="-r ${RPATH}"
+go test -race -cover -tags dynamic,test "${PKG_DIR}/config/..." -failfast -count=1  -ldflags="-r ${RPATH}"
+go test -race -cover -tags dynamic,test "${PKG_DIR}/log/..." -failfast -count=1  -ldflags="-r ${RPATH}"
+go test -race -cover -tags dynamic,test "${PKG_DIR}/mq/..." -failfast -count=1  -ldflags="-r ${RPATH}"
+go test -race -cover -tags dynamic,test "${PKG_DIR}/tracer/..." -failfast -count=1  -ldflags="-r ${RPATH}"
+go test -race -cover -tags dynamic,test "${PKG_DIR}/util/..." -failfast -count=1  -ldflags="-r ${RPATH}"
+go test -race -cover -tags dynamic,test "${PKG_DIR}/streaming/..." -failfast -count=1  -ldflags="-r ${RPATH}"
+popd
 }
 
 function test_datanode
 {
 
-go test -race -cover ${APPLE_SILICON_FLAG} "${MILVUS_DIR}/datanode/..." -failfast -count=1
-go test -race -cover ${APPLE_SILICON_FLAG} "${MILVUS_DIR}/distributed/datanode/..." -failfast -count=1
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/datanode/..." -failfast -count=1  -ldflags="-r ${RPATH}"
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/distributed/datanode/..." -failfast -count=1  -ldflags="-r ${RPATH}"
 
 }
 
 function test_indexnode()
 {
-go test -race -cover ${APPLE_SILICON_FLAG} "${MILVUS_DIR}/indexnode/..." -failfast -count=1
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/indexnode/..." -failfast -count=1 -ldflags="-r ${RPATH}"
 }
 
 function test_rootcoord()
 {
-go test -race -cover ${APPLE_SILICON_FLAG} "${MILVUS_DIR}/distributed/rootcoord/..." -failfast -count=1
-go test -race -cover ${APPLE_SILICON_FLAG} "${MILVUS_DIR}/rootcoord" -failfast
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/distributed/rootcoord/..." -failfast -count=1 -ldflags="-r ${RPATH}"
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/rootcoord" -failfast  -ldflags="-r ${RPATH}"
 }
 
 function test_datacoord()
 {
-go test -race -cover ${APPLE_SILICON_FLAG} "${MILVUS_DIR}/distributed/datacoord/..." -failfast -count=1
-go test -race -cover ${APPLE_SILICON_FLAG} "${MILVUS_DIR}/datacoord/..." -failfast -count=1
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/distributed/datacoord/..." -failfast -count=1 -ldflags="-r ${RPATH}"
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/datacoord/..." -failfast -count=1 -ldflags="-r ${RPATH}"
 }
 
 function test_querycoord()
 {
-go test -race -cover ${APPLE_SILICON_FLAG} "${MILVUS_DIR}/distributed/querycoord/..." -failfast -count=1
-go test -race -cover ${APPLE_SILICON_FLAG} "${MILVUS_DIR}/querycoordv2/..." -failfast -count=1
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/distributed/querycoord/..." -failfast -count=1  -ldflags="-r ${RPATH}"
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/querycoordv2/..." -failfast -count=1  -ldflags="-r ${RPATH}"
 }
-
-#function test_indexcoord()
-#{
-#go test -race -cover ${APPLE_SILICON_FLAG} "${MILVUS_DIR}/indexcoord/..." -failfast
-#}
 
 function test_metastore()
 {
-go test -race -cover ${APPLE_SILICON_FLAG} "${MILVUS_DIR}/metastore/..." -failfast -count=1
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/metastore/..." -failfast -count=1 -ldflags="-r ${RPATH}"
+}
+
+function test_cmd()
+{
+go test -race -cover -tags dynamic,test "${ROOT_DIR}/cmd/tools/..." -failfast -count=1 -ldflags="-r ${RPATH}"
+}
+
+function test_streaming()
+{
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/streamingcoord/..." -failfast -count=1 -ldflags="-r ${RPATH}"
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/streamingnode/..." -failfast -count=1 -ldflags="-r ${RPATH}"
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/util/streamingutil/..." -failfast -count=1 -ldflags="-r ${RPATH}"
+go test -race -cover -tags dynamic,test "${MILVUS_DIR}/distributed/streaming/..." -failfast -count=1 -ldflags="-r ${RPATH}"
+pushd pkg
+go test -race -cover -tags dynamic,test "${PKG_DIR}/streaming/..." -failfast -count=1  -ldflags="-r ${RPATH}"
+popd
 }
 
 function test_all()
@@ -175,16 +185,16 @@ test_indexnode
 test_rootcoord
 test_querycoord
 test_datacoord
-#test_indexcoord
 test_kv
 test_mq
 test_storage
 test_allocator
 test_tso
-test_config
 test_util
 test_pkg
 test_metastore
+test_cmd
+test_streaming
 }
 
 
@@ -211,9 +221,6 @@ case "${TEST_TAG}" in
     datacoord)
 	test_datacoord
         ;;
-#    indexcoord)
-#	test_indexcoord
-#        ;;
     kv)
 	test_kv
         ;;
@@ -240,6 +247,12 @@ case "${TEST_TAG}" in
         ;;
     metastore)
 	test_metastore
+        ;;
+    cmd)
+	test_cmd
+        ;;
+    streaming)
+	test_streaming
         ;;
     *)   echo "Test All";
 	test_all

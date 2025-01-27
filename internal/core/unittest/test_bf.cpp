@@ -56,7 +56,7 @@ Distances(const float* base,
         }
         return res;
     } else {
-        PanicInfo("invalid metric type");
+        PanicInfo(MetricTypeInvalid, "invalid metric type");
     }
 }
 
@@ -85,7 +85,7 @@ Ref(const float* base,
     } else if (milvus::IsMetricType(metric, knowhere::metric::IP)) {
         std::reverse(res.begin(), res.end());
     } else {
-        PanicInfo("invalid metric type");
+        PanicInfo(MetricTypeInvalid, "invalid metric type");
     }
     return GetOffsets(res, topk);
 }
@@ -122,16 +122,26 @@ class TestFloatSearchBruteForce : public ::testing::Test {
 
         auto base = GenFloatVecs(dim, nb, metric_type);
         auto query = GenFloatVecs(dim, nq, metric_type);
+        auto index_info = std::map<std::string, std::string>{};
 
-        dataset::SearchDataset dataset{
+        dataset::SearchDataset query_dataset{
             metric_type, nq, topk, -1, dim, query.data()};
         if (!is_supported_float_metric(metric_type)) {
             // Memory leak in knowhere.
             // ASSERT_ANY_THROW(BruteForceSearch(dataset, base.data(), nb, bitset_view));
             return;
         }
-        auto result = BruteForceSearch(
-            dataset, base.data(), nb, knowhere::Json(), bitset_view);
+        SearchInfo search_info;
+        search_info.topk_ = topk;
+        search_info.metric_type_ = metric_type;
+
+        auto raw_dataset = query::dataset::RawDataset{0, dim, nb, base.data()};
+        auto result = BruteForceSearch(query_dataset,
+                                       raw_dataset,
+                                       search_info,
+                                       index_info,
+                                       bitset_view,
+                                       DataType::VECTOR_FLOAT);
         for (int i = 0; i < nq; i++) {
             auto ref = Ref(base.data(),
                            query.data() + i * dim,

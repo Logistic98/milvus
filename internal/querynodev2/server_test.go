@@ -18,17 +18,27 @@ package querynodev2
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/errors"
+	"github.com/spf13/viper"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
 	clientv3 "go.etcd.io/etcd/client/v3"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/mocks/util/mock_segcore"
+	"github.com/milvus-io/milvus/internal/mocks/util/searchutil/mock_optimizers"
+	"github.com/milvus-io/milvus/internal/querynodev2/segments"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/util/dependency"
+	"github.com/milvus-io/milvus/pkg/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/util/etcd"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
@@ -50,14 +60,13 @@ type QueryNodeSuite struct {
 
 func (suite *QueryNodeSuite) SetupSuite() {
 	suite.address = "test-address"
-
 }
 
 func (suite *QueryNodeSuite) SetupTest() {
 	var err error
 	paramtable.Init()
 	suite.params = paramtable.Get()
-	suite.params.Save(suite.params.QueryNodeCfg.GCEnabled.Key, "false")
+	suite.params.Save(suite.params.CommonCfg.GCEnabled.Key, "false")
 
 	// mock factory
 	suite.factory = dependency.NewMockFactory(suite.T())
@@ -91,14 +100,14 @@ func (suite *QueryNodeSuite) TestBasic() {
 	err = suite.node.Init()
 	suite.NoError(err)
 
-	// node shoule be unhealthy before node start
+	// node should be unhealthy before node start
 	suite.False(suite.node.lifetime.GetState() == commonpb.StateCode_Healthy)
 
 	// start node
 	err = suite.node.Start()
 	suite.NoError(err)
 
-	// node shoule be healthy after node start
+	// node should be healthy after node start
 	suite.True(suite.node.lifetime.GetState() == commonpb.StateCode_Healthy)
 
 	// register node to etcd
@@ -136,10 +145,105 @@ func (suite *QueryNodeSuite) TestInit_VactorChunkManagerFailed() {
 
 	// init vactor chunk manager failed
 	suite.factory.EXPECT().Init(mock.Anything).Return()
-	suite.factory.EXPECT().NewPersistentStorageChunkManager(mock.Anything).Return(suite.chunkManagerFactory.NewPersistentStorageChunkManager(context.Background())).Once()
 	suite.factory.EXPECT().NewPersistentStorageChunkManager(mock.Anything).Return(nil, errors.New("mock error")).Once()
 	err = suite.node.Init()
 	suite.Error(err)
+}
+
+func (suite *QueryNodeSuite) TestInit_QueryHook() {
+	// mock expect
+	suite.factory.EXPECT().Init(mock.Anything).Return()
+	suite.factory.EXPECT().NewPersistentStorageChunkManager(mock.Anything).Return(suite.chunkManagerFactory.NewPersistentStorageChunkManager(context.Background()))
+
+	var err error
+	suite.node.SetEtcdClient(suite.etcd)
+	err = suite.node.Init()
+	suite.NoError(err)
+
+	mockHook := mock_optimizers.NewMockQueryHook(suite.T())
+	suite.node.queryHook = mockHook
+	suite.node.handleQueryHookEvent()
+
+	yamlWriter := viper.New()
+	yamlWriter.SetConfigFile("../../configs/milvus.yaml")
+	yamlWriter.ReadInConfig()
+	var x1, x2, x3 int32
+	suite.Equal(atomic.LoadInt32(&x1), int32(0))
+	suite.Equal(atomic.LoadInt32(&x2), int32(0))
+	suite.Equal(atomic.LoadInt32(&x3), int32(0))
+
+	mockHook.EXPECT().InitTuningConfig(mock.Anything).Run(func(params map[string]string) {
+		atomic.StoreInt32(&x1, 6)
+	}).Return(nil)
+
+	// create tuning conf
+	yamlWriter.Set("autoIndex.params.tuning.1238", "xxxx")
+	yamlWriter.WriteConfig()
+	suite.Eventually(func() bool {
+		return atomic.LoadInt32(&x1) == int32(6)
+	}, 20*time.Second, time.Second)
+
+	mockHook.EXPECT().Init(mock.Anything).Run(func(params string) {
+		atomic.StoreInt32(&x2, 5)
+	}).Return(nil)
+	yamlWriter.Set("autoIndex.params.search", "aaaa")
+	yamlWriter.WriteConfig()
+	suite.Eventually(func() bool {
+		return atomic.LoadInt32(&x2) == int32(5)
+	}, 20*time.Second, time.Second)
+	yamlWriter.Set("autoIndex.params.search", "")
+	yamlWriter.WriteConfig()
+
+	atomic.StoreInt32(&x1, 0)
+	suite.Equal(atomic.LoadInt32(&x1), int32(0))
+	// update tuning conf
+	yamlWriter.Set("autoIndex.params.tuning.1238", "yyyy")
+	yamlWriter.WriteConfig()
+	suite.Eventually(func() bool {
+		return atomic.LoadInt32(&x1) == int32(6)
+	}, 20*time.Second, time.Second)
+
+	mockHook.EXPECT().DeleteTuningConfig(mock.Anything).Run(func(params string) {
+		atomic.StoreInt32(&x3, 7)
+	}).Return(nil)
+
+	// delete tuning conf
+	yamlWriter.Set("autoIndex.params.tuning", "")
+	yamlWriter.WriteConfig()
+	suite.Eventually(func() bool {
+		return atomic.LoadInt32(&x3) == int32(7)
+	}, 20*time.Second, time.Second)
+}
+
+func (suite *QueryNodeSuite) TestStop() {
+	paramtable.Get().Save(paramtable.Get().QueryNodeCfg.GracefulStopTimeout.Key, "2")
+
+	suite.node.manager = segments.NewManager()
+
+	schema := mock_segcore.GenTestCollectionSchema("test_stop", schemapb.DataType_Int64, true)
+	collection, err := segments.NewCollection(1, schema, nil, &querypb.LoadMetaInfo{
+		LoadType: querypb.LoadType_LoadCollection,
+	})
+	suite.Require().NoError(err)
+	segment, err := segments.NewSegment(
+		context.Background(),
+		collection,
+		segments.SegmentTypeSealed,
+		1,
+		&querypb.SegmentLoadInfo{
+			SegmentID:     100,
+			PartitionID:   10,
+			CollectionID:  1,
+			Level:         datapb.SegmentLevel_Legacy,
+			InsertChannel: fmt.Sprintf("by-dev-rootcoord-dml_0_%dv0", 1),
+		},
+		nil,
+	)
+	suite.NoError(err)
+	suite.node.manager.Segment.Put(context.Background(), segments.SegmentTypeSealed, segment)
+	err = suite.node.Stop()
+	suite.NoError(err)
+	suite.True(suite.node.manager.Segment.Empty())
 }
 
 func TestQueryNode(t *testing.T) {

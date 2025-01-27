@@ -1,16 +1,14 @@
 package planparserv2
 
 import (
-	"encoding/json"
-
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/internal/proto/planpb"
+	"github.com/milvus-io/milvus/internal/json"
 	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/proto/planpb"
 )
 
-type ShowExprVisitor struct {
-}
+type ShowExprVisitor struct{}
 
 func extractColumnInfo(info *planpb.ColumnInfo) interface{} {
 	js := make(map[string]interface{})
@@ -18,10 +16,14 @@ func extractColumnInfo(info *planpb.ColumnInfo) interface{} {
 	js["data_type"] = info.GetDataType().String()
 	js["auto_id"] = info.GetIsAutoID()
 	js["is_pk"] = info.GetIsPrimaryKey()
+	js["nullable"] = info.GetNullable()
 	return js
 }
 
 func extractGenericValue(value *planpb.GenericValue) interface{} {
+	if value == nil {
+		return nil
+	}
 	switch realValue := value.Val.(type) {
 	case *planpb.GenericValue_BoolVal:
 		return realValue.BoolVal
@@ -47,6 +49,8 @@ func (v *ShowExprVisitor) VisitExpr(expr *planpb.Expr) interface{} {
 		js["expr"] = v.VisitUnaryExpr(realExpr.UnaryExpr)
 	case *planpb.Expr_BinaryExpr:
 		js["expr"] = v.VisitBinaryExpr(realExpr.BinaryExpr)
+	case *planpb.Expr_CallExpr:
+		js["expr"] = v.VisitCallExpr(realExpr.CallExpr)
 	case *planpb.Expr_CompareExpr:
 		js["expr"] = v.VisitCompareExpr(realExpr.CompareExpr)
 	case *planpb.Expr_UnaryRangeExpr:
@@ -61,6 +65,8 @@ func (v *ShowExprVisitor) VisitExpr(expr *planpb.Expr) interface{} {
 		js["expr"] = v.VisitValueExpr(realExpr.ValueExpr)
 	case *planpb.Expr_ColumnExpr:
 		js["expr"] = v.VisitColumnExpr(realExpr.ColumnExpr)
+	case *planpb.Expr_NullExpr:
+		js["expr"] = v.VisitNullExpr(realExpr.NullExpr)
 	default:
 		js["expr"] = ""
 	}
@@ -94,6 +100,18 @@ func (v *ShowExprVisitor) VisitBinaryExpr(expr *planpb.BinaryExpr) interface{} {
 	return js
 }
 
+func (v *ShowExprVisitor) VisitCallExpr(expr *planpb.CallExpr) interface{} {
+	js := make(map[string]interface{})
+	js["expr_type"] = "call"
+	js["func_name"] = expr.FunctionName
+	params := make([]interface{}, 0, len(expr.FunctionParameters))
+	for _, p := range expr.FunctionParameters {
+		params = append(params, v.VisitExpr(p))
+	}
+	js["func_parameters"] = params
+	return js
+}
+
 func (v *ShowExprVisitor) VisitCompareExpr(expr *planpb.CompareExpr) interface{} {
 	js := make(map[string]interface{})
 	js["expr_type"] = "compare"
@@ -109,6 +127,11 @@ func (v *ShowExprVisitor) VisitUnaryRangeExpr(expr *planpb.UnaryRangeExpr) inter
 	js["op"] = expr.Op.String()
 	js["column_info"] = extractColumnInfo(expr.GetColumnInfo())
 	js["operand"] = extractGenericValue(expr.Value)
+	var extraValues []interface{}
+	for _, v := range expr.ExtraValues {
+		extraValues = append(extraValues, extractGenericValue(v))
+	}
+	js["extra_values"] = extraValues
 	return js
 }
 
@@ -157,6 +180,14 @@ func (v *ShowExprVisitor) VisitColumnExpr(expr *planpb.ColumnExpr) interface{} {
 	return js
 }
 
+func (v *ShowExprVisitor) VisitNullExpr(expr *planpb.NullExpr) interface{} {
+	js := make(map[string]interface{})
+	js["expr_type"] = "null"
+	js["op"] = expr.Op.String()
+	js["column_info"] = extractColumnInfo(expr.GetColumnInfo())
+	return js
+}
+
 func NewShowExprVisitor() LogicalExprVisitor {
 	return &ShowExprVisitor{}
 }
@@ -165,6 +196,6 @@ func NewShowExprVisitor() LogicalExprVisitor {
 func ShowExpr(expr *planpb.Expr) {
 	v := NewShowExprVisitor()
 	js := v.VisitExpr(expr)
-	b, _ := json.MarshalIndent(js, "", "  ")
+	b, _ := json.Marshal(js)
 	log.Info("[ShowExpr]", zap.String("expr", string(b)))
 }

@@ -19,10 +19,11 @@ package msgstream
 import (
 	"testing"
 
-	"github.com/golang/protobuf/proto"
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/msgpb"
 	"github.com/stretchr/testify/assert"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 )
 
 func Test_ProtoUnmarshalDispatcher(t *testing.T) {
@@ -33,7 +34,7 @@ func Test_ProtoUnmarshalDispatcher(t *testing.T) {
 			EndTimestamp:   0,
 			HashValues:     []uint32{1},
 		},
-		InsertRequest: msgpb.InsertRequest{
+		InsertRequest: &msgpb.InsertRequest{
 			Base: &commonpb.MsgBase{
 				MsgType:   commonpb.MsgType_Insert,
 				MsgID:     1,
@@ -57,13 +58,13 @@ func Test_ProtoUnmarshalDispatcher(t *testing.T) {
 	for _, v := range msgPack.Msgs {
 		headerMsg := commonpb.MsgHeader{}
 		payload, err := v.Marshal(v)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		p, err := convertToByteArray(payload)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		err = proto.Unmarshal(p, &headerMsg)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		msg, err := unmarshalDispatcher.Unmarshal(p, headerMsg.Base.MsgType)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		t.Log("msg type: ", msg.Type(), ", msg value: ", msg, "msg tag: ")
 	}
 }

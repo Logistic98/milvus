@@ -17,11 +17,33 @@
 package lock
 
 import (
+	"context"
 	"sync"
 
+	pool "github.com/jolestar/go-commons-pool/v2"
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus/pkg/log"
+)
+
+var (
+	ctx             = context.Background()
+	lockPoolFactory = pool.NewPooledObjectFactorySimple(func(ctx2 context.Context) (interface{}, error) {
+		return newRefLock(), nil
+	})
+	lockerPoolConfig = &pool.ObjectPoolConfig{
+		LIFO:                     pool.DefaultLIFO,
+		MaxTotal:                 -1,
+		MaxIdle:                  64,
+		MinIdle:                  pool.DefaultMinIdle,
+		MinEvictableIdleTime:     pool.DefaultMinEvictableIdleTime,
+		SoftMinEvictableIdleTime: pool.DefaultSoftMinEvictableIdleTime,
+		NumTestsPerEvictionRun:   pool.DefaultNumTestsPerEvictionRun,
+		EvictionPolicyName:       pool.DefaultEvictionPolicyName,
+		EvictionContext:          ctx,
+		BlockWhenExhausted:       false,
+	}
+	refLockPoolPool = pool.NewObjectPool(ctx, lockPoolFactory, lockerPoolConfig)
 )
 
 type RefLock struct {
@@ -33,8 +55,12 @@ func (m *RefLock) ref() {
 	m.refCounter++
 }
 
-func (m *RefLock) unref() {
-	m.refCounter--
+func (m *RefLock) unref() bool {
+	if m.refCounter > 0 {
+		m.refCounter--
+		return true
+	}
+	return false
 }
 
 func newRefLock() *RefLock {
@@ -45,19 +71,19 @@ func newRefLock() *RefLock {
 	return &c
 }
 
-type KeyLock struct {
+type KeyLock[K comparable] struct {
 	keyLocksMutex sync.Mutex
-	refLocks      map[string]*RefLock
+	refLocks      map[K]*RefLock
 }
 
-func NewKeyLock() *KeyLock {
-	keyLock := KeyLock{
-		refLocks: make(map[string]*RefLock),
+func NewKeyLock[K comparable]() *KeyLock[K] {
+	keyLock := KeyLock[K]{
+		refLocks: make(map[K]*RefLock),
 	}
 	return &keyLock
 }
 
-func (k *KeyLock) Lock(key string) {
+func (k *KeyLock[K]) Lock(key K) {
 	k.keyLocksMutex.Lock()
 	// update the key map
 	if keyLock, ok := k.refLocks[key]; ok {
@@ -66,7 +92,14 @@ func (k *KeyLock) Lock(key string) {
 		k.keyLocksMutex.Unlock()
 		keyLock.mutex.Lock()
 	} else {
-		newKLock := newRefLock()
+		obj, err := refLockPoolPool.BorrowObject(ctx)
+		if err != nil {
+			log.Ctx(ctx).Error("BorrowObject failed", zap.Error(err))
+			k.keyLocksMutex.Unlock()
+			return
+		}
+		newKLock := obj.(*RefLock)
+		// newKLock := newRefLock()
 		newKLock.mutex.Lock()
 		k.refLocks[key] = newKLock
 		newKLock.ref()
@@ -76,22 +109,23 @@ func (k *KeyLock) Lock(key string) {
 	}
 }
 
-func (k *KeyLock) Unlock(lockedKey string) {
+func (k *KeyLock[K]) Unlock(lockedKey K) {
 	k.keyLocksMutex.Lock()
 	defer k.keyLocksMutex.Unlock()
 	keyLock, ok := k.refLocks[lockedKey]
 	if !ok {
-		log.Warn("Unlocking non-existing key", zap.String("key", lockedKey))
+		log.Warn("Unlocking non-existing key", zap.Any("key", lockedKey))
 		return
 	}
 	keyLock.unref()
 	if keyLock.refCounter == 0 {
+		_ = refLockPoolPool.ReturnObject(ctx, keyLock)
 		delete(k.refLocks, lockedKey)
 	}
 	keyLock.mutex.Unlock()
 }
 
-func (k *KeyLock) RLock(key string) {
+func (k *KeyLock[K]) RLock(key K) {
 	k.keyLocksMutex.Lock()
 	// update the key map
 	if keyLock, ok := k.refLocks[key]; ok {
@@ -100,7 +134,14 @@ func (k *KeyLock) RLock(key string) {
 		k.keyLocksMutex.Unlock()
 		keyLock.mutex.RLock()
 	} else {
-		newKLock := newRefLock()
+		obj, err := refLockPoolPool.BorrowObject(ctx)
+		if err != nil {
+			log.Ctx(ctx).Error("BorrowObject failed", zap.Error(err))
+			k.keyLocksMutex.Unlock()
+			return
+		}
+		newKLock := obj.(*RefLock)
+		// newKLock := newRefLock()
 		newKLock.mutex.RLock()
 		k.refLocks[key] = newKLock
 		newKLock.ref()
@@ -110,22 +151,23 @@ func (k *KeyLock) RLock(key string) {
 	}
 }
 
-func (k *KeyLock) RUnlock(lockedKey string) {
+func (k *KeyLock[K]) RUnlock(lockedKey K) {
 	k.keyLocksMutex.Lock()
 	defer k.keyLocksMutex.Unlock()
 	keyLock, ok := k.refLocks[lockedKey]
 	if !ok {
-		log.Warn("Unlocking non-existing key", zap.String("key", lockedKey))
+		log.Warn("Unlocking non-existing key", zap.Any("key", lockedKey))
 		return
 	}
 	keyLock.unref()
 	if keyLock.refCounter == 0 {
+		_ = refLockPoolPool.ReturnObject(ctx, keyLock)
 		delete(k.refLocks, lockedKey)
 	}
 	keyLock.mutex.RUnlock()
 }
 
-func (k *KeyLock) size() int {
+func (k *KeyLock[K]) size() int {
 	k.keyLocksMutex.Lock()
 	defer k.keyLocksMutex.Unlock()
 	return len(k.refLocks)

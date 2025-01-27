@@ -29,11 +29,12 @@ TEST(Span, Naive) {
     auto float_vec_fid = schema->AddDebugField(
         "floatvec", DataType::VECTOR_FLOAT, 32, knowhere::metric::L2);
     auto i64_fid = schema->AddDebugField("counter", DataType::INT64);
+    auto nullable_fid =
+        schema->AddDebugField("nullable", DataType::INT64, true);
     schema->set_primary_field_id(i64_fid);
 
-    auto dataset = DataGen(schema, N);
-    auto seg_conf = SegcoreConfig::default_config();
-    auto segment = CreateGrowingSegment(schema, -1, seg_conf);
+    auto dataset = DataGen(schema, N, 42, 0, 1, 10, false, true, true);
+    auto segment = CreateGrowingSegment(schema, empty_index_meta, -1);
     segment->PreInsert(N);
     segment->Insert(0,
                     N,
@@ -43,20 +44,24 @@ TEST(Span, Naive) {
     auto vec_ptr = dataset.get_col<uint8_t>(bin_vec_fid);
     auto age_ptr = dataset.get_col<float>(float_fid);
     auto float_ptr = dataset.get_col<float>(float_vec_fid);
-    SegmentInternalInterface& interface = *segment;
-    auto num_chunk = interface.num_chunk();
+    auto nullable_data_ptr = dataset.get_col<int64_t>(nullable_fid);
+    auto nullable_valid_data_ptr = dataset.get_col_valid(nullable_fid);
+    auto num_chunk = segment->num_chunk(FieldId(0));
     ASSERT_EQ(num_chunk, upper_div(N, size_per_chunk));
-    auto row_count = interface.get_row_count();
+    auto row_count = segment->get_row_count();
     ASSERT_EQ(N, row_count);
     for (auto chunk_id = 0; chunk_id < num_chunk; ++chunk_id) {
         auto vec_span =
-            interface.chunk_data<milvus::BinaryVector>(bin_vec_fid, chunk_id);
-        auto age_span = interface.chunk_data<float>(float_fid, chunk_id);
+            segment->chunk_data<milvus::BinaryVector>(bin_vec_fid, chunk_id);
+        auto age_span = segment->chunk_data<float>(float_fid, chunk_id);
         auto float_span =
-            interface.chunk_data<milvus::FloatVector>(float_vec_fid, chunk_id);
+            segment->chunk_data<milvus::FloatVector>(float_vec_fid, chunk_id);
+        auto null_field_span =
+            segment->chunk_data<int64_t>(nullable_fid, chunk_id);
         auto begin = chunk_id * size_per_chunk;
         auto end = std::min((chunk_id + 1) * size_per_chunk, N);
         auto size_of_chunk = end - begin;
+        ASSERT_EQ(age_span.valid_data(), nullptr);
         for (int i = 0; i < size_of_chunk * 512 / 8; ++i) {
             ASSERT_EQ(vec_span.data()[i], vec_ptr[i + begin * 512 / 8]);
         }
@@ -65,6 +70,13 @@ TEST(Span, Naive) {
         }
         for (int i = 0; i < size_of_chunk; ++i) {
             ASSERT_EQ(float_span.data()[i], float_ptr[i + begin * 32]);
+        }
+        for (int i = 0; i < size_of_chunk; ++i) {
+            ASSERT_EQ(null_field_span.data()[i], nullable_data_ptr[i + begin]);
+        }
+        for (int i = 0; i < size_of_chunk; ++i) {
+            ASSERT_EQ(null_field_span.valid_data()[i],
+                      nullable_valid_data_ptr[i + begin]);
         }
     }
 }

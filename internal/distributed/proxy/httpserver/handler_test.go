@@ -1,23 +1,39 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package httpserver
 
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/cockroachdb/errors"
-
 	"github.com/gin-gonic/gin"
 	"github.com/gin-gonic/gin/binding"
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/types"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/json"
+	"github.com/milvus-io/milvus/internal/types"
 )
 
 func Test_WrappedInsertRequest_JSONMarshal_AsInsertRequest(t *testing.T) {
@@ -46,8 +62,22 @@ func (m *mockProxyComponent) Dummy(ctx context.Context, request *milvuspb.DummyR
 	return nil, nil
 }
 
-var emptyBody = &gin.H{}
-var testStatus = &commonpb.Status{Reason: "ok"}
+var (
+	emptyBody  = &gin.H{}
+	testStatus = &commonpb.Status{Reason: "ok"}
+)
+
+func (m *mockProxyComponent) CreateDatabase(ctx context.Context, in *milvuspb.CreateDatabaseRequest) (*commonpb.Status, error) {
+	return testStatus, nil
+}
+
+func (m *mockProxyComponent) DropDatabase(ctx context.Context, in *milvuspb.DropDatabaseRequest) (*commonpb.Status, error) {
+	return testStatus, nil
+}
+
+func (m *mockProxyComponent) ListDatabases(ctx context.Context, in *milvuspb.ListDatabasesRequest) (*milvuspb.ListDatabasesResponse, error) {
+	return &milvuspb.ListDatabasesResponse{Status: testStatus}, nil
+}
 
 func (m *mockProxyComponent) CreateCollection(ctx context.Context, request *milvuspb.CreateCollectionRequest) (*commonpb.Status, error) {
 	return testStatus, nil
@@ -100,9 +130,11 @@ func (m *mockProxyComponent) HasPartition(ctx context.Context, request *milvuspb
 func (m *mockProxyComponent) LoadPartitions(ctx context.Context, request *milvuspb.LoadPartitionsRequest) (*commonpb.Status, error) {
 	return testStatus, nil
 }
+
 func (m *mockProxyComponent) ReleasePartitions(ctx context.Context, request *milvuspb.ReleasePartitionsRequest) (*commonpb.Status, error) {
 	return testStatus, nil
 }
+
 func (m *mockProxyComponent) GetPartitionStatistics(ctx context.Context, request *milvuspb.GetPartitionStatisticsRequest) (*milvuspb.GetPartitionStatisticsResponse, error) {
 	return &milvuspb.GetPartitionStatisticsResponse{Status: testStatus}, nil
 }
@@ -123,12 +155,24 @@ func (m *mockProxyComponent) AlterAlias(ctx context.Context, request *milvuspb.A
 	return testStatus, nil
 }
 
+func (m *mockProxyComponent) DescribeAlias(ctx context.Context, request *milvuspb.DescribeAliasRequest) (*milvuspb.DescribeAliasResponse, error) {
+	return &milvuspb.DescribeAliasResponse{Status: testStatus}, nil
+}
+
+func (m *mockProxyComponent) ListAliases(ctx context.Context, request *milvuspb.ListAliasesRequest) (*milvuspb.ListAliasesResponse, error) {
+	return &milvuspb.ListAliasesResponse{Status: testStatus}, nil
+}
+
 func (m *mockProxyComponent) CreateIndex(ctx context.Context, request *milvuspb.CreateIndexRequest) (*commonpb.Status, error) {
 	return testStatus, nil
 }
 
 func (m *mockProxyComponent) DescribeIndex(ctx context.Context, request *milvuspb.DescribeIndexRequest) (*milvuspb.DescribeIndexResponse, error) {
 	return &milvuspb.DescribeIndexResponse{Status: testStatus}, nil
+}
+
+func (m *mockProxyComponent) GetIndexStatistics(ctx context.Context, request *milvuspb.GetIndexStatisticsRequest) (*milvuspb.GetIndexStatisticsResponse, error) {
+	return &milvuspb.GetIndexStatisticsResponse{Status: testStatus}, nil
 }
 
 func (m *mockProxyComponent) GetIndexState(ctx context.Context, request *milvuspb.GetIndexStateRequest) (*milvuspb.GetIndexStateResponse, error) {
@@ -181,7 +225,7 @@ func (m *mockProxyComponent) Query(ctx context.Context, request *milvuspb.QueryR
 	return &queryResult, nil
 }
 
-var flushResult = milvuspb.FlushResponse{
+var flushResult = &milvuspb.FlushResponse{
 	DbName: "default",
 }
 
@@ -189,10 +233,10 @@ func (m *mockProxyComponent) Flush(ctx context.Context, request *milvuspb.FlushR
 	if len(request.CollectionNames) < 1 {
 		return nil, errors.New("body parse err")
 	}
-	return &flushResult, nil
+	return flushResult, nil
 }
 
-var calcDistanceResult = milvuspb.CalcDistanceResults{
+var calcDistanceResult = &milvuspb.CalcDistanceResults{
 	Array: &milvuspb.CalcDistanceResults_IntDist{
 		IntDist: &schemapb.IntArray{
 			Data: []int32{1, 2, 3},
@@ -204,7 +248,7 @@ func (m *mockProxyComponent) CalcDistance(ctx context.Context, request *milvuspb
 	if len(request.Params) < 1 {
 		return nil, errors.New("body parse err")
 	}
-	return &calcDistanceResult, nil
+	return calcDistanceResult, nil
 }
 
 func (m *mockProxyComponent) GetFlushState(ctx context.Context, request *milvuspb.GetFlushStateRequest) (*milvuspb.GetFlushStateResponse, error) {
@@ -397,7 +441,8 @@ func TestHandlers(t *testing.T) {
 		},
 		{
 			http.MethodGet, "/partition/statistics", emptyBody,
-			http.StatusOK, milvuspb.GetPartitionStatisticsResponse{Status: testStatus},
+			http.StatusOK,
+			milvuspb.GetPartitionStatisticsResponse{Status: testStatus},
 		},
 		{
 			http.MethodGet, "/partitions", emptyBody,
@@ -440,26 +485,32 @@ func TestHandlers(t *testing.T) {
 			http.StatusOK, &milvuspb.MutationResult{Acknowledged: true},
 		},
 		{
-			http.MethodDelete, "/entities", milvuspb.DeleteRequest{Expr: "some expr"},
+			http.MethodDelete, "/entities",
+			milvuspb.DeleteRequest{Expr: "some expr"},
 			http.StatusOK, &milvuspb.MutationResult{Acknowledged: true},
 		},
 		{
-			http.MethodPost, "/search", milvuspb.SearchRequest{Dsl: "some dsl"},
+			http.MethodPost, "/search",
+			milvuspb.SearchRequest{Dsl: "some dsl"},
 			http.StatusOK, &searchResult,
 		},
 		{
-			http.MethodPost, "/query", milvuspb.QueryRequest{Expr: "some expr"},
+			http.MethodPost, "/query",
+			milvuspb.QueryRequest{Expr: "some expr"},
 			http.StatusOK, &queryResult,
 		},
 		{
-			http.MethodPost, "/persist", milvuspb.FlushRequest{CollectionNames: []string{"c1"}},
+			http.MethodPost, "/persist",
+			milvuspb.FlushRequest{CollectionNames: []string{"c1"}},
 			http.StatusOK, flushResult,
 		},
 		{
-			http.MethodGet, "/distance", milvuspb.CalcDistanceRequest{
+			http.MethodGet, "/distance",
+			milvuspb.CalcDistanceRequest{
 				Params: []*commonpb.KeyValuePair{
 					{Key: "key", Value: "val"},
-				}},
+				},
+			},
 			http.StatusOK, calcDistanceResult,
 		},
 		{

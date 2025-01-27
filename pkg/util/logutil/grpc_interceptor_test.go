@@ -54,6 +54,10 @@ func TestCtxWithLevelAndTrace(t *testing.T) {
 		assert.True(t, ok)
 		assert.Equal(t, "client-req-id", md.Get(clientRequestIDKey)[0])
 		assert.Equal(t, zapcore.ErrorLevel.String(), md.Get(logLevelRPCMetaKey)[0])
+		expectedctx := context.TODO()
+		expectedctx = log.WithErrorLevel(expectedctx)
+		expectedctx = log.WithTraceID(expectedctx, md.Get(clientRequestIDKey)[0])
+		assert.Equal(t, log.Ctx(expectedctx), log.Ctx(newctx))
 	})
 }
 
@@ -61,5 +65,5 @@ func withMetaData(ctx context.Context, level zapcore.Level) context.Context {
 	md := metadata.New(map[string]string{
 		logLevelRPCMetaKey: level.String(),
 	})
-	return metadata.NewIncomingContext(context.TODO(), md)
+	return metadata.NewIncomingContext(ctx, md)
 }

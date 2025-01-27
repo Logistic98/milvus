@@ -16,14 +16,16 @@
 
 #pragma once
 
+#include <any>
 #include <string>
 #include <memory>
 #include <vector>
 #include <unordered_map>
 
+#include "common/FieldData.h"
 #include "common/Types.h"
+#include "storage/PayloadReader.h"
 #include "storage/Types.h"
-#include "storage/FieldData.h"
 #include "storage/BinlogReader.h"
 
 namespace milvus::storage {
@@ -34,8 +36,7 @@ struct EventHeader {
     int32_t event_length_;
     int32_t next_position_;
 
-    EventHeader() {
-    }
+    EventHeader() = default;
     explicit EventHeader(BinlogReaderPtr reader);
 
     std::vector<uint8_t>
@@ -51,8 +52,7 @@ struct DescriptorEventDataFixPart {
     Timestamp end_timestamp;
     milvus::proto::schema::DataType data_type;
 
-    DescriptorEventDataFixPart() {
-    }
+    DescriptorEventDataFixPart() = default;
     explicit DescriptorEventDataFixPart(BinlogReaderPtr reader);
 
     std::vector<uint8_t>
@@ -63,11 +63,10 @@ struct DescriptorEventData {
     DescriptorEventDataFixPart fix_part;
     int32_t extra_length;
     std::vector<uint8_t> extra_bytes;
-    std::unordered_map<std::string, std::string> extras;
+    std::unordered_map<std::string, std::any> extras;
     std::vector<uint8_t> post_header_lengths;
 
-    DescriptorEventData() {
-    }
+    DescriptorEventData() = default;
     explicit DescriptorEventData(BinlogReaderPtr reader);
 
     std::vector<uint8_t>
@@ -78,12 +77,14 @@ struct BaseEventData {
     Timestamp start_timestamp;
     Timestamp end_timestamp;
     FieldDataPtr field_data;
+    std::shared_ptr<PayloadReader> payload_reader;
 
-    BaseEventData() {
-    }
+    BaseEventData() = default;
     explicit BaseEventData(BinlogReaderPtr reader,
                            int event_length,
-                           DataType data_type);
+                           DataType data_type,
+                           bool nullable,
+                           bool is_field_data = true);
 
     std::vector<uint8_t>
     Serialize();
@@ -93,8 +94,7 @@ struct DescriptorEvent {
     EventHeader event_header;
     DescriptorEventData event_data;
 
-    DescriptorEvent() {
-    }
+    DescriptorEvent() = default;
     explicit DescriptorEvent(BinlogReaderPtr reader);
 
     std::vector<uint8_t>
@@ -104,10 +104,12 @@ struct DescriptorEvent {
 struct BaseEvent {
     EventHeader event_header;
     BaseEventData event_data;
+    int64_t event_offset;
 
-    BaseEvent() {
-    }
-    explicit BaseEvent(BinlogReaderPtr reader, DataType data_type);
+    BaseEvent() = default;
+    explicit BaseEvent(BinlogReaderPtr reader,
+                       DataType data_type,
+                       bool nullable);
 
     std::vector<uint8_t>
     Serialize();
@@ -149,8 +151,7 @@ struct LocalIndexEvent {
     uint32_t degree;
     FieldDataPtr field_data;
 
-    LocalIndexEvent() {
-    }
+    LocalIndexEvent() = default;
     explicit LocalIndexEvent(BinlogReaderPtr reader);
 
     std::vector<uint8_t>

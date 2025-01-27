@@ -26,36 +26,39 @@ import (
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/internal/querycoordv2/task"
 	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/proto/querypb"
 )
 
 const (
-	InfoPrefix = "Balance-Info:"
+	PlanInfoPrefix = "Balance-Plans:"
+	DistInfoPrefix = "Balance-Dists:"
 )
 
-func CreateSegmentTasksFromPlans(ctx context.Context, checkerID int64, timeout time.Duration, plans []SegmentAssignPlan) []task.Task {
+func CreateSegmentTasksFromPlans(ctx context.Context, source task.Source, timeout time.Duration, plans []SegmentAssignPlan) []task.Task {
 	ret := make([]task.Task, 0)
 	for _, p := range plans {
 		actions := make([]task.Action, 0)
 		if p.To != -1 {
-			action := task.NewSegmentAction(p.To, task.ActionTypeGrow, p.Segment.GetInsertChannel(), p.Segment.GetID())
+			action := task.NewSegmentActionWithScope(p.To, task.ActionTypeGrow, p.Segment.GetInsertChannel(), p.Segment.GetID(), querypb.DataScope_Historical)
 			actions = append(actions, action)
 		}
 		if p.From != -1 {
-			action := task.NewSegmentAction(p.From, task.ActionTypeReduce, p.Segment.GetInsertChannel(), p.Segment.GetID())
+			action := task.NewSegmentActionWithScope(p.From, task.ActionTypeReduce, p.Segment.GetInsertChannel(), p.Segment.GetID(), querypb.DataScope_Historical)
 			actions = append(actions, action)
 		}
 		t, err := task.NewSegmentTask(
 			ctx,
 			timeout,
-			checkerID,
+			source,
 			p.Segment.GetCollectionID(),
-			p.ReplicaID,
+			p.Replica,
 			actions...,
 		)
 		if err != nil {
 			log.Warn("create segment task from plan failed",
 				zap.Int64("collection", p.Segment.GetCollectionID()),
-				zap.Int64("replica", p.ReplicaID),
+				zap.Int64("segmentID", p.Segment.GetID()),
+				zap.Int64("replica", p.Replica.GetID()),
 				zap.String("channel", p.Segment.GetInsertChannel()),
 				zap.Int64("from", p.From),
 				zap.Int64("to", p.To),
@@ -66,15 +69,17 @@ func CreateSegmentTasksFromPlans(ctx context.Context, checkerID int64, timeout t
 
 		log.Info("create segment task",
 			zap.Int64("collection", p.Segment.GetCollectionID()),
-			zap.Int64("replica", p.ReplicaID),
+			zap.Int64("segmentID", p.Segment.GetID()),
+			zap.Int64("replica", p.Replica.GetID()),
 			zap.String("channel", p.Segment.GetInsertChannel()),
+			zap.String("level", p.Segment.GetLevel().String()),
 			zap.Int64("from", p.From),
 			zap.Int64("to", p.To))
 		if task.GetTaskType(t) == task.TaskTypeMove {
 			// from balance checker
 			t.SetPriority(task.TaskPriorityLow)
 		} else {
-			//from segment checker
+			// from segment checker
 			t.SetPriority(task.TaskPriorityNormal)
 		}
 		ret = append(ret, t)
@@ -82,7 +87,7 @@ func CreateSegmentTasksFromPlans(ctx context.Context, checkerID int64, timeout t
 	return ret
 }
 
-func CreateChannelTasksFromPlans(ctx context.Context, checkerID int64, timeout time.Duration, plans []ChannelAssignPlan) []task.Task {
+func CreateChannelTasksFromPlans(ctx context.Context, source task.Source, timeout time.Duration, plans []ChannelAssignPlan) []task.Task {
 	ret := make([]task.Task, 0, len(plans))
 	for _, p := range plans {
 		actions := make([]task.Action, 0)
@@ -94,11 +99,11 @@ func CreateChannelTasksFromPlans(ctx context.Context, checkerID int64, timeout t
 			action := task.NewChannelAction(p.From, task.ActionTypeReduce, p.Channel.GetChannelName())
 			actions = append(actions, action)
 		}
-		t, err := task.NewChannelTask(ctx, timeout, checkerID, p.Channel.GetCollectionID(), p.ReplicaID, actions...)
+		t, err := task.NewChannelTask(ctx, timeout, source, p.Channel.GetCollectionID(), p.Replica, actions...)
 		if err != nil {
 			log.Warn("create channel task failed",
 				zap.Int64("collection", p.Channel.GetCollectionID()),
-				zap.Int64("replica", p.ReplicaID),
+				zap.Int64("replica", p.Replica.GetID()),
 				zap.String("channel", p.Channel.GetChannelName()),
 				zap.Int64("from", p.From),
 				zap.Int64("to", p.To),
@@ -109,7 +114,7 @@ func CreateChannelTasksFromPlans(ctx context.Context, checkerID int64, timeout t
 
 		log.Info("create channel task",
 			zap.Int64("collection", p.Channel.GetCollectionID()),
-			zap.Int64("replica", p.ReplicaID),
+			zap.Int64("replica", p.Replica.GetID()),
 			zap.String("channel", p.Channel.GetChannelName()),
 			zap.Int64("from", p.From),
 			zap.Int64("to", p.To))
@@ -120,13 +125,14 @@ func CreateChannelTasksFromPlans(ctx context.Context, checkerID int64, timeout t
 }
 
 func PrintNewBalancePlans(collectionID int64, replicaID int64, segmentPlans []SegmentAssignPlan,
-	channelPlans []ChannelAssignPlan) {
-	balanceInfo := fmt.Sprintf("%s{collectionID:%d, replicaID:%d, ", InfoPrefix, collectionID, replicaID)
+	channelPlans []ChannelAssignPlan,
+) {
+	balanceInfo := fmt.Sprintf("%s new plans:{collectionID:%d, replicaID:%d, ", PlanInfoPrefix, collectionID, replicaID)
 	for _, segmentPlan := range segmentPlans {
-		balanceInfo += segmentPlan.ToString()
+		balanceInfo += segmentPlan.String()
 	}
 	for _, channelPlan := range channelPlans {
-		balanceInfo += channelPlan.ToString()
+		balanceInfo += channelPlan.String()
 	}
 	balanceInfo += "}"
 	log.Info(balanceInfo)
@@ -134,9 +140,10 @@ func PrintNewBalancePlans(collectionID int64, replicaID int64, segmentPlans []Se
 
 func PrintCurrentReplicaDist(replica *meta.Replica,
 	stoppingNodesSegments map[int64][]*meta.Segment, nodeSegments map[int64][]*meta.Segment,
-	channelManager *meta.ChannelDistManager) {
-	distInfo := fmt.Sprintf("%s {collectionID:%d, replicaID:%d, ", InfoPrefix, replica.CollectionID, replica.GetID())
-	//1. print stopping nodes segment distribution
+	channelManager *meta.ChannelDistManager, segmentDistMgr *meta.SegmentDistManager,
+) {
+	distInfo := fmt.Sprintf("%s {collectionID:%d, replicaID:%d, ", DistInfoPrefix, replica.GetCollectionID(), replica.GetID())
+	// 1. print stopping nodes segment distribution
 	distInfo += "[stoppingNodesSegmentDist:"
 	for stoppingNodeID, stoppedSegments := range stoppingNodesSegments {
 		distInfo += fmt.Sprintf("[nodeID:%d, ", stoppingNodeID)
@@ -146,26 +153,31 @@ func PrintCurrentReplicaDist(replica *meta.Replica,
 		}
 		distInfo += "]]"
 	}
-	distInfo += "]\n"
-	//2. print normal nodes segment distribution
+	distInfo += "]"
+	// 2. print normal nodes segment distribution
 	distInfo += "[normalNodesSegmentDist:"
-	for normalNodeID, normalNodeSegments := range nodeSegments {
+	for normalNodeID, normalNodeCollectionSegments := range nodeSegments {
 		distInfo += fmt.Sprintf("[nodeID:%d, ", normalNodeID)
 		distInfo += "loaded-segments:["
 		nodeRowSum := int64(0)
-		for _, normalSegment := range normalNodeSegments {
-			distInfo += fmt.Sprintf("[segmentID: %d, rowCount: %d] ",
-				normalSegment.GetID(), normalSegment.GetNumOfRows())
-			nodeRowSum += normalSegment.GetNumOfRows()
+		normalNodeSegments := segmentDistMgr.GetByFilter(meta.WithNodeID(normalNodeID))
+		for _, normalNodeSegment := range normalNodeSegments {
+			nodeRowSum += normalNodeSegment.GetNumOfRows()
 		}
-		distInfo += fmt.Sprintf("] nodeRowSum:%d]", nodeRowSum)
+		nodeCollectionRowSum := int64(0)
+		for _, normalCollectionSegment := range normalNodeCollectionSegments {
+			distInfo += fmt.Sprintf("[segmentID: %d, rowCount: %d] ",
+				normalCollectionSegment.GetID(), normalCollectionSegment.GetNumOfRows())
+			nodeCollectionRowSum += normalCollectionSegment.GetNumOfRows()
+		}
+		distInfo += fmt.Sprintf("] nodeRowSum:%d nodeCollectionRowSum:%d]", nodeRowSum, nodeCollectionRowSum)
 	}
-	distInfo += "]\n"
+	distInfo += "]"
 
-	//3. print stopping nodes channel distribution
+	// 3. print stopping nodes channel distribution
 	distInfo += "[stoppingNodesChannelDist:"
 	for stoppingNodeID := range stoppingNodesSegments {
-		stoppingNodeChannels := channelManager.GetByNode(stoppingNodeID)
+		stoppingNodeChannels := channelManager.GetByCollectionAndFilter(replica.GetCollectionID(), meta.WithNodeID2Channel(stoppingNodeID))
 		distInfo += fmt.Sprintf("[nodeID:%d, count:%d,", stoppingNodeID, len(stoppingNodeChannels))
 		distInfo += "channels:["
 		for _, stoppingChan := range stoppingNodeChannels {
@@ -173,12 +185,12 @@ func PrintCurrentReplicaDist(replica *meta.Replica,
 		}
 		distInfo += "]]"
 	}
-	distInfo += "]\n"
+	distInfo += "]"
 
-	//4. print normal nodes channel distribution
+	// 4. print normal nodes channel distribution
 	distInfo += "[normalNodesChannelDist:"
 	for normalNodeID := range nodeSegments {
-		normalNodeChannels := channelManager.GetByNode(normalNodeID)
+		normalNodeChannels := channelManager.GetByCollectionAndFilter(replica.GetCollectionID(), meta.WithNodeID2Channel(normalNodeID))
 		distInfo += fmt.Sprintf("[nodeID:%d, count:%d,", normalNodeID, len(normalNodeChannels))
 		distInfo += "channels:["
 		for _, normalNodeChan := range normalNodeChannels {
@@ -186,7 +198,7 @@ func PrintCurrentReplicaDist(replica *meta.Replica,
 		}
 		distInfo += "]]"
 	}
-	distInfo += "]\n"
+	distInfo += "]"
 
 	log.Info(distInfo)
 }

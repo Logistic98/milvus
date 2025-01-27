@@ -25,23 +25,22 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
-	"github.com/milvus-io/milvus/internal/util/mock"
-
-	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/stretchr/testify/assert"
+	"go.uber.org/zap"
 	"google.golang.org/grpc"
 
-	"github.com/milvus-io/milvus/internal/proxy"
+	"github.com/milvus-io/milvus/internal/util/mock"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/util/etcd"
-	"github.com/stretchr/testify/assert"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
 func TestMain(m *testing.M) {
 	// init embed etcd
 	embedetcdServer, tempDir, err := etcd.StartTestEmbedEtcdServer()
 	if err != nil {
-		log.Fatal(err.Error())
+		log.Fatal("failed to start embed etcd server", zap.Error(err))
 	}
 	defer os.RemoveAll(tempDir)
 	defer embedetcdServer.Close()
@@ -56,50 +55,30 @@ func TestMain(m *testing.M) {
 }
 
 func Test_NewClient(t *testing.T) {
-	proxy.Params.Init()
-
 	ctx := context.Background()
 
-	etcdCli, err := etcd.GetEtcdClient(
-		Params.EtcdCfg.UseEmbedEtcd.GetAsBool(),
-		Params.EtcdCfg.EtcdUseSSL.GetAsBool(),
-		Params.EtcdCfg.Endpoints.GetAsStrings(),
-		Params.EtcdCfg.EtcdTLSCert.GetValue(),
-		Params.EtcdCfg.EtcdTLSKey.GetValue(),
-		Params.EtcdCfg.EtcdTLSCACert.GetValue(),
-		Params.EtcdCfg.EtcdTLSMinVersion.GetValue())
+	client, err := NewClient(ctx)
 	assert.NoError(t, err)
-	client, err := NewClient(ctx, proxy.Params.EtcdCfg.MetaRootPath.GetValue(), etcdCli)
-	assert.Nil(t, err)
 	assert.NotNil(t, client)
-
-	err = client.Init()
-	assert.Nil(t, err)
-
-	err = client.Start()
-	assert.Nil(t, err)
-
-	err = client.Register()
-	assert.Nil(t, err)
 
 	checkFunc := func(retNotNil bool) {
 		retCheck := func(notNil bool, ret any, err error) {
 			if notNil {
 				assert.NotNil(t, ret)
-				assert.Nil(t, err)
+				assert.NoError(t, err)
 			} else {
 				assert.Nil(t, ret)
-				assert.NotNil(t, err)
+				assert.Error(t, err)
 			}
 		}
 
-		r1, err := client.GetComponentStates(ctx)
+		r1, err := client.GetComponentStates(ctx, nil)
 		retCheck(retNotNil, r1, err)
 
-		r2, err := client.GetTimeTickChannel(ctx)
+		r2, err := client.GetTimeTickChannel(ctx, nil)
 		retCheck(retNotNil, r2, err)
 
-		r3, err := client.GetStatisticsChannel(ctx)
+		r3, err := client.GetStatisticsChannel(ctx, nil)
 		retCheck(retNotNil, r3, err)
 
 		r4, err := client.ShowCollections(ctx, nil)
@@ -170,20 +149,56 @@ func Test_NewClient(t *testing.T) {
 
 		r27, err := client.DescribeResourceGroup(ctx, nil)
 		retCheck(retNotNil, r27, err)
+
+		r28, err := client.ListCheckers(ctx, nil)
+		retCheck(retNotNil, r28, err)
+
+		r29, err := client.ActivateChecker(ctx, nil)
+		retCheck(retNotNil, r29, err)
+
+		r30, err := client.DeactivateChecker(ctx, nil)
+		retCheck(retNotNil, r30, err)
+
+		r31, err := client.ListQueryNode(ctx, nil)
+		retCheck(retNotNil, r31, err)
+
+		r32, err := client.GetQueryNodeDistribution(ctx, nil)
+		retCheck(retNotNil, r32, err)
+
+		r33, err := client.SuspendBalance(ctx, nil)
+		retCheck(retNotNil, r33, err)
+
+		r34, err := client.ResumeBalance(ctx, nil)
+		retCheck(retNotNil, r34, err)
+
+		r35, err := client.SuspendNode(ctx, nil)
+		retCheck(retNotNil, r35, err)
+
+		r36, err := client.ResumeNode(ctx, nil)
+		retCheck(retNotNil, r36, err)
+
+		r37, err := client.TransferSegment(ctx, nil)
+		retCheck(retNotNil, r37, err)
+
+		r38, err := client.TransferChannel(ctx, nil)
+		retCheck(retNotNil, r38, err)
+
+		r39, err := client.CheckQueryNodeDistribution(ctx, nil)
+		retCheck(retNotNil, r39, err)
 	}
 
-	client.grpcClient = &mock.GRPCClientBase[querypb.QueryCoordClient]{
+	client.(*Client).grpcClient = &mock.GRPCClientBase[querypb.QueryCoordClient]{
 		GetGrpcClientErr: errors.New("dummy"),
 	}
 
 	newFunc1 := func(cc *grpc.ClientConn) querypb.QueryCoordClient {
 		return &mock.GrpcQueryCoordClient{Err: nil}
 	}
-	client.grpcClient.SetNewGrpcClientFunc(newFunc1)
+	client.(*Client).grpcClient.SetNewGrpcClientFunc(newFunc1)
 
 	checkFunc(false)
 
-	client.grpcClient = &mock.GRPCClientBase[querypb.QueryCoordClient]{
+	client.(*Client).grpcClient = &mock.GRPCClientBase[querypb.QueryCoordClient]{
 		GetGrpcClientErr: nil,
 	}
 
@@ -191,21 +206,21 @@ func Test_NewClient(t *testing.T) {
 		return &mock.GrpcQueryCoordClient{Err: errors.New("dummy")}
 	}
 
-	client.grpcClient.SetNewGrpcClientFunc(newFunc2)
+	client.(*Client).grpcClient.SetNewGrpcClientFunc(newFunc2)
 
 	checkFunc(false)
 
-	client.grpcClient = &mock.GRPCClientBase[querypb.QueryCoordClient]{
+	client.(*Client).grpcClient = &mock.GRPCClientBase[querypb.QueryCoordClient]{
 		GetGrpcClientErr: nil,
 	}
 
 	newFunc3 := func(cc *grpc.ClientConn) querypb.QueryCoordClient {
 		return &mock.GrpcQueryCoordClient{Err: nil}
 	}
-	client.grpcClient.SetNewGrpcClientFunc(newFunc3)
+	client.(*Client).grpcClient.SetNewGrpcClientFunc(newFunc3)
 
 	checkFunc(true)
 
-	err = client.Stop()
-	assert.Nil(t, err)
+	err = client.Close()
+	assert.NoError(t, err)
 }

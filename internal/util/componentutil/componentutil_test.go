@@ -22,11 +22,13 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
-
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
 	"github.com/stretchr/testify/assert"
+	"google.golang.org/grpc"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus/pkg/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/util/funcutil"
 )
 
 type MockComponent struct {
@@ -55,11 +57,11 @@ func (mc *MockComponent) Stop() error {
 	return nil
 }
 
-func (mc *MockComponent) GetComponentStates(ctx context.Context) (*milvuspb.ComponentStates, error) {
+func (mc *MockComponent) GetComponentStates(ctx context.Context, req *milvuspb.GetComponentStatesRequest, opts ...grpc.CallOption) (*milvuspb.ComponentStates, error) {
 	return mc.compState, mc.compErr
 }
 
-func (mc *MockComponent) GetStatisticsChannel(ctx context.Context) (*milvuspb.StringResponse, error) {
+func (mc *MockComponent) GetStatisticsChannel(ctx context.Context, req *internalpb.GetStatisticsChannelRequest, opts ...grpc.CallOption) (*milvuspb.StringResponse, error) {
 	return mc.strResp, nil
 }
 
@@ -92,7 +94,7 @@ func Test_WaitForComponentInitOrHealthy(t *testing.T) {
 		compErr:   errors.New("error"),
 	}
 	err := WaitForComponentInitOrHealthy(context.TODO(), mc, "mockService", 1, 10*time.Millisecond)
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 
 	mc = &MockComponent{
 		compState: &milvuspb.ComponentStates{
@@ -104,7 +106,7 @@ func Test_WaitForComponentInitOrHealthy(t *testing.T) {
 		compErr: nil,
 	}
 	err = WaitForComponentInitOrHealthy(context.TODO(), mc, "mockService", 1, 10*time.Millisecond)
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 
 	validCodes := []commonpb.StateCode{commonpb.StateCode_Initializing, commonpb.StateCode_Healthy}
 	testCodes := []commonpb.StateCode{commonpb.StateCode_Initializing, commonpb.StateCode_Healthy, commonpb.StateCode_Abnormal}
@@ -112,9 +114,9 @@ func Test_WaitForComponentInitOrHealthy(t *testing.T) {
 		mc := buildMockComponent(code)
 		err := WaitForComponentInitOrHealthy(context.TODO(), mc, "mockService", 1, 10*time.Millisecond)
 		if funcutil.SliceContain(validCodes, code) {
-			assert.Nil(t, err)
+			assert.NoError(t, err)
 		} else {
-			assert.NotNil(t, err)
+			assert.Error(t, err)
 		}
 	}
 }
@@ -126,9 +128,9 @@ func Test_WaitForComponentInit(t *testing.T) {
 		mc := buildMockComponent(code)
 		err := WaitForComponentInit(context.TODO(), mc, "mockService", 1, 10*time.Millisecond)
 		if funcutil.SliceContain(validCodes, code) {
-			assert.Nil(t, err)
+			assert.NoError(t, err)
 		} else {
-			assert.NotNil(t, err)
+			assert.Error(t, err)
 		}
 	}
 }

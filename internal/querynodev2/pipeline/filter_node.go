@@ -17,35 +17,37 @@
 package pipeline
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 
-	"github.com/golang/protobuf/proto"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/querynodev2/segments"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus/internal/querynodev2/delegator"
 	base "github.com/milvus-io/milvus/internal/util/pipeline"
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/metrics"
 	"github.com/milvus-io/milvus/pkg/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/util/merr"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/util/tsoutil"
 )
 
-//filterNode filter the invalid message of pipeline
+// filterNode filter the invalid message of pipeline
 type filterNode struct {
 	*BaseNode
 	collectionID     UniqueID
 	manager          *DataManager
-	excludedSegments *typeutil.ConcurrentMap[int64, *datapb.SegmentInfo]
 	channel          string
 	InsertMsgPolicys []InsertMsgFilter
 	DeleteMsgPolicys []DeleteMsgFilter
+
+	delegator delegator.ShardDelegator
 }
 
 func (fNode *filterNode) Operate(in Msg) Msg {
+	log := log.Ctx(context.TODO())
 	if in == nil {
 		log.Debug("type assertion failed for Msg in filterNode because it's nil",
 			zap.String("name", fNode.Name()))
@@ -66,14 +68,12 @@ func (fNode *filterNode) Operate(in Msg) Msg {
 
 	metrics.QueryNodeConsumeTimeTickLag.
 		WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.InsertLabel, fmt.Sprint(fNode.collectionID)).
-		Set(float64(streamMsgPack.EndTs))
+		Set(float64(tsoutil.SubByNow(streamMsgPack.EndTs)))
 
-	//Get collection from collection manager
+	// Get collection from collection manager
 	collection := fNode.manager.Collection.Get(fNode.collectionID)
 	if collection == nil {
-		err := segments.WrapCollectionNotFound(fNode.collectionID)
-		log.Error(err.Error())
-		panic(err)
+		log.Fatal("collection not found in meta", zap.Int64("collectionID", fNode.collectionID))
 	}
 
 	out := &insertNodeMsg{
@@ -85,7 +85,7 @@ func (fNode *filterNode) Operate(in Msg) Msg {
 		},
 	}
 
-	//add msg to out if msg pass check of filter
+	// add msg to out if msg pass check of filter
 	for _, msg := range streamMsgPack.Msgs {
 		err := fNode.filtrate(collection, msg)
 		if err != nil {
@@ -99,16 +99,17 @@ func (fNode *filterNode) Operate(in Msg) Msg {
 			out.append(msg)
 		}
 	}
+	fNode.delegator.TryCleanExcludedSegments(streamMsgPack.EndTs)
+	metrics.QueryNodeWaitProcessingMsgCount.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.InsertLabel).Inc()
 	return out
 }
 
-//filtrate message with filter policy
+// filtrate message with filter policy
 func (fNode *filterNode) filtrate(c *Collection, msg msgstream.TsMsg) error {
-
 	switch msg.Type() {
 	case commonpb.MsgType_Insert:
 		insertMsg := msg.(*msgstream.InsertMsg)
-		metrics.QueryNodeConsumeCounter.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.InsertLabel).Add(float64(proto.Size(insertMsg)))
+		metrics.QueryNodeConsumeCounter.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.InsertLabel).Add(float64(insertMsg.Size()))
 		for _, policy := range fNode.InsertMsgPolicys {
 			err := policy(fNode, c, insertMsg)
 			if err != nil {
@@ -116,9 +117,17 @@ func (fNode *filterNode) filtrate(c *Collection, msg msgstream.TsMsg) error {
 			}
 		}
 
+		// check segment whether excluded
+		ok := fNode.delegator.VerifyExcludedSegments(insertMsg.SegmentID, insertMsg.EndTimestamp)
+		if !ok {
+			m := fmt.Sprintf("skip msg due to segment=%d has been excluded", insertMsg.GetSegmentID())
+			return merr.WrapErrServiceInternal(m)
+		}
+		return nil
+
 	case commonpb.MsgType_Delete:
 		deleteMsg := msg.(*msgstream.DeleteMsg)
-		metrics.QueryNodeConsumeCounter.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.InsertLabel).Add(float64(proto.Size(deleteMsg)))
+		metrics.QueryNodeConsumeCounter.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.InsertLabel).Add(float64(deleteMsg.Size()))
 		for _, policy := range fNode.DeleteMsgPolicys {
 			err := policy(fNode, c, deleteMsg)
 			if err != nil {
@@ -126,7 +135,7 @@ func (fNode *filterNode) filtrate(c *Collection, msg msgstream.TsMsg) error {
 			}
 		}
 	default:
-		return ErrMsgInvalidType
+		return merr.WrapErrParameterInvalid("msgType is Insert or Delete", "not")
 	}
 	return nil
 }
@@ -135,20 +144,19 @@ func newFilterNode(
 	collectionID int64,
 	channel string,
 	manager *DataManager,
-	excludedSegments *typeutil.ConcurrentMap[int64, *datapb.SegmentInfo],
+	delegator delegator.ShardDelegator,
 	maxQueueLength int32,
 ) *filterNode {
 	return &filterNode{
-		BaseNode:         base.NewBaseNode(fmt.Sprintf("FilterNode-%s", channel), maxQueueLength),
-		collectionID:     collectionID,
-		manager:          manager,
-		channel:          channel,
-		excludedSegments: excludedSegments,
+		BaseNode:     base.NewBaseNode(fmt.Sprintf("FilterNode-%s", channel), maxQueueLength),
+		collectionID: collectionID,
+		manager:      manager,
+		channel:      channel,
+		delegator:    delegator,
 		InsertMsgPolicys: []InsertMsgFilter{
 			InsertNotAligned,
 			InsertEmpty,
 			InsertOutOfTarget,
-			InsertExcluded,
 		},
 		DeleteMsgPolicys: []DeleteMsgFilter{
 			DeleteNotAligned,

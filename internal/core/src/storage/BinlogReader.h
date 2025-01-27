@@ -19,8 +19,7 @@
 #include <memory>
 #include <utility>
 
-#include "utils/Status.h"
-#include "exceptions/EasyAssert.h"
+#include "common/EasyAssert.h"
 
 namespace milvus::storage {
 
@@ -31,16 +30,10 @@ class BinlogReader {
         : data_(binlog_data), size_(length), tell_(0) {
     }
 
-    explicit BinlogReader(const uint8_t* binlog_data, int64_t length)
-        : size_(length), tell_(0) {
-        data_ = std::shared_ptr<uint8_t[]>(new uint8_t[length]);
-        std::memcpy(data_.get(), binlog_data, length);
-    }
-
-    Status
+    SegcoreError
     Read(int64_t nbytes, void* out);
 
-    std::pair<Status, std::shared_ptr<uint8_t[]>>
+    std::pair<SegcoreError, std::shared_ptr<uint8_t[]>>
     Read(int64_t nbytes);
 
     int64_t
@@ -49,9 +42,9 @@ class BinlogReader {
     }
 
  private:
+    std::shared_ptr<uint8_t[]> data_;
     int64_t size_;
     int64_t tell_;
-    std::shared_ptr<uint8_t[]> data_;
 };
 
 using BinlogReaderPtr = std::shared_ptr<BinlogReader>;

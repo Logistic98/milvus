@@ -18,31 +18,67 @@ package msgstream
 
 import (
 	"context"
+	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
 func TestPmsFactory(t *testing.T) {
-	Params.Init()
-	pmsFactory := NewPmsFactory(&Params.PulsarCfg)
+	pmsFactory := NewPmsFactory(&Params.ServiceParam)
 
-	ctx := context.Background()
-	_, err := pmsFactory.NewMsgStream(ctx)
-	assert.Nil(t, err)
+	err := pmsFactory.NewMsgStreamDisposer(context.Background())([]string{"hello"}, "xx")
+	assert.NoError(t, err)
 
-	_, err = pmsFactory.NewTtMsgStream(ctx)
-	assert.Nil(t, err)
+	tests := []struct {
+		description   string
+		withTimeout   bool
+		ctxTimeouted  bool
+		expectedError bool
+	}{
+		{"normal ctx", false, false, false},
+		{"timeout ctx not timeout", true, false, false},
+		{"timeout ctx timeout", true, true, true},
+	}
 
-	_, err = pmsFactory.NewQueryMsgStream(ctx)
-	assert.Nil(t, err)
+	for _, test := range tests {
+		t.Run(test.description, func(t *testing.T) {
+			var cancel context.CancelFunc
+			ctx := context.Background()
+			if test.withTimeout {
+				if test.ctxTimeouted {
+					ctx, cancel = context.WithDeadline(ctx, time.Now().Add(-1*time.Minute))
+				} else {
+					ctx, cancel = context.WithTimeout(ctx, time.Second*10)
+				}
+				defer cancel()
+			}
+			stream, err := pmsFactory.NewMsgStream(ctx)
+			if test.expectedError {
+				assert.Error(t, err)
+				assert.Nil(t, stream)
+			} else {
+				assert.NoError(t, err)
+				assert.NotNil(t, stream)
+			}
 
-	err = pmsFactory.NewMsgStreamDisposer(ctx)([]string{"hello"}, "xx")
-	assert.Nil(t, err)
+			ttStream, err := pmsFactory.NewTtMsgStream(ctx)
+			if test.expectedError {
+				assert.Error(t, err)
+				assert.Nil(t, ttStream)
+			} else {
+				assert.NoError(t, err)
+				assert.NotNil(t, ttStream)
+			}
+		})
+	}
 }
 
 func TestPmsFactoryWithAuth(t *testing.T) {
-	config := &Params.PulsarCfg
+	config := &Params.ServiceParam
 	Params.Save(Params.PulsarCfg.AuthPlugin.Key, "token")
 	Params.Save(Params.PulsarCfg.AuthParams.Key, "token:fake_token")
 	defer func() {
@@ -53,13 +89,10 @@ func TestPmsFactoryWithAuth(t *testing.T) {
 
 	ctx := context.Background()
 	_, err := pmsFactory.NewMsgStream(ctx)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	_, err = pmsFactory.NewTtMsgStream(ctx)
-	assert.Nil(t, err)
-
-	_, err = pmsFactory.NewQueryMsgStream(ctx)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	Params.Save(Params.PulsarCfg.AuthParams.Key, "")
 	pmsFactory = NewPmsFactory(config)
@@ -70,25 +103,67 @@ func TestPmsFactoryWithAuth(t *testing.T) {
 
 	_, err = pmsFactory.NewTtMsgStream(ctx)
 	assert.Error(t, err)
-
-	_, err = pmsFactory.NewQueryMsgStream(ctx)
-	assert.Error(t, err)
-
 }
 
 func TestKafkaFactory(t *testing.T) {
-	kmsFactory := NewKmsFactory(&Params.KafkaCfg)
+	kmsFactory := NewKmsFactory(&Params.ServiceParam)
+
+	tests := []struct {
+		description   string
+		withTimeout   bool
+		ctxTimeouted  bool
+		expectedError bool
+	}{
+		{"normal ctx", false, false, false},
+		{"timeout ctx not timeout", true, false, false},
+		{"timeout ctx timeout", true, true, true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.description, func(t *testing.T) {
+			var cancel context.CancelFunc
+			ctx := context.Background()
+			if test.withTimeout {
+				if test.ctxTimeouted {
+					ctx, cancel = context.WithDeadline(ctx, time.Now().Add(-1*time.Minute))
+				} else {
+					ctx, cancel = context.WithTimeout(ctx, time.Second*10)
+				}
+				defer cancel()
+			}
+			stream, err := kmsFactory.NewMsgStream(ctx)
+			if test.expectedError {
+				assert.Error(t, err)
+				assert.Nil(t, stream)
+			} else {
+				assert.NoError(t, err)
+				assert.NotNil(t, stream)
+			}
+
+			ttStream, err := kmsFactory.NewTtMsgStream(ctx)
+			if test.expectedError {
+				assert.Error(t, err)
+				assert.Nil(t, ttStream)
+			} else {
+				assert.NoError(t, err)
+				assert.NotNil(t, ttStream)
+			}
+		})
+	}
+}
+
+func TestRmsFactory(t *testing.T) {
+	defer os.Unsetenv("ROCKSMQ_PATH")
+	paramtable.Init()
+
+	dir := t.TempDir()
+
+	rmsFactory := NewRocksmqFactory(dir, &paramtable.Get().ServiceParam)
 
 	ctx := context.Background()
-	_, err := kmsFactory.NewMsgStream(ctx)
-	assert.Nil(t, err)
+	_, err := rmsFactory.NewMsgStream(ctx)
+	assert.NoError(t, err)
 
-	_, err = kmsFactory.NewTtMsgStream(ctx)
-	assert.Nil(t, err)
-
-	_, err = kmsFactory.NewQueryMsgStream(ctx)
-	assert.Nil(t, err)
-
-	// err = kmsFactory.NewMsgStreamDisposer(ctx)([]string{"hello"}, "xx")
-	// assert.Nil(t, err)
+	_, err = rmsFactory.NewTtMsgStream(ctx)
+	assert.NoError(t, err)
 }

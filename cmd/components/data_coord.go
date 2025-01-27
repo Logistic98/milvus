@@ -18,12 +18,16 @@ package components
 
 import (
 	"context"
+	"time"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
+	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	grpcdatacoordclient "github.com/milvus-io/milvus/internal/distributed/datacoord"
 	"github.com/milvus-io/milvus/internal/util/dependency"
 	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
@@ -35,7 +39,10 @@ type DataCoord struct {
 
 // NewDataCoord creates a new DataCoord
 func NewDataCoord(ctx context.Context, factory dependency.Factory) (*DataCoord, error) {
-	s := grpcdatacoordclient.NewServer(ctx, factory)
+	s, err := grpcdatacoordclient.NewServer(ctx, factory)
+	if err != nil {
+		return nil, err
+	}
 
 	return &DataCoord{
 		ctx: ctx,
@@ -43,21 +50,25 @@ func NewDataCoord(ctx context.Context, factory dependency.Factory) (*DataCoord, 
 	}, nil
 }
 
+// Prepare prepares service
+func (s *DataCoord) Prepare() error {
+	return s.svr.Prepare()
+}
+
 // Run starts service
 func (s *DataCoord) Run() error {
 	if err := s.svr.Run(); err != nil {
+		log.Ctx(s.ctx).Error("DataCoord starts error", zap.Error(err))
 		return err
 	}
-	log.Debug("DataCoord successfully started")
+	log.Ctx(s.ctx).Debug("DataCoord successfully started")
 	return nil
 }
 
 // Stop terminates service
 func (s *DataCoord) Stop() error {
-	if err := s.svr.Stop(); err != nil {
-		return err
-	}
-	return nil
+	timeout := paramtable.Get().DataCoordCfg.GracefulStopTimeout.GetAsDuration(time.Second)
+	return exitWhenStopTimeout(s.svr.Stop, timeout)
 }
 
 // GetComponentStates returns DataCoord's states

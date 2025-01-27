@@ -17,15 +17,18 @@ extern "C" {
 #include <stdint.h>
 #include <stdlib.h>
 
+#include "common/resource_c.h"
 #include "common/binary_set_c.h"
 #include "common/type_c.h"
 #include "segcore/collection_c.h"
 
 typedef void* CLoadIndexInfo;
 
+bool
+IsLoadWithDisk(const char* index_type, int index_engine_version);
+
 CStatus
-NewLoadIndexInfo(CLoadIndexInfo* c_load_index_info,
-                 CStorageConfig c_storage_config);
+NewLoadIndexInfo(CLoadIndexInfo* c_load_index_info);
 
 void
 DeleteLoadIndexInfo(CLoadIndexInfo c_load_index_info);
@@ -41,7 +44,12 @@ AppendFieldInfo(CLoadIndexInfo c_load_index_info,
                 int64_t partition_id,
                 int64_t segment_id,
                 int64_t field_id,
-                enum CDataType field_type);
+                enum CDataType field_type,
+                bool enable_mmap,
+                const char* mmap_dir_path);
+
+LoadResourceRequest
+EstimateLoadIndexResource(CLoadIndexInfo c_load_index_info);
 
 CStatus
 AppendIndexInfo(CLoadIndexInfo c_load_index_info,
@@ -56,8 +64,24 @@ CStatus
 AppendIndexFilePath(CLoadIndexInfo c_load_index_info, const char* file_path);
 
 CStatus
+AppendIndexV2(CTraceContext c_trace, CLoadIndexInfo c_load_index_info);
+
+CStatus
+AppendIndexEngineVersionToLoadInfo(CLoadIndexInfo c_load_index_info,
+                                   int32_t index_engine_version);
+
+CStatus
 CleanLoadedIndex(CLoadIndexInfo c_load_index_info);
 
+void
+AppendStorageInfo(CLoadIndexInfo c_load_index_info,
+                  const char* uri,
+                  int64_t version);
+
+CStatus
+FinishLoadIndexInfo(CLoadIndexInfo c_load_index_info,
+                    const uint8_t* serialized_load_index_info,
+                    const uint64_t len);
 #ifdef __cplusplus
 }
 #endif

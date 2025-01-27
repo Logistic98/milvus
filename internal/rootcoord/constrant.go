@@ -16,6 +16,12 @@
 
 package rootcoord
 
+import (
+	"context"
+
+	"github.com/milvus-io/milvus/pkg/util/merr"
+)
+
 const (
 	// TODO: better to make them configurable, use default value if no config was set since we never explode these before.
 	globalIDAllocatorKey      = "idTimestamp"
@@ -23,3 +29,26 @@ const (
 	globalTSOAllocatorKey     = "timestamp"
 	globalTSOAllocatorSubPath = "tso"
 )
+
+func checkGeneralCapacity(ctx context.Context, newColNum int,
+	newParNum int64,
+	newShardNum int32,
+	core *Core,
+) error {
+	var addedNum int64 = 0
+	if newColNum > 0 && newParNum > 0 && newShardNum > 0 {
+		// create collections scenarios
+		addedNum += int64(newColNum) * newParNum * int64(newShardNum)
+	} else if newColNum == 0 && newShardNum == 0 && newParNum > 0 {
+		// add partitions to existing collections
+		addedNum += newParNum
+	}
+
+	generalCount := core.meta.GetGeneralCount(ctx)
+	generalCount += int(addedNum)
+	if generalCount > Params.RootCoordCfg.MaxGeneralCapacity.GetAsInt() {
+		return merr.WrapGeneralCapacityExceed(generalCount, Params.RootCoordCfg.MaxGeneralCapacity.GetAsInt64(),
+			"failed checking constraint: sum_collections(parition*shard) exceeding the max general capacity:")
+	}
+	return nil
+}

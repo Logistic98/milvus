@@ -17,33 +17,51 @@
 package pipeline
 
 import (
+	"context"
+	"fmt"
 	"sync"
 	"time"
 
-	"github.com/milvus-io/milvus-proto/go-api/msgpb"
+	"github.com/cockroachdb/errors"
+	"go.uber.org/atomic"
+	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
+	"github.com/milvus-io/milvus/internal/distributed/streaming"
+	"github.com/milvus-io/milvus/internal/util/streamingutil"
 	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/mq/common"
 	"github.com/milvus-io/milvus/pkg/mq/msgdispatcher"
 	"github.com/milvus-io/milvus/pkg/mq/msgstream"
-	"github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper"
+	"github.com/milvus-io/milvus/pkg/streaming/util/message"
+	"github.com/milvus-io/milvus/pkg/streaming/util/message/adaptor"
+	"github.com/milvus-io/milvus/pkg/streaming/util/options"
+	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/util/retry"
 	"github.com/milvus-io/milvus/pkg/util/tsoutil"
-	"go.uber.org/zap"
 )
 
 type StreamPipeline interface {
 	Pipeline
-	ConsumeMsgStream(position *msgpb.MsgPosition) error
+	ConsumeMsgStream(ctx context.Context, position *msgpb.MsgPosition) error
+	Status() string
 }
 
 type streamPipeline struct {
-	*pipeline
-	input      <-chan *msgstream.MsgPack
-	dispatcher msgdispatcher.Client
-	startOnce  sync.Once
-	vChannel   string
+	pipeline        *pipeline
+	input           <-chan *msgstream.MsgPack
+	scanner         streaming.Scanner
+	dispatcher      msgdispatcher.Client
+	startOnce       sync.Once
+	vChannel        string
+	replicateConfig *msgstream.ReplicateConfig
 
 	closeCh   chan struct{} // notify work to exit
 	closeWg   sync.WaitGroup
 	closeOnce sync.Once
+
+	lastAccessTime *atomic.Time
 }
 
 func (p *streamPipeline) work() {
@@ -51,28 +69,79 @@ func (p *streamPipeline) work() {
 	for {
 		select {
 		case <-p.closeCh:
-			log.Debug("stream pipeline input closed")
+			log.Ctx(context.TODO()).Debug("stream pipeline input closed")
 			return
 		case msg := <-p.input:
-			log.RatedDebug(10, "stream pipeline fetch msg", zap.Int("sum", len(msg.Msgs)))
-			p.nodes[0].inputChannel <- msg
+			p.lastAccessTime.Store(time.Now())
+			log.Ctx(context.TODO()).RatedDebug(10, "stream pipeline fetch msg", zap.Int("sum", len(msg.Msgs)))
+			p.pipeline.inputChannel <- msg
+			p.pipeline.process()
 		}
 	}
 }
 
-func (p *streamPipeline) ConsumeMsgStream(position *msgpb.MsgPosition) error {
+// Status returns the status of the pipeline, it will return "Healthy" if the input node
+// has received any msg in the last nodeTtInterval
+func (p *streamPipeline) Status() string {
+	diff := time.Since(p.lastAccessTime.Load())
+	if diff > p.pipeline.nodeTtInterval {
+		return fmt.Sprintf("input node hasn't received any msg in the last %s", diff.String())
+	}
+	return "Healthy"
+}
+
+func (p *streamPipeline) ConsumeMsgStream(ctx context.Context, position *msgpb.MsgPosition) error {
+	log := log.Ctx(ctx)
 	var err error
 	if position == nil {
 		log.Error("seek stream to nil position")
 		return ErrNilPosition
 	}
 
+	if streamingutil.IsStreamingServiceEnabled() {
+		startFrom := adaptor.MustGetMessageIDFromMQWrapperIDBytes(streaming.WAL().WALName(), position.GetMsgID())
+		log.Info(
+			"stream pipeline seeks from position with scanner",
+			zap.String("channel", position.GetChannelName()),
+			zap.Any("startFromMessageID", startFrom),
+			zap.Uint64("timestamp", position.GetTimestamp()),
+		)
+		handler := adaptor.NewMsgPackAdaptorHandler()
+		p.scanner = streaming.WAL().Read(ctx, streaming.ReadOption{
+			VChannel:      position.GetChannelName(),
+			DeliverPolicy: options.DeliverPolicyStartFrom(startFrom),
+			DeliverFilters: []options.DeliverFilter{
+				// only consume messages with timestamp >= position timestamp
+				options.DeliverFilterTimeTickGTE(position.GetTimestamp()),
+				// only consume insert and delete messages
+				options.DeliverFilterMessageType(message.MessageTypeInsert, message.MessageTypeDelete),
+			},
+			MessageHandler: handler,
+		})
+		p.input = handler.Chan()
+		return nil
+	}
+
 	start := time.Now()
-	p.input, err = p.dispatcher.Register(p.vChannel, position, mqwrapper.SubscriptionPositionUnknown)
+	err = retry.Handle(ctx, func() (bool, error) {
+		p.input, err = p.dispatcher.Register(ctx, &msgdispatcher.StreamConfig{
+			VChannel:        p.vChannel,
+			Pos:             position,
+			SubPos:          common.SubscriptionPositionUnknown,
+			ReplicateConfig: p.replicateConfig,
+		})
+		if err != nil {
+			log.Warn("dispatcher register failed", zap.String("channel", position.ChannelName), zap.Error(err))
+			return errors.Is(err, merr.ErrTooManyConsumers), err
+		}
+		return false, nil
+	}, retry.Sleep(paramtable.Get().MQCfg.RetrySleep.GetAsDuration(time.Second)), // 5 seconds
+		retry.MaxSleepTime(paramtable.Get().MQCfg.RetryTimeout.GetAsDuration(time.Second))) // 5 minutes
 	if err != nil {
-		log.Error("dispatcher register failed", zap.String("channel", position.ChannelName))
+		log.Error("dispatcher register failed after retried", zap.String("channel", position.ChannelName), zap.Error(err))
 		return WrapErrRegDispather(err)
 	}
+
 	ts, _ := tsoutil.ParseTS(position.GetTimestamp())
 	log.Info("stream pipeline seeks from position with msgDispatcher",
 		zap.String("pchannel", position.ChannelName),
@@ -82,6 +151,10 @@ func (p *streamPipeline) ConsumeMsgStream(position *msgpb.MsgPosition) error {
 		zap.Duration("elapse", time.Since(start)),
 	)
 	return nil
+}
+
+func (p *streamPipeline) Add(nodes ...Node) {
+	p.pipeline.Add(nodes...)
 }
 
 func (p *streamPipeline) Start() error {
@@ -98,22 +171,32 @@ func (p *streamPipeline) Close() {
 	p.closeOnce.Do(func() {
 		close(p.closeCh)
 		p.closeWg.Wait()
+		if p.scanner != nil {
+			p.scanner.Close()
+		}
 		p.dispatcher.Deregister(p.vChannel)
 		p.pipeline.Close()
 	})
 }
 
-func NewPipelineWithStream(dispatcher msgdispatcher.Client, nodeTtInterval time.Duration, enableTtChecker bool, vChannel string) StreamPipeline {
+func NewPipelineWithStream(dispatcher msgdispatcher.Client,
+	nodeTtInterval time.Duration,
+	enableTtChecker bool,
+	vChannel string,
+	replicateConfig *msgstream.ReplicateConfig,
+) StreamPipeline {
 	pipeline := &streamPipeline{
 		pipeline: &pipeline{
 			nodes:           []*nodeCtx{},
 			nodeTtInterval:  nodeTtInterval,
 			enableTtChecker: enableTtChecker,
 		},
-		dispatcher: dispatcher,
-		vChannel:   vChannel,
-		closeCh:    make(chan struct{}),
-		closeWg:    sync.WaitGroup{},
+		dispatcher:      dispatcher,
+		vChannel:        vChannel,
+		replicateConfig: replicateConfig,
+		closeCh:         make(chan struct{}),
+		closeWg:         sync.WaitGroup{},
+		lastAccessTime:  atomic.NewTime(time.Now()),
 	}
 
 	return pipeline

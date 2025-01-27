@@ -19,36 +19,38 @@ package components
 import (
 	"context"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus/internal/util/dependency"
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 // IndexCoord implements IndexCoord grpc server
-type IndexCoord struct {
-}
+type IndexCoord struct{}
 
 // NewIndexCoord creates a new IndexCoord
 func NewIndexCoord(ctx context.Context, factory dependency.Factory) (*IndexCoord, error) {
 	return &IndexCoord{}, nil
 }
 
+func (s *IndexCoord) Prepare() error {
+	return nil
+}
+
 // Run starts service
 func (s *IndexCoord) Run() error {
-	log.Info("IndexCoord running ...")
+	log.Ctx(context.TODO()).Info("IndexCoord running ...")
 	return nil
 }
 
 // Stop terminates service
 func (s *IndexCoord) Stop() error {
-	log.Info("IndexCoord stopping ...")
+	log.Ctx(context.TODO()).Info("IndexCoord stopping ...")
 	return nil
 }
 
 // GetComponentStates returns indexnode's states
 func (s *IndexCoord) Health(ctx context.Context) commonpb.StateCode {
-	log.Info("IndexCoord is healthy")
 	return commonpb.StateCode_Healthy
 }
 

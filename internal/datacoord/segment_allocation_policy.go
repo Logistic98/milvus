@@ -17,14 +17,19 @@
 package datacoord
 
 import (
+	"fmt"
+	"math/rand"
 	"sort"
 	"time"
 
 	"github.com/cockroachdb/errors"
-	"github.com/milvus-io/milvus/pkg/util/tsoutil"
+	"github.com/samber/lo"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/pkg/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/util/tsoutil"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
@@ -62,20 +67,36 @@ func calBySchemaPolicyWithDiskIndex(schema *schemapb.CollectionSchema) (int, err
 	return int(threshold / float64(sizePerRecord)), nil
 }
 
+func calBySegmentSizePolicy(schema *schemapb.CollectionSchema, segmentSize int64) (int, error) {
+	if schema == nil {
+		return -1, errors.New("nil schema")
+	}
+	sizePerRecord, err := typeutil.EstimateSizePerRecord(schema)
+	if err != nil {
+		return -1, err
+	}
+	// check zero value, preventing panicking
+	if sizePerRecord == 0 {
+		return -1, errors.New("zero size record schema found")
+	}
+	return int(segmentSize) / sizePerRecord, nil
+}
+
 // AllocatePolicy helper function definition to allocate Segment space
 type AllocatePolicy func(segments []*SegmentInfo, count int64,
-	maxCountPerSegment int64) ([]*Allocation, []*Allocation)
+	maxCountPerL1Segment int64, level datapb.SegmentLevel) ([]*Allocation, []*Allocation)
 
-// AllocatePolicyV1 v1 policy simple allocation policy using Greedy Algorithm
-func AllocatePolicyV1(segments []*SegmentInfo, count int64,
-	maxCountPerSegment int64) ([]*Allocation, []*Allocation) {
+// alloca policy for L1 segment
+func AllocatePolicyL1(segments []*SegmentInfo, count int64,
+	maxCountPerL1Segment int64, level datapb.SegmentLevel,
+) ([]*Allocation, []*Allocation) {
 	newSegmentAllocations := make([]*Allocation, 0)
 	existedSegmentAllocations := make([]*Allocation, 0)
 	// create new segment if count >= max num
-	for count >= maxCountPerSegment {
-		allocation := getAllocation(maxCountPerSegment)
+	for count >= maxCountPerL1Segment {
+		allocation := getAllocation(maxCountPerL1Segment)
 		newSegmentAllocations = append(newSegmentAllocations, allocation)
-		count -= maxCountPerSegment
+		count -= maxCountPerL1Segment
 	}
 
 	// allocate space for remaining count
@@ -87,7 +108,18 @@ func AllocatePolicyV1(segments []*SegmentInfo, count int64,
 		for _, allocation := range segment.allocations {
 			allocSize += allocation.NumOfRows
 		}
-		free := segment.GetMaxRowNum() - segment.GetNumOfRows() - allocSize
+
+		// When inserts are too fast, hardTimeTick may lag, causing segment to be unable to seal in time.
+		// To prevent allocating large segment, introducing the sealProportion factor here.
+		// The condition `free < 0` ensures that the allocation exceeds the minimum sealable size,
+		// preventing segments from remaining unsealable indefinitely.
+		maxRowsWithSealProportion := int64(float64(segment.GetMaxRowNum()) * paramtable.Get().DataCoordCfg.SegmentSealProportion.GetAsFloat())
+		free := maxRowsWithSealProportion - segment.GetNumOfRows() - allocSize
+		if free < 0 {
+			continue
+		}
+
+		free = segment.GetMaxRowNum() - segment.GetNumOfRows() - allocSize
 		if free < count {
 			continue
 		}
@@ -103,39 +135,51 @@ func AllocatePolicyV1(segments []*SegmentInfo, count int64,
 	return newSegmentAllocations, existedSegmentAllocations
 }
 
-// segmentSealPolicy seal policy applies to segment
-type segmentSealPolicy func(segment *SegmentInfo, ts Timestamp) bool
+type SegmentSealPolicy interface {
+	ShouldSeal(segment *SegmentInfo, ts Timestamp) (bool, string)
+}
 
-// getSegmentCapacityPolicy get segmentSealPolicy with segment size factor policy
-func getSegmentCapacityPolicy(sizeFactor float64) segmentSealPolicy {
-	return func(segment *SegmentInfo, ts Timestamp) bool {
-		var allocSize int64
-		for _, allocation := range segment.allocations {
-			allocSize += allocation.NumOfRows
-		}
-		return float64(segment.currRows) >= sizeFactor*float64(segment.GetMaxRowNum())
+// segmentSealPolicy seal policy applies to segment
+type segmentSealPolicyFunc func(segment *SegmentInfo, ts Timestamp) (bool, string)
+
+func (f segmentSealPolicyFunc) ShouldSeal(segment *SegmentInfo, ts Timestamp) (bool, string) {
+	return f(segment, ts)
+}
+
+// sealL1SegmentByCapacity get segmentSealPolicy with segment size factor policy
+func sealL1SegmentByCapacity(sizeFactor float64) segmentSealPolicyFunc {
+	return func(segment *SegmentInfo, ts Timestamp) (bool, string) {
+		jitter := paramtable.Get().DataCoordCfg.SegmentSealProportionJitter.GetAsFloat()
+		ratio := (1 - jitter*rand.Float64())
+		return float64(segment.currRows) >= sizeFactor*float64(segment.GetMaxRowNum())*ratio,
+			fmt.Sprintf("Row count capacity full, current rows: %d, max row: %d, seal factor: %f, jitter ratio: %f", segment.currRows, segment.GetMaxRowNum(), sizeFactor, ratio)
 	}
 }
 
-// sealByMaxBinlogSizePolicy get segmentSealPolicy with lifetime limit compares ts - segment.lastExpireTime
-func sealByLifetimePolicy(lifetime time.Duration) segmentSealPolicy {
-	return func(segment *SegmentInfo, ts Timestamp) bool {
+// sealL1SegmentByLifetimePolicy get segmentSealPolicy with lifetime limit compares ts - segment.lastExpireTime
+func sealL1SegmentByLifetime(lifetime time.Duration) segmentSealPolicyFunc {
+	return func(segment *SegmentInfo, ts Timestamp) (bool, string) {
 		pts, _ := tsoutil.ParseTS(ts)
 		epts, _ := tsoutil.ParseTS(segment.GetLastExpireTime())
 		d := pts.Sub(epts)
-		return d >= lifetime
+		return d >= lifetime,
+			fmt.Sprintf("Segment Lifetime expired, segment last expire: %v, now:%v, max lifetime %v",
+				pts, epts, lifetime)
 	}
 }
 
-// sealByMaxBinlogSizePolicy seal segment if binlog file number of segment exceed configured max number
-func sealByMaxBinlogFileNumberPolicy(maxBinlogFileNumber int) segmentSealPolicy {
-	return func(segment *SegmentInfo, ts Timestamp) bool {
+// sealL1SegmentByBinlogFileNumber seal L1 segment if binlog file number of segment exceed configured max number
+func sealL1SegmentByBinlogFileNumber(maxBinlogFileNumber int) segmentSealPolicyFunc {
+	return func(segment *SegmentInfo, ts Timestamp) (bool, string) {
 		logFileCounter := 0
-		for _, fieldBinlog := range segment.GetStatslogs() {
+		for _, fieldBinlog := range segment.GetBinlogs() {
+			// Only count the binlog file number of the first field which is equal to the binlog file number of the primary field.
+			// Remove the multiplier generated by the number of fields.
 			logFileCounter += len(fieldBinlog.GetBinlogs())
+			break
 		}
-
-		return logFileCounter >= maxBinlogFileNumber
+		return logFileCounter >= maxBinlogFileNumber,
+			fmt.Sprintf("Segment binlog number too large, binlog number: %d, max binlog number: %d", logFileCounter, maxBinlogFileNumber)
 	}
 }
 
@@ -147,33 +191,61 @@ func sealByMaxBinlogFileNumberPolicy(maxBinlogFileNumber int) segmentSealPolicy 
 // into this segment anymore, so sealLongTimeIdlePolicy will seal these segments to trigger handoff of query cluster.
 // Q: Why we don't decrease the expiry time directly?
 // A: We don't want to influence segments which are accepting `frequent small` batch entities.
-func sealLongTimeIdlePolicy(idleTimeTolerance time.Duration, minSizeToSealIdleSegment float64, maxSizeOfSegment float64) segmentSealPolicy {
-	return func(segment *SegmentInfo, ts Timestamp) bool {
+func sealL1SegmentByIdleTime(idleTimeTolerance time.Duration, minSizeToSealIdleSegment float64, maxSizeOfSegment float64) segmentSealPolicyFunc {
+	return func(segment *SegmentInfo, ts Timestamp) (bool, string) {
 		limit := (minSizeToSealIdleSegment / maxSizeOfSegment) * float64(segment.GetMaxRowNum())
 		return time.Since(segment.lastWrittenTime) > idleTimeTolerance &&
-			float64(segment.currRows) > limit
+				float64(segment.currRows) > limit,
+			fmt.Sprintf("segment idle, segment row number :%d, last written time: %v, max idle duration: %v", segment.currRows, segment.lastWrittenTime, idleTimeTolerance)
 	}
 }
 
 // channelSealPolicy seal policy applies to channel
-type channelSealPolicy func(string, []*SegmentInfo, Timestamp) []*SegmentInfo
+type channelSealPolicy func(string, []*SegmentInfo, Timestamp) ([]*SegmentInfo, string)
 
-// getChannelCapacityPolicy get channelSealPolicy with channel segment capacity policy
+// getChannelOpenSegCapacityPolicy get channelSealPolicy with channel segment capacity policy
 func getChannelOpenSegCapacityPolicy(limit int) channelSealPolicy {
-	return func(channel string, segs []*SegmentInfo, ts Timestamp) []*SegmentInfo {
+	return func(channel string, segs []*SegmentInfo, ts Timestamp) ([]*SegmentInfo, string) {
 		if len(segs) <= limit {
-			return []*SegmentInfo{}
+			return []*SegmentInfo{}, ""
 		}
 		sortSegmentsByLastExpires(segs)
 		offLen := len(segs) - limit
 		if offLen > len(segs) {
 			offLen = len(segs)
 		}
-		return segs[0:offLen]
+		return segs[0:offLen], fmt.Sprintf("seal by channel segment capacity, len(segs)=%d, limit=%d", len(segs), limit)
 	}
 }
 
-// sortSegStatusByLastExpires sort segmentStatus with lastExpireTime ascending order
+// sealByTotalGrowingSegmentsSize seals the largest growing segment
+// if the total size of growing segments exceeds the threshold.
+func sealByTotalGrowingSegmentsSize() channelSealPolicy {
+	return func(channel string, segments []*SegmentInfo, ts Timestamp) ([]*SegmentInfo, string) {
+		growingSegments := lo.Filter(segments, func(segment *SegmentInfo, _ int) bool {
+			return segment != nil && segment.GetState() == commonpb.SegmentState_Growing
+		})
+
+		var totalSize int64
+		sizeMap := lo.SliceToMap(growingSegments, func(segment *SegmentInfo) (int64, int64) {
+			size := segment.getSegmentSize()
+			totalSize += size
+			return segment.GetID(), size
+		})
+
+		threshold := paramtable.Get().DataCoordCfg.GrowingSegmentsMemSizeInMB.GetAsInt64() * 1024 * 1024
+		if totalSize >= threshold {
+			target := lo.MaxBy(growingSegments, func(s1, s2 *SegmentInfo) bool {
+				return sizeMap[s1.GetID()] > sizeMap[s2.GetID()]
+			})
+			return []*SegmentInfo{target}, fmt.Sprintf("seal by total growing segments size, "+
+				"totalSize=%d, threshold=%d", totalSize, threshold)
+		}
+		return nil, ""
+	}
+}
+
+// sortSegmentsByLastExpires sort segmentStatus with lastExpireTime ascending order
 func sortSegmentsByLastExpires(segs []*SegmentInfo) {
 	sort.Slice(segs, func(i, j int) bool {
 		return segs[i].LastExpireTime < segs[j].LastExpireTime
@@ -182,10 +254,14 @@ func sortSegmentsByLastExpires(segs []*SegmentInfo) {
 
 type flushPolicy func(segment *SegmentInfo, t Timestamp) bool
 
-const flushInterval = 2 * time.Second
-
-func flushPolicyV1(segment *SegmentInfo, t Timestamp) bool {
+func flushPolicyL1(segment *SegmentInfo, t Timestamp) bool {
 	return segment.GetState() == commonpb.SegmentState_Sealed &&
-		time.Since(segment.lastFlushTime) >= flushInterval &&
-		(segment.GetLastExpireTime() <= t && segment.currRows != 0 || (segment.IsImporting))
+		segment.Level != datapb.SegmentLevel_L0 &&
+		time.Since(segment.lastFlushTime) >= paramtable.Get().DataCoordCfg.SegmentFlushInterval.GetAsDuration(time.Second) &&
+		segment.GetLastExpireTime() <= t &&
+		segment.currRows != 0 &&
+		// Decoupling the importing segment from the flush process,
+		// This check avoids notifying the datanode to flush the
+		// importing segment which may not exist.
+		!segment.GetIsImporting()
 }

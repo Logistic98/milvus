@@ -18,13 +18,17 @@ package config
 
 import (
 	"context"
-	"fmt"
+	"path"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/cockroachdb/errors"
+	"github.com/samber/lo"
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.uber.org/zap"
 
+	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/util/etcd"
 )
 
@@ -34,18 +38,23 @@ const (
 
 type EtcdSource struct {
 	sync.RWMutex
-	etcdCli       *clientv3.Client
-	ctx           context.Context
-	currentConfig map[string]string
-	keyPrefix     string
+	etcdCli        *clientv3.Client
+	ctx            context.Context
+	currentConfigs map[string]string
+	keyPrefix      string
 
+	updateMu        sync.Mutex
 	configRefresher *refresher
-	eh              EventHandler
+	manager         ConfigManager
 }
 
 func NewEtcdSource(etcdInfo *EtcdInfo) (*EtcdSource, error) {
-	etcdCli, err := etcd.GetEtcdClient(
+	log.Ctx(context.TODO()).Debug("init etcd source", zap.Any("etcdInfo", etcdInfo))
+	etcdCli, err := etcd.CreateEtcdClient(
 		etcdInfo.UseEmbed,
+		etcdInfo.EnableAuth,
+		etcdInfo.UserName,
+		etcdInfo.PassWord,
 		etcdInfo.UseSSL,
 		etcdInfo.Endpoints,
 		etcdInfo.CertFile,
@@ -56,22 +65,23 @@ func NewEtcdSource(etcdInfo *EtcdInfo) (*EtcdSource, error) {
 		return nil, err
 	}
 	es := &EtcdSource{
-		etcdCli:       etcdCli,
-		ctx:           context.Background(),
-		currentConfig: make(map[string]string),
-		keyPrefix:     etcdInfo.KeyPrefix,
+		etcdCli:        etcdCli,
+		ctx:            context.Background(),
+		currentConfigs: make(map[string]string),
+		keyPrefix:      etcdInfo.KeyPrefix,
 	}
 	es.configRefresher = newRefresher(etcdInfo.RefreshInterval, es.refreshConfigurations)
+	es.configRefresher.start(es.GetSourceName())
 	return es, nil
 }
 
 // GetConfigurationByKey implements ConfigSource
 func (es *EtcdSource) GetConfigurationByKey(key string) (string, error) {
 	es.RLock()
-	v, ok := es.currentConfig[key]
+	v, ok := es.currentConfigs[key]
 	es.RUnlock()
 	if !ok {
-		return "", fmt.Errorf("key not found: %s", key)
+		return "", errors.Wrap(ErrKeyNotFound, key) // fmt.Errorf("key not found: %s", key)
 	}
 	return v, nil
 }
@@ -83,9 +93,8 @@ func (es *EtcdSource) GetConfigurations() (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	es.configRefresher.start(es.GetSourceName())
 	es.RLock()
-	for key, value := range es.currentConfig {
+	for key, value := range es.currentConfigs {
 		configMap[key] = value
 	}
 	es.RUnlock()
@@ -104,19 +113,46 @@ func (es *EtcdSource) GetSourceName() string {
 }
 
 func (es *EtcdSource) Close() {
-	es.etcdCli.Close()
+	// cannot close client here, since client is shared with components
 	es.configRefresher.stop()
 }
 
+func (es *EtcdSource) SetManager(m ConfigManager) {
+	es.Lock()
+	defer es.Unlock()
+	es.manager = m
+}
+
 func (es *EtcdSource) SetEventHandler(eh EventHandler) {
-	es.configRefresher.eh = eh
+	es.configRefresher.SetEventHandler(eh)
+}
+
+func (es *EtcdSource) UpdateOptions(opts Options) {
+	if opts.EtcdInfo == nil {
+		return
+	}
+	es.Lock()
+	defer es.Unlock()
+	es.keyPrefix = opts.EtcdInfo.KeyPrefix
+	if es.configRefresher.refreshInterval != opts.EtcdInfo.RefreshInterval {
+		es.configRefresher.stop()
+		eh := es.configRefresher.GetEventHandler()
+		es.configRefresher = newRefresher(opts.EtcdInfo.RefreshInterval, es.refreshConfigurations)
+		es.configRefresher.SetEventHandler(eh)
+		es.configRefresher.start(es.GetSourceName())
+	}
 }
 
 func (es *EtcdSource) refreshConfigurations() error {
-	prefix := es.keyPrefix + "/config"
+	log := log.Ctx(es.ctx).WithRateGroup("config.etcdSource", 1, 60)
+	es.RLock()
+	prefix := path.Join(es.keyPrefix, "config")
+	es.RUnlock()
+
 	ctx, cancel := context.WithTimeout(es.ctx, ReadConfigTimeout)
 	defer cancel()
-	response, err := es.etcdCli.Get(ctx, prefix, clientv3.WithPrefix())
+	log.RatedDebug(10, "etcd refreshConfigurations", zap.String("prefix", prefix), zap.Any("endpoints", es.etcdCli.Endpoints()))
+	response, err := es.etcdCli.Get(ctx, prefix, clientv3.WithPrefix(), clientv3.WithSerializable())
 	if err != nil {
 		return err
 	}
@@ -126,13 +162,29 @@ func (es *EtcdSource) refreshConfigurations() error {
 		key = strings.TrimPrefix(key, prefix+"/")
 		newConfig[key] = string(kv.Value)
 		newConfig[formatKey(key)] = string(kv.Value)
+		log.Debug("got config from etcd", zap.String("key", string(kv.Key)), zap.String("value", string(kv.Value)))
 	}
+	return es.update(newConfig)
+}
+
+func (es *EtcdSource) update(configs map[string]string) error {
+	// make sure config not change when fire event
+	es.updateMu.Lock()
+	defer es.updateMu.Unlock()
+
 	es.Lock()
-	defer es.Unlock()
-	err = es.configRefresher.fireEvents(es.GetSourceName(), es.currentConfig, newConfig)
+	events, err := PopulateEvents(es.GetSourceName(), es.currentConfigs, configs)
 	if err != nil {
+		es.Unlock()
+		log.Ctx(es.ctx).Warn("generating event error", zap.Error(err))
 		return err
 	}
-	es.currentConfig = newConfig
+	es.currentConfigs = configs
+	es.Unlock()
+	if es.manager != nil {
+		es.manager.EvictCacheValueByFormat(lo.Map(events, func(event *Event, _ int) string { return event.Key })...)
+	}
+
+	es.configRefresher.fireEvents(events...)
 	return nil
 }

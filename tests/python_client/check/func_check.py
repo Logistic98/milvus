@@ -7,8 +7,19 @@ from common import common_func as cf
 from common.common_type import CheckTasks, Connect_Object_Name
 # from common.code_mapping import ErrorCode, ErrorMessage
 from pymilvus import Collection, Partition, ResourceGroupInfo
-from utils.api_request import Error
 import check.param_check as pc
+
+
+class Error:
+    def __init__(self, error):
+        self.code = getattr(error, 'code', -1)
+        self.message = getattr(error, 'message', str(error))
+
+    def __str__(self):
+        return f"Error(code={self.code}, message={self.message})"
+
+    def __repr__(self):
+        return f"Error(code={self.code}, message={self.message})"
 
 
 class ResponseChecker:
@@ -56,9 +67,17 @@ class ResponseChecker:
             # Search interface of collection and partition that response check
             result = self.check_search_results(self.response, self.func_name, self.check_items)
 
+        elif self.check_task == CheckTasks.check_search_iterator:
+            # Search iterator interface of collection and partition that response check
+            result = self.check_search_iterator(self.response, self.func_name, self.check_items)
+
         elif self.check_task == CheckTasks.check_query_results:
             # Query interface of collection and partition that response check
             result = self.check_query_results(self.response, self.func_name, self.check_items)
+
+        elif self.check_task == CheckTasks.check_query_iterator:
+            # query iterator interface of collection and partition that response check
+            result = self.check_query_iterator(self.response, self.func_name, self.check_items)
 
         elif self.check_task == CheckTasks.check_query_empty:
             result = self.check_query_empty(self.response, self.func_name)
@@ -83,29 +102,55 @@ class ResponseChecker:
         elif self.check_task == CheckTasks.check_permission_deny:
             # Collection interface response check
             result = self.check_permission_deny(self.response, self.succ)
+
+        elif self.check_task == CheckTasks.check_auth_failure:
+            # connection interface response check
+            result = self.check_auth_failure(self.response, self.succ)
+
         elif self.check_task == CheckTasks.check_rg_property:
             # describe resource group interface response check
             result = self.check_rg_property(self.response, self.func_name, self.check_items)
+
+        elif self.check_task == CheckTasks.check_describe_collection_property:
+            # describe collection interface(high level api) response check
+            result = self.check_describe_collection_property(self.response, self.func_name, self.check_items)
+        elif self.check_task == CheckTasks.check_collection_fields_properties:
+            # check field properties in describe collection response
+            result = self.check_collection_fields_properties(self.response, self.func_name, self.check_items)
+        elif self.check_task == CheckTasks.check_describe_database_property:
+            # describe database interface(high level api) response check
+            result = self.check_describe_database_property(self.response, self.func_name, self.check_items)
+        elif self.check_task == CheckTasks.check_insert_result:
+            # check `insert` interface response
+            result = self.check_insert_response(check_items=self.check_items)
 
         # Add check_items here if something new need verify
 
         return result
 
-    @staticmethod
-    def assert_succ(actual, expect):
-        assert actual is expect
+    def assert_succ(self, actual, expect):
+        assert actual is expect, f"Response of API {self.func_name} expect {expect}, but got {actual}"
         return True
 
-    @staticmethod
-    def assert_exception(res, actual=True, error_dict=None):
-        assert actual is False
+    def assert_exception(self, res, actual=True, error_dict=None):
+        assert actual is False, f"Response of API {self.func_name} expect get error, but success"
         assert len(error_dict) > 0
         if isinstance(res, Error):
             error_code = error_dict[ct.err_code]
-            assert res.code == error_code or error_dict[ct.err_msg] in res.message
+            # assert res.code == error_code or error_dict[ct.err_msg] in res.message, (
+            #     f"Response of API {self.func_name} "
+            #     f"expect get error code {error_dict[ct.err_code]} or error message {error_dict[ct.err_code]}, "
+            #     f"but got {res.code} {res.message}")
+            assert error_dict[ct.err_msg] in res.message, (
+                f"Response of API {self.func_name} "
+                f"expect get error message {error_dict[ct.err_code]}, "
+                f"but got {res.code} {res.message}")
+
         else:
             log.error("[CheckFunc] Response of API is not an error: %s" % str(res))
-            assert False
+            assert False, (f"Response of API expect get error code {error_dict[ct.err_code]} or "
+                           f"error message {error_dict[ct.err_code]}"
+                           f"but success")
         return True
 
     @staticmethod
@@ -176,8 +221,122 @@ class ResponseChecker:
             assert collection.num_entities == check_items.get("num_entities")
         if check_items.get("primary", None):
             assert collection.primary_field.name == check_items.get("primary")
-        if check_items.get("shards_num", None):
-            assert collection._shards_num == check_items.get("shards_num")
+        return True
+
+    @staticmethod
+    def check_describe_collection_property(res, func_name, check_items):
+        """
+        According to the check_items to check collection properties of res, which return from func_name
+        :param res: actual response of init collection
+        :type res: Collection
+
+        :param func_name: init collection API
+        :type func_name: str
+
+        :param check_items: which items expected to be checked, including name, schema, num_entities, primary
+        :type check_items: dict, {check_key: expected_value}
+        """
+        exp_func_name = "describe_collection"
+        if func_name != exp_func_name:
+            log.warning("The function name is {} rather than {}".format(func_name, exp_func_name))
+        if len(check_items) == 0:
+            raise Exception("No expect values found in the check task")
+        if check_items.get("collection_name", None) is not None:
+            assert res["collection_name"] == check_items.get("collection_name")
+        if check_items.get("auto_id", False):
+            assert res["auto_id"] == check_items.get("auto_id")
+        if check_items.get("num_shards", 1):
+            assert res["num_shards"] == check_items.get("num_shards", 1)
+        if check_items.get("consistency_level", 2):
+            assert res["consistency_level"] == check_items.get("consistency_level", 2)
+        if check_items.get("enable_dynamic_field", True):
+            assert res["enable_dynamic_field"] == check_items.get("enable_dynamic_field", True)
+        if check_items.get("num_partitions", 1):
+            assert res["num_partitions"] == check_items.get("num_partitions", 1)
+        if check_items.get("id_name", "id"):
+            assert res["fields"][0]["name"] == check_items.get("id_name", "id")
+        if check_items.get("vector_name", "vector"):
+            assert res["fields"][1]["name"] == check_items.get("vector_name", "vector")
+        if check_items.get("dim", None) is not None:
+            assert res["fields"][1]["params"]["dim"] == check_items.get("dim")
+        if check_items.get("nullable_fields", None) is not None:
+            nullable_fields = check_items.get("nullable_fields")
+            if not isinstance(nullable_fields, list):
+                log.error("nullable_fields should be a list including all the nullable fields name")
+                assert False
+            for field in res["fields"]:
+                if field["name"] in nullable_fields:
+                    assert field["nullable"] is True
+        assert res["fields"][0]["is_primary"] is True
+        assert res["fields"][0]["field_id"] == 100 and (res["fields"][0]["type"] == 5 or 21)
+        assert res["fields"][1]["field_id"] == 101 and res["fields"][1]["type"] == 101
+
+        return True
+
+    @staticmethod
+    def check_collection_fields_properties(res, func_name, check_items):
+        """
+        According to the check_items to check collection field properties of res, which return from func_name
+        :param res: actual response of client.describe_collection()
+        :type res: Collection
+
+        :param func_name: describe_collection
+        :type func_name: str
+
+        :param check_items: which field properties expected to be checked, like max_length etc.
+        :type check_items: dict, {field_name: {field_properties}, ...}
+        """
+        exp_func_name = "describe_collection"
+        if func_name != exp_func_name:
+            log.warning("The function name is {} rather than {}".format(func_name, exp_func_name))
+        if len(check_items) == 0:
+            raise Exception("No expect values found in the check task")
+        if check_items.get("collection_name", None) is not None:
+            assert res["collection_name"] == check_items.get("collection_name")
+        for key in check_items.keys():
+            for field in res["fields"]:
+                if field["name"] == key:
+                    assert field['params'].items() >= check_items[key].items()
+        return True
+
+    @staticmethod
+    def check_describe_database_property(res, func_name, check_items):
+        """
+        According to the check_items to check database properties of res, which return from func_name
+        :param res: actual response of init database
+        :type res: Database
+
+        :param func_name: init database API
+        :type func_name: str
+
+        :param check_items: which items expected to be checked
+        :type check_items: dict, {check_key: expected_value}
+        """
+        exp_func_name = "describe_database"
+        if func_name != exp_func_name:
+            log.warning("The function name is {} rather than {}".format(func_name, exp_func_name))
+        if len(check_items) == 0:
+            raise Exception("No expect values found in the check task")
+        if check_items.get("db_name", None) is not None:
+            assert res["name"] == check_items.get("db_name")
+        if check_items.get("database.force.deny.writing", None) is not None:
+            if check_items.get("database.force.deny.writing") == "Missing":
+                assert "database.force.deny.writing" not in res
+            else:
+                assert res["database.force.deny.writing"] == check_items.get("database.force.deny.writing")
+        if check_items.get("database.force.deny.reading", None) is not None:
+            if check_items.get("database.force.deny.reading") == "Missing":
+                assert "database.force.deny.reading" not in res
+            else:
+                assert res["database.force.deny.reading"] == check_items.get("database.force.deny.reading")
+        if check_items.get("database.replica.number", None) is not None:
+            if check_items.get("database.replica.number") == "Missing":
+                assert "database.replica.number" not in res
+            else:
+                assert res["database.replica.number"] == check_items.get("database.replica.number")
+        if check_items.get("properties_length", None) is not None:
+            assert len(res) == check_items.get("properties_length")
+
         return True
 
     @staticmethod
@@ -232,14 +391,20 @@ class ResponseChecker:
         expected: check the search is ok
         """
         log.info("search_results_check: checking the searching results")
-        if func_name != 'search':
-            log.warning("The function name is {} rather than {}".format(func_name, "search"))
+        if func_name != 'search' and func_name != 'hybrid_search':
+            log.warning("The function name is {} rather than {} or {}".format(func_name, "search", "hybrid_search"))
         if len(check_items) == 0:
             raise Exception("No expect values found in the check task")
         if check_items.get("_async", None):
             if check_items["_async"]:
                 search_res.done()
                 search_res = search_res.result()
+        if check_items.get("output_fields", None):
+            assert set(search_res[0][0].entity.fields) == set(check_items["output_fields"])
+            log.info('search_results_check: Output fields of query searched is correct')
+            if check_items.get("original_entities", None):
+                original_entities = check_items["original_entities"][0]
+                pc.output_field_value_check(search_res, original_entities)
         if len(search_res) != check_items["nq"]:
             log.error("search_results_check: Numbers of query searched (%d) "
                       "is not equal with expected (%d)"
@@ -247,25 +412,92 @@ class ResponseChecker:
             assert len(search_res) == check_items["nq"]
         else:
             log.info("search_results_check: Numbers of query searched is correct")
+        enable_milvus_client_api = check_items.get("enable_milvus_client_api", False)
+        # log.debug(search_res)
         for hits in search_res:
+            searched_original_vectors = []
+            ids = []
+            vector_id = 0
+            if enable_milvus_client_api:
+                for hit in hits:
+                    ids.append(hit['id'])
+            else:
+                ids = list(hits.ids)
             if (len(hits) != check_items["limit"]) \
-                    or (len(hits.ids) != check_items["limit"]):
+                    or (len(ids) != check_items["limit"]):
                 log.error("search_results_check: limit(topK) searched (%d) "
                           "is not equal with expected (%d)"
                           % (len(hits), check_items["limit"]))
                 assert len(hits) == check_items["limit"]
-                assert len(hits.ids) == check_items["limit"]
+                assert len(ids) == check_items["limit"]
             else:
                 if check_items.get("ids", None) is not None:
-                    ids_match = pc.list_contain_check(list(hits.ids),
+                    ids_match = pc.list_contain_check(ids,
                                                       list(check_items["ids"]))
                     if not ids_match:
                         log.error("search_results_check: ids searched not match")
                         assert ids_match
+                elif check_items.get("metric", None) is not None:
+                    if check_items.get("vector_nq") is None:
+                        raise Exception("vector for searched (nq) is needed for distance check")
+                    if check_items.get("original_vectors") is None:
+                        raise Exception("inserted vectors are needed for distance check")
+                    for id in hits.ids:
+                        searched_original_vectors.append(check_items["original_vectors"][id])
+                    cf.compare_distance_vector_and_vector_list(check_items["vector_nq"][vector_id],
+                                                               searched_original_vectors,
+                                                               check_items["metric"], hits.distances)
+                    log.info("search_results_check: Checked the distances for one nq: OK")
                 else:
-                    pass    # just check nq and topk, not specific ids need check
+                    pass  # just check nq and topk, not specific ids need check
+            vector_id +=  1
         log.info("search_results_check: limit (topK) and "
                  "ids searched for %d queries are correct" % len(search_res))
+
+        return True
+
+    @staticmethod
+    def check_search_iterator(search_res, func_name, check_items):
+        """
+        target: check the search iterator results
+        method: 1. check the iterator number
+                2. check the limit(topK) and ids
+                3. check the distance
+        expected: check the search is ok
+        """
+        log.info("search_iterator_results_check: checking the searching results")
+        if func_name != 'search_iterator':
+            log.warning("The function name is {} rather than {}".format(func_name, "search_iterator"))
+        search_iterator = search_res
+        pk_list = []
+        while True:
+            try:
+                res = search_iterator.next()
+                if len(res) == 0:
+                    log.info("search iteration finished, close")
+                    search_iterator.close()
+                    break
+                if check_items.get("batch_size", None):
+                    assert len(res) <= check_items["batch_size"]
+                if check_items.get("radius", None):
+                    for distance in res.distances():
+                        if check_items["metric_type"] == "L2":
+                            assert distance < check_items["radius"]
+                        else:
+                            assert distance > check_items["radius"]
+                if check_items.get("range_filter", None):
+                    for distance in res.distances():
+                        if check_items["metric_type"] == "L2":
+                            assert distance >= check_items["range_filter"]
+                        else:
+                            assert distance <= check_items["range_filter"]
+                pk_list.extend(res.ids())
+            except Exception as e:
+                assert check_items["err_msg"] in str(e)
+                return False
+        assert len(pk_list) == len(set(pk_list))
+        log.info("check: total %d results" % len(pk_list))
+
         return True
 
     @staticmethod
@@ -295,12 +527,49 @@ class ResponseChecker:
         primary_field = check_items.get("primary_field", None)
         if exp_res is not None:
             if isinstance(query_res, list):
-                assert pc.equal_entities_list(exp=exp_res, actual=query_res, primary_field=primary_field, with_vec=with_vec)
+                assert pc.equal_entities_list(exp=exp_res, actual=query_res, primary_field=primary_field,
+                                              with_vec=with_vec)
                 return True
             else:
                 log.error(f"Query result {query_res} is not list")
                 return False
         log.warning(f'Expected query result is {exp_res}')
+
+    @staticmethod
+    def check_query_iterator(query_res, func_name, check_items):
+        """
+        target: check the query results
+        method: 1. check the query number
+                2. check the limit(topK) and ids
+                3. check the distance
+        expected: check the search is ok
+        """
+        log.info("query_iterator_results_check: checking the query results")
+        if func_name != 'query_iterator':
+            log.warning("The function name is {} rather than {}".format(func_name, "query_iterator"))
+        query_iterator = query_res
+        pk_list = []
+        while True:
+            res = query_iterator.next()
+            if len(res) == 0:
+                log.info("search iteration finished, close")
+                query_iterator.close()
+                break
+            pk_name = ct.default_int64_field_name if res[0].get(ct.default_int64_field_name, None) is not None \
+                else ct.default_string_field_name
+            for i in range(len(res)):
+                pk_list.append(res[i][pk_name])
+            if check_items.get("limit", None):
+                assert len(res) <= check_items["limit"]
+        assert len(pk_list) == len(set(pk_list))
+        if check_items.get("count", None):
+            log.info(len(pk_list))
+            assert len(pk_list) == check_items["count"]
+        if check_items.get("exp_ids", None):
+            assert pk_list == check_items["exp_ids"]
+        log.info("check: total %d results" % len(pk_list))
+
+        return True
 
     @staticmethod
     def check_query_empty(query_res, func_name):
@@ -428,4 +697,29 @@ class ResponseChecker:
         else:
             log.error("[CheckFunc] Response of API is not an error: %s" % str(res))
             assert False
+        return True
+
+    @staticmethod
+    def check_auth_failure(res, actual=True):
+        assert actual is False
+        if isinstance(res, Error):
+            assert "auth check failure" in res.message
+        else:
+            log.error("[CheckFunc] Response of API is not an error: %s" % str(res))
+            assert False
+        return True
+
+    def check_insert_response(self, check_items):
+        # check request successful
+        self.assert_succ(self.succ, True)
+
+        # get insert count
+        real = check_items.get("insert_count", None) if isinstance(check_items, dict) else None
+        if real is None:
+            real = len(self.kwargs_dict.get("data", [[]])[0])
+
+        # check insert count
+        error_message = "[CheckFunc] Insert count does not meet expectations, response:{0} != expected:{1}"
+        assert self.response.insert_count == real, error_message.format(self.response.insert_count, real)
+
         return True

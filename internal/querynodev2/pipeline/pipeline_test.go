@@ -17,27 +17,29 @@
 package pipeline
 
 import (
+	"context"
 	"testing"
 
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
 
-	"github.com/milvus-io/milvus-proto/go-api/msgpb"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/mocks/util/mock_segcore"
 	"github.com/milvus-io/milvus/internal/querynodev2/delegator"
 	"github.com/milvus-io/milvus/internal/querynodev2/segments"
-	"github.com/milvus-io/milvus/internal/querynodev2/tsafe"
+	"github.com/milvus-io/milvus/pkg/common"
 	"github.com/milvus-io/milvus/pkg/mq/msgdispatcher"
 	"github.com/milvus-io/milvus/pkg/mq/msgstream"
-	"github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper"
+	"github.com/milvus-io/milvus/pkg/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
 type PipelineTestSuite struct {
 	suite.Suite
-	//datas
+	// datas
 	collectionName   string
 	collectionID     int64
 	partitionIDs     []int64
@@ -45,10 +47,7 @@ type PipelineTestSuite struct {
 	insertSegmentIDs []int64
 	deletePKs        []int64
 
-	//dependencies
-	tSafeManager TSafeManager
-
-	//mocks
+	// mocks
 	segmentManager    *segments.MockSegmentManager
 	collectionManager *segments.MockCollectionManager
 	delegator         *delegator.MockShardDelegator
@@ -89,7 +88,7 @@ func (suite *PipelineTestSuite) buildMsgPack(schema *schemapb.CollectionSchema) 
 
 func (suite *PipelineTestSuite) SetupTest() {
 	paramtable.Init()
-	//init mock
+	// init mock
 	//	init manager
 	suite.collectionManager = segments.NewMockCollectionManager(suite.T())
 	suite.segmentManager = segments.NewMockSegmentManager(suite.T())
@@ -97,25 +96,33 @@ func (suite *PipelineTestSuite) SetupTest() {
 	suite.delegator = delegator.NewMockShardDelegator(suite.T())
 	//	init mq dispatcher
 	suite.msgDispatcher = msgdispatcher.NewMockClient(suite.T())
-
-	//init dependency
-	//	init tsafeManager
-	suite.tSafeManager = tsafe.NewTSafeReplica()
-	suite.tSafeManager.Add(suite.channel, 0)
 }
 
 func (suite *PipelineTestSuite) TestBasic() {
-	//init mock
+	// init mock
 	//	mock collection manager
-	schema := segments.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64)
-	collection := segments.NewCollection(suite.collectionID, schema, querypb.LoadType_LoadCollection)
+	schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, true)
+	collection, err := segments.NewCollection(suite.collectionID, schema, mock_segcore.GenTestIndexMeta(suite.collectionID, schema), &querypb.LoadMetaInfo{
+		LoadType: querypb.LoadType_LoadCollection,
+		DbProperties: []*commonpb.KeyValuePair{
+			{
+				Key:   common.ReplicateIDKey,
+				Value: "local-test",
+			},
+		},
+	})
+	suite.Require().NoError(err)
 	suite.collectionManager.EXPECT().Get(suite.collectionID).Return(collection)
 
 	//  mock mq factory
-	suite.msgDispatcher.EXPECT().Register(suite.channel, mock.Anything, mqwrapper.SubscriptionPositionUnknown).Return(suite.msgChan, nil)
+	suite.msgDispatcher.EXPECT().Register(mock.Anything, mock.Anything).Return(suite.msgChan, nil)
 	suite.msgDispatcher.EXPECT().Deregister(suite.channel)
 
 	//	mock delegator
+	suite.delegator.EXPECT().AddExcludedSegments(mock.Anything).Maybe()
+	suite.delegator.EXPECT().VerifyExcludedSegments(mock.Anything, mock.Anything).Return(true).Maybe()
+	suite.delegator.EXPECT().TryCleanExcludedSegments(mock.Anything).Maybe()
+
 	suite.delegator.EXPECT().ProcessInsert(mock.Anything).Run(
 		func(insertRecords map[int64]*delegator.InsertData) {
 			for segmentID := range insertRecords {
@@ -131,36 +138,27 @@ func (suite *PipelineTestSuite) TestBasic() {
 				}
 			}
 		})
-	//build pipleine
+
+	// build pipleine
 	manager := &segments.Manager{
 		Collection: suite.collectionManager,
 		Segment:    suite.segmentManager,
 	}
-	pipeline, err := NewPipeLine(suite.collectionID, suite.channel, manager, suite.tSafeManager, suite.msgDispatcher, suite.delegator)
+	pipelineObj, err := NewPipeLine(collection, suite.channel, manager, suite.msgDispatcher, suite.delegator)
 	suite.NoError(err)
 
-	//Init Consumer
-	err = pipeline.ConsumeMsgStream(&msgpb.MsgPosition{})
+	// Init Consumer
+	err = pipelineObj.ConsumeMsgStream(context.Background(), &msgpb.MsgPosition{})
 	suite.NoError(err)
 
-	err = pipeline.Start()
+	err = pipelineObj.Start()
 	suite.NoError(err)
-	defer pipeline.Close()
-
-	// watch tsafe manager
-	listener := suite.tSafeManager.WatchChannel(suite.channel)
+	defer pipelineObj.Close()
 
 	// build input msg
 	in := suite.buildMsgPack(schema)
+	suite.delegator.EXPECT().UpdateTSafe(in.EndTs).Return()
 	suite.msgChan <- in
-
-	// wait pipeline work
-	<-listener.On()
-
-	//check tsafe
-	tsafe, err := suite.tSafeManager.Get(suite.channel)
-	suite.NoError(err)
-	suite.Equal(in.EndTs, tsafe)
 }
 
 func TestQueryNodePipeline(t *testing.T) {

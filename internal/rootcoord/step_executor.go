@@ -22,9 +22,10 @@ import (
 	"sync"
 	"time"
 
+	"go.uber.org/zap"
+
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/util/retry"
-	"go.uber.org/zap"
 )
 
 const (
@@ -64,14 +65,14 @@ func (s *stepStack) Execute(ctx context.Context) *stepStack {
 
 		if !retry.IsRecoverable(err) {
 			if !skipLog {
-				log.Warn("failed to execute step, not able to reschedule", zap.Error(err), zap.String("step", todo.Desc()))
+				log.Ctx(ctx).Warn("failed to execute step, not able to reschedule", zap.Error(err), zap.String("step", todo.Desc()))
 			}
 			return nil
 		}
 		if err != nil {
-			s.steps = nil // let s can be collected.
+			s.steps = nil // let's can be collected.
 			if !skipLog {
-				log.Warn("failed to execute step, wait for reschedule", zap.Error(err), zap.String("step", todo.Desc()))
+				log.Ctx(ctx).Warn("failed to execute step, wait for reschedule", zap.Error(err), zap.String("step", todo.Desc()))
 			}
 			return &stepStack{steps: steps}
 		}

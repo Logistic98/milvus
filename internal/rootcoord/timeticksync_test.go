@@ -23,10 +23,10 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus/internal/util/dependency"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
+	"github.com/milvus-io/milvus/pkg/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
@@ -42,8 +42,7 @@ func TestTimetickSync(t *testing.T) {
 
 	paramtable.Get().Save(Params.RootCoordCfg.DmlChannelNum.Key, "2")
 	paramtable.Get().Save(Params.CommonCfg.RootCoordDml.Key, "rootcoord-dml")
-	paramtable.Get().Save(Params.CommonCfg.RootCoordDelta.Key, "rootcoord-delta")
-	ttSync := newTimeTickSync(ctx, sourceID, factory, nil)
+	ttSync := newTimeTickSync(context.TODO(), ctx, sourceID, factory, nil)
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -78,7 +77,7 @@ func TestTimetickSync(t *testing.T) {
 		}
 
 		err := ttSync.updateTimeTick(msg, "1")
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 
 		msg.ChannelNames = append(msg.ChannelNames, "a")
 		err = ttSync.updateTimeTick(msg, "1")
@@ -90,11 +89,11 @@ func TestTimetickSync(t *testing.T) {
 		ttSync.sess2ChanTsMap[msg.Base.SourceID] = cttMsg
 
 		err = ttSync.updateTimeTick(msg, "1")
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 
 		ttSync.sourceID = int64(1)
 		err = ttSync.updateTimeTick(msg, "1")
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 	})
 
 	wg.Add(1)
@@ -121,8 +120,7 @@ func TestMultiTimetickSync(t *testing.T) {
 
 	paramtable.Get().Save(Params.RootCoordCfg.DmlChannelNum.Key, "1")
 	paramtable.Get().Save(Params.CommonCfg.RootCoordDml.Key, "rootcoord-dml")
-	paramtable.Get().Save(Params.CommonCfg.RootCoordDelta.Key, "rootcoord-delta")
-	ttSync := newTimeTickSync(ctx, UniqueID(0), factory, nil)
+	ttSync := newTimeTickSync(context.TODO(), ctx, UniqueID(0), factory, nil)
 
 	var wg sync.WaitGroup
 
@@ -131,10 +129,10 @@ func TestMultiTimetickSync(t *testing.T) {
 		defer wg.Done()
 
 		// suppose this is rooit
-		ttSync.addSession(&sessionutil.Session{ServerID: 1})
+		ttSync.addSession(&sessionutil.Session{SessionRaw: sessionutil.SessionRaw{ServerID: 1}})
 
 		// suppose this is proxy1
-		ttSync.addSession(&sessionutil.Session{ServerID: 2})
+		ttSync.addSession(&sessionutil.Session{SessionRaw: sessionutil.SessionRaw{ServerID: 2}})
 
 		msg := &internalpb.ChannelTimeTickMsg{
 			Base: &commonpb.MsgBase{
@@ -145,7 +143,7 @@ func TestMultiTimetickSync(t *testing.T) {
 		}
 
 		err := ttSync.updateTimeTick(msg, "1")
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 
 		msg2 := &internalpb.ChannelTimeTickMsg{
 			Base: &commonpb.MsgBase{
@@ -155,7 +153,7 @@ func TestMultiTimetickSync(t *testing.T) {
 			DefaultTimestamp: 102,
 		}
 		err = ttSync.updateTimeTick(msg2, "2")
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 
 		// make sure result works
 		result := <-ttSync.sendChan
@@ -175,4 +173,76 @@ func Test_ttHistogram_get(t *testing.T) {
 	h.remove("ch1", "ch2", "not_exist")
 	assert.Equal(t, typeutil.ZeroTimestamp, h.get("ch1"))
 	assert.Equal(t, typeutil.ZeroTimestamp, h.get("ch2"))
+}
+
+func TestTimetickSyncWithExistChannels(t *testing.T) {
+	ctx := context.Background()
+	sourceID := int64(100)
+
+	factory := dependency.NewDefaultFactory(true)
+
+	//chanMap := map[typeutil.UniqueID][]string{
+	//	int64(1): {"rootcoord-dml_0"},
+	//}
+
+	paramtable.Get().Save(Params.CommonCfg.RootCoordDml.Key, "rootcoord-dml")
+	chans := map[UniqueID][]string{}
+
+	chans[UniqueID(100)] = []string{"by-dev-rootcoord-dml_4", "by-dev-rootcoord-dml_8"}
+	chans[UniqueID(102)] = []string{"by-dev-rootcoord-dml_2", "by-dev-rootcoord-dml_9"}
+	ttSync := newTimeTickSync(context.TODO(), ctx, sourceID, factory, chans)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	t.Run("sendToChannel", func(t *testing.T) {
+		defer wg.Done()
+		ttSync.sendToChannel()
+
+		ttSync.sess2ChanTsMap[1] = nil
+		ttSync.sendToChannel()
+
+		msg := &internalpb.ChannelTimeTickMsg{
+			Base: &commonpb.MsgBase{
+				MsgType: commonpb.MsgType_TimeTick,
+			},
+		}
+		ttSync.sess2ChanTsMap[1] = newChanTsMsg(msg, 1)
+		ttSync.sendToChannel()
+	})
+
+	wg.Add(1)
+	t.Run("assign channels", func(t *testing.T) {
+		defer wg.Done()
+		channels := ttSync.getDmlChannelNames(int(4))
+		assert.Equal(t, channels, []string{"by-dev-rootcoord-dml_0", "by-dev-rootcoord-dml_1", "by-dev-rootcoord-dml_3", "by-dev-rootcoord-dml_5"})
+
+		channels = ttSync.getDmlChannelNames(int(4))
+		assert.Equal(t, channels, []string{"by-dev-rootcoord-dml_6", "by-dev-rootcoord-dml_7", "by-dev-rootcoord-dml_0", "by-dev-rootcoord-dml_1"})
+	})
+
+	// test get new channels
+}
+
+func TestTimetickSyncInvalidName(t *testing.T) {
+	ctx := context.Background()
+	sourceID := int64(100)
+
+	factory := dependency.NewDefaultFactory(true)
+
+	//chanMap := map[typeutil.UniqueID][]string{
+	//	int64(1): {"rootcoord-dml_0"},
+	//}
+
+	paramtable.Get().Save(Params.CommonCfg.RootCoordDml.Key, "rootcoord-dml")
+	chans := map[UniqueID][]string{}
+	chans[UniqueID(100)] = []string{"rootcoord-dml4"}
+	assert.Panics(t, func() {
+		newTimeTickSync(context.TODO(), ctx, sourceID, factory, chans)
+	})
+
+	chans = map[UniqueID][]string{}
+	chans[UniqueID(102)] = []string{"rootcoord-dml_a"}
+	assert.Panics(t, func() {
+		newTimeTickSync(context.TODO(), ctx, sourceID, factory, chans)
+	})
 }

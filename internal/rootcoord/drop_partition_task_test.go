@@ -21,14 +21,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/milvus-io/milvus/internal/metastore/model"
-	"github.com/milvus-io/milvus/internal/proto/etcdpb"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus/internal/metastore/model"
+	mockrootcoord "github.com/milvus-io/milvus/internal/rootcoord/mocks"
+	"github.com/milvus-io/milvus/pkg/util/funcutil"
 )
 
 func Test_dropPartitionTask_Prepare(t *testing.T) {
@@ -56,7 +56,7 @@ func Test_dropPartitionTask_Prepare(t *testing.T) {
 	t.Run("failed to get collection meta", func(t *testing.T) {
 		core := newTestCore(withInvalidMeta())
 		task := &dropPartitionTask{
-			baseTask: baseTask{core: core},
+			baseTask: newBaseTask(context.Background(), core),
 			Req: &milvuspb.DropPartitionRequest{
 				Base: &commonpb.MsgBase{MsgType: commonpb.MsgType_DropPartition},
 			},
@@ -66,17 +66,20 @@ func Test_dropPartitionTask_Prepare(t *testing.T) {
 	})
 
 	t.Run("normal case", func(t *testing.T) {
-		Params.Init()
-
 		collectionName := funcutil.GenRandomStr()
 		coll := &model.Collection{Name: collectionName}
-		meta := newMockMetaTable()
-		meta.GetCollectionByNameFunc = func(ctx context.Context, collectionName string, ts Timestamp) (*model.Collection, error) {
-			return coll.Clone(), nil
-		}
+
+		meta := mockrootcoord.NewIMetaTable(t)
+		meta.On("GetCollectionByName",
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+		).Return(coll.Clone(), nil)
+
 		core := newTestCore(withMeta(meta))
 		task := &dropPartitionTask{
-			baseTask: baseTask{core: core},
+			baseTask: newBaseTask(context.Background(), core),
 			Req: &milvuspb.DropPartitionRequest{
 				Base:           &commonpb.MsgBase{MsgType: commonpb.MsgType_DropPartition},
 				CollectionName: collectionName,
@@ -111,7 +114,7 @@ func Test_dropPartitionTask_Execute(t *testing.T) {
 		coll := &model.Collection{Name: collectionName, Partitions: []*model.Partition{{PartitionName: partitionName}}}
 		core := newTestCore(withInvalidProxyManager())
 		task := &dropPartitionTask{
-			baseTask: baseTask{core: core},
+			baseTask: newBaseTask(context.Background(), core),
 			Req: &milvuspb.DropPartitionRequest{
 				Base:           &commonpb.MsgBase{MsgType: commonpb.MsgType_DropPartition},
 				CollectionName: collectionName,
@@ -129,7 +132,7 @@ func Test_dropPartitionTask_Execute(t *testing.T) {
 		coll := &model.Collection{Name: collectionName, Partitions: []*model.Partition{{PartitionName: partitionName}}}
 		core := newTestCore(withValidProxyManager(), withInvalidMeta())
 		task := &dropPartitionTask{
-			baseTask: baseTask{core: core},
+			baseTask: newBaseTask(context.Background(), core),
 			Req: &milvuspb.DropPartitionRequest{
 				Base:           &commonpb.MsgBase{MsgType: commonpb.MsgType_DropPartition},
 				CollectionName: collectionName,
@@ -150,25 +153,36 @@ func Test_dropPartitionTask_Execute(t *testing.T) {
 		coll := &model.Collection{Name: collectionName, Partitions: []*model.Partition{{PartitionName: partitionName}}}
 		removePartitionMetaCalled := false
 		removePartitionMetaChan := make(chan struct{}, 1)
-		meta := newMockMetaTable()
-		meta.ChangePartitionStateFunc = func(ctx context.Context, collectionID UniqueID, partitionID UniqueID, state etcdpb.PartitionState, ts Timestamp) error {
-			return nil
-		}
-		meta.RemovePartitionFunc = func(ctx context.Context, collectionID UniqueID, partitionID UniqueID, ts Timestamp) error {
+
+		meta := mockrootcoord.NewIMetaTable(t)
+		meta.On("ChangePartitionState",
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+		).Return(nil)
+		meta.On("RemovePartition",
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+		).Return(func(ctx context.Context, dbID int64, collectionID int64, partitionID int64, ts uint64) error {
 			removePartitionMetaCalled = true
 			removePartitionMetaChan <- struct{}{}
 			return nil
-		}
+		})
 
-		gc := newMockGarbageCollector()
+		gc := mockrootcoord.NewGarbageCollector(t)
 		deletePartitionCalled := false
 		deletePartitionChan := make(chan struct{}, 1)
-		gc.GcPartitionDataFunc = func(ctx context.Context, pChannels []string, coll *model.Partition) (Timestamp, error) {
+		gc.EXPECT().GcPartitionData(mock.Anything, mock.Anything, mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, pChannels, vchannel []string, coll *model.Partition) (Timestamp, error) {
 			deletePartitionChan <- struct{}{}
 			deletePartitionCalled = true
 			time.Sleep(confirmGCInterval)
 			return 0, nil
-		}
+		})
 
 		broker := newMockBroker()
 		broker.GCConfirmFunc = func(ctx context.Context, collectionID, partitionID UniqueID) bool {
@@ -188,7 +202,7 @@ func Test_dropPartitionTask_Execute(t *testing.T) {
 			withBroker(broker))
 
 		task := &dropPartitionTask{
-			baseTask: baseTask{core: core},
+			baseTask: newBaseTask(context.Background(), core),
 			Req: &milvuspb.DropPartitionRequest{
 				Base:           &commonpb.MsgBase{MsgType: commonpb.MsgType_DropPartition},
 				CollectionName: collectionName,

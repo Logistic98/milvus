@@ -20,10 +20,12 @@ import (
 	"context"
 	"testing"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-	"github.com/milvus-io/milvus/internal/metastore/model"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	mockrootcoord "github.com/milvus-io/milvus/internal/rootcoord/mocks"
 )
 
 func Test_hasCollectionTask_Prepare(t *testing.T) {
@@ -57,10 +59,7 @@ func Test_hasCollectionTask_Execute(t *testing.T) {
 	t.Run("failed", func(t *testing.T) {
 		core := newTestCore(withInvalidMeta())
 		task := &hasCollectionTask{
-			baseTask: baseTask{
-				core: core,
-				done: make(chan error, 1),
-			},
+			baseTask: newBaseTask(context.Background(), core),
 			Req: &milvuspb.HasCollectionRequest{
 				Base: &commonpb.MsgBase{
 					MsgType: commonpb.MsgType_HasCollection,
@@ -75,16 +74,17 @@ func Test_hasCollectionTask_Execute(t *testing.T) {
 	})
 
 	t.Run("success", func(t *testing.T) {
-		meta := newMockMetaTable()
-		meta.GetCollectionByNameFunc = func(ctx context.Context, collectionName string, ts Timestamp) (*model.Collection, error) {
-			return nil, nil
-		}
+		meta := mockrootcoord.NewIMetaTable(t)
+		meta.On("GetCollectionByName",
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+		).Return(nil, nil)
+
 		core := newTestCore(withMeta(meta))
 		task := &hasCollectionTask{
-			baseTask: baseTask{
-				core: core,
-				done: make(chan error, 1),
-			},
+			baseTask: newBaseTask(context.Background(), core),
 			Req: &milvuspb.HasCollectionRequest{
 				Base: &commonpb.MsgBase{
 					MsgType: commonpb.MsgType_HasCollection,

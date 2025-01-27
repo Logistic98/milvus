@@ -16,36 +16,40 @@ package log
 import (
 	"context"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
 
 type ctxLogKeyType struct{}
 
-var (
-	CtxLogKey = ctxLogKeyType{}
-)
+var CtxLogKey = ctxLogKeyType{}
 
 // Debug logs a message at DebugLevel. The message includes any fields passed
 // at the log site, as well as any fields accumulated on the logger.
+// Deprecated: Use Ctx(ctx).Debug instead.
 func Debug(msg string, fields ...zap.Field) {
 	L().Debug(msg, fields...)
 }
 
 // Info logs a message at InfoLevel. The message includes any fields passed
 // at the log site, as well as any fields accumulated on the logger.
+// Deprecated: Use Ctx(ctx).Info instead.
 func Info(msg string, fields ...zap.Field) {
 	L().Info(msg, fields...)
 }
 
 // Warn logs a message at WarnLevel. The message includes any fields passed
 // at the log site, as well as any fields accumulated on the logger.
+// Deprecated: Use Ctx(ctx).Warn instead.
 func Warn(msg string, fields ...zap.Field) {
 	L().Warn(msg, fields...)
 }
 
 // Error logs a message at ErrorLevel. The message includes any fields passed
 // at the log site, as well as any fields accumulated on the logger.
+// Deprecated: Use Ctx(ctx).Error instead.
 func Error(msg string, fields ...zap.Field) {
 	L().Error(msg, fields...)
 }
@@ -54,6 +58,7 @@ func Error(msg string, fields ...zap.Field) {
 // at the log site, as well as any fields accumulated on the logger.
 //
 // The logger then panics, even if logging at PanicLevel is disabled.
+// Deprecated: Use Ctx(ctx).Panic instead.
 func Panic(msg string, fields ...zap.Field) {
 	L().Panic(msg, fields...)
 }
@@ -63,6 +68,7 @@ func Panic(msg string, fields ...zap.Field) {
 //
 // The logger then calls os.Exit(1), even if logging at FatalLevel is
 // disabled.
+// Deprecated: Use Ctx(ctx).Fatal instead.
 func Fatal(msg string, fields ...zap.Field) {
 	L().Fatal(msg, fields...)
 }
@@ -70,6 +76,7 @@ func Fatal(msg string, fields ...zap.Field) {
 // RatedDebug print logs at debug level
 // it limit log print to avoid too many logs
 // return true if log successfully
+// Deprecated: Use Ctx(ctx).RatedDebug instead.
 func RatedDebug(cost float64, msg string, fields ...zap.Field) bool {
 	if R().CheckCredit(cost) {
 		L().Debug(msg, fields...)
@@ -81,6 +88,7 @@ func RatedDebug(cost float64, msg string, fields ...zap.Field) bool {
 // RatedInfo print logs at info level
 // it limit log print to avoid too many logs
 // return true if log successfully
+// Deprecated: Use Ctx(ctx).RatedInfo instead.
 func RatedInfo(cost float64, msg string, fields ...zap.Field) bool {
 	if R().CheckCredit(cost) {
 		L().Info(msg, fields...)
@@ -92,6 +100,7 @@ func RatedInfo(cost float64, msg string, fields ...zap.Field) bool {
 // RatedWarn print logs at warn level
 // it limit log print to avoid too many logs
 // return true if log successfully
+// Deprecated: Use Ctx(ctx).RatedWarn instead.
 func RatedWarn(cost float64, msg string, fields ...zap.Field) bool {
 	if R().CheckCredit(cost) {
 		L().Warn(msg, fields...)
@@ -102,9 +111,12 @@ func RatedWarn(cost float64, msg string, fields ...zap.Field) bool {
 
 // With creates a child logger and adds structured context to it.
 // Fields added to the child don't affect the parent, and vice versa.
+// Deprecated: Use Ctx(ctx).With instead.
 func With(fields ...zap.Field) *MLogger {
 	return &MLogger{
-		Logger: L().With(fields...).WithOptions(zap.AddCallerSkip(-1)),
+		Logger: L().WithOptions(zap.WrapCore(func(core zapcore.Core) zapcore.Core {
+			return NewLazyWith(core, fields)
+		})).WithOptions(zap.AddCallerSkip(-1)),
 	}
 }
 
@@ -131,7 +143,7 @@ func WithReqID(ctx context.Context, reqID int64) context.Context {
 
 // WithModule adds given module field to the logger in ctx
 func WithModule(ctx context.Context, module string) context.Context {
-	fields := []zap.Field{zap.String("module", module)}
+	fields := []zap.Field{zap.String(FieldNameModule, module)}
 	return WithFields(ctx, fields...)
 }
 
@@ -147,6 +159,16 @@ func WithFields(ctx context.Context, fields ...zap.Field) context.Context {
 		Logger: zlogger.With(fields...),
 	}
 	return context.WithValue(ctx, CtxLogKey, mLogger)
+}
+
+// NewIntentContext creates a new context with intent information and returns it along with a span.
+func NewIntentContext(name string, intent string) (context.Context, trace.Span) {
+	intentCtx, initSpan := otel.Tracer(name).Start(context.Background(), intent)
+	intentCtx = WithFields(intentCtx,
+		zap.String("role", name),
+		zap.String("intent", intent),
+		zap.String("traceID", initSpan.SpanContext().TraceID().String()))
+	return intentCtx, initSpan
 }
 
 // Ctx returns a logger which will log contextual messages attached in ctx

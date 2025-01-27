@@ -74,6 +74,11 @@ func (m *ConcurrentMap[K, V]) Get(key K) (V, bool) {
 	return value.(V), true
 }
 
+func (m *ConcurrentMap[K, V]) Contain(key K) bool {
+	_, ok := m.Get(key)
+	return ok
+}
+
 // GetOrInsert returns the `value` and `loaded` on the given `key`, `value` set.
 // If the key already exists, return the value and set `loaded` to true.
 // If the key does not exist, insert the given `key` and `value` to map, return the value and set `loaded` to false.
@@ -94,4 +99,34 @@ func (m *ConcurrentMap[K, V]) GetAndRemove(key K) (V, bool) {
 	}
 	m.len.Dec()
 	return value.(V), true
+}
+
+// Remove removes the `key`, `value` set if `key` is in the map,
+// does nothing if `key` not in the map.
+func (m *ConcurrentMap[K, V]) Remove(key K) {
+	if _, loaded := m.inner.LoadAndDelete(key); loaded {
+		m.len.Dec()
+	}
+}
+
+func (m *ConcurrentMap[K, V]) Len() int {
+	return int(m.len.Load())
+}
+
+func (m *ConcurrentMap[K, V]) Values() []V {
+	ret := make([]V, m.Len())
+	m.inner.Range(func(key, value any) bool {
+		ret = append(ret, value.(V))
+		return true
+	})
+	return ret
+}
+
+func (m *ConcurrentMap[K, V]) Keys() []K {
+	ret := make([]K, m.Len())
+	m.inner.Range(func(key, value any) bool {
+		ret = append(ret, key.(K))
+		return true
+	})
+	return ret
 }

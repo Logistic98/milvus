@@ -47,6 +47,53 @@ var (
 			collectionIDLabelName,
 		})
 
+	QueryNodeProcessCost = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "process_insert_or_delete_latency",
+			Help:      "process insert or delete cost in ms",
+			Buckets:   buckets,
+		}, []string{
+			nodeIDLabelName,
+			msgTypeLabelName,
+		})
+
+	QueryNodeApplyBFCost = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "apply_bf_latency",
+			Help:      "apply bf cost in ms",
+			Buckets:   buckets,
+		}, []string{
+			functionLabelName,
+			nodeIDLabelName,
+		})
+
+	QueryNodeForwardDeleteCost = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "forward_delete_latency",
+			Help:      "forward delete cost in ms",
+			Buckets:   buckets,
+		}, []string{
+			functionLabelName,
+			nodeIDLabelName,
+		})
+
+	QueryNodeWaitProcessingMsgCount = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "wait_processing_msg_count",
+			Help:      "count of wait processing msg",
+		}, []string{
+			nodeIDLabelName,
+			msgTypeLabelName,
+		})
+
 	QueryNodeConsumerMsgCount = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: milvusNamespace,
@@ -81,6 +128,7 @@ var (
 			partitionIDLabelName,
 			segmentStateLabelName,
 			indexCountLabelName,
+			segmentLevelLabelName,
 		})
 
 	QueryNodeNumDmlChannels = prometheus.NewGaugeVec(
@@ -113,6 +161,8 @@ var (
 			nodeIDLabelName,
 			queryTypeLabelName,
 			statusLabelName,
+			requestScope,
+			collectionIDLabelName,
 		})
 
 	QueryNodeSQReqLatency = prometheus.NewHistogramVec(
@@ -128,6 +178,18 @@ var (
 			requestScope,
 		})
 
+	QueryNodeSQLatencyWaitTSafe = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "sq_wait_tsafe_latency",
+			Help:      "latency of search or query to wait for tsafe",
+			Buckets:   buckets,
+		}, []string{
+			nodeIDLabelName,
+			queryTypeLabelName,
+		})
+
 	QueryNodeSQLatencyInQueue = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: milvusNamespace,
@@ -138,7 +200,23 @@ var (
 		}, []string{
 			nodeIDLabelName,
 			queryTypeLabelName,
+			databaseLabelName,
+			ResourceGroupLabelName,
 		})
+
+	QueryNodeSQPerUserLatencyInQueue = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "sq_queue_user_latency",
+			Help:      "latency per user of search or query in queue",
+			Buckets:   buckets,
+		}, []string{
+			nodeIDLabelName,
+			queryTypeLabelName,
+			usernameLabelName,
+		},
+	)
 
 	QueryNodeSQSegmentLatency = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
@@ -175,6 +253,8 @@ var (
 		}, []string{
 			nodeIDLabelName,
 			queryTypeLabelName,
+			reduceLevelName,
+			reduceType,
 		})
 
 	QueryNodeLoadSegmentLatency = prometheus.NewHistogramVec(
@@ -183,7 +263,7 @@ var (
 			Subsystem: typeutil.QueryNodeRole,
 			Name:      "load_segment_latency",
 			Help:      "latency of load per segment",
-			Buckets:   buckets,
+			Buckets:   longTaskBuckets, // unit milliseconds
 		}, []string{
 			nodeIDLabelName,
 		})
@@ -272,6 +352,18 @@ var (
 			nodeIDLabelName,
 		})
 
+	QueryNodeSearchFTSNumTokens = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "search_fts_num_tokens",
+			Help:      "number of tokens in each Full Text Search search task",
+			Buckets:   buckets,
+		}, []string{
+			nodeIDLabelName,
+			collectionIDLabelName,
+		})
+
 	QueryNodeSearchGroupSize = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: milvusNamespace,
@@ -281,6 +373,55 @@ var (
 			Buckets:   buckets,
 		}, []string{
 			nodeIDLabelName,
+		})
+
+	QueryNodeSearchHitSegmentNum = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "search_hit_segment_num",
+			Help:      "the number of segments actually involved in search task",
+		}, []string{
+			nodeIDLabelName,
+			collectionIDLabelName,
+			queryTypeLabelName,
+		})
+
+	QueryNodeSegmentPruneRatio = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "segment_prune_ratio",
+			Help:      "ratio of segments pruned by segment_pruner",
+		}, []string{
+			nodeIDLabelName,
+			collectionIDLabelName,
+			segmentPruneLabelName,
+		})
+
+	QueryNodeSegmentPruneBias = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "segment_prune_bias",
+			Help:      "bias of workload when enabling segment prune",
+		}, []string{
+			nodeIDLabelName,
+			collectionIDLabelName,
+			segmentPruneLabelName,
+		})
+
+	QueryNodeSegmentPruneLatency = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "segment_prune_latency",
+			Help:      "latency of segment prune",
+			Buckets:   buckets,
+		}, []string{
+			nodeIDLabelName,
+			collectionIDLabelName,
+			segmentPruneLabelName,
 		})
 
 	QueryNodeEvictedReadReqCount = prometheus.NewCounterVec(
@@ -310,11 +451,36 @@ var (
 			Name:      "entity_num",
 			Help:      "number of entities which can be searched/queried, clustered by collection, partition and state",
 		}, []string{
+			databaseLabelName,
+			collectionName,
 			nodeIDLabelName,
 			collectionIDLabelName,
 			partitionIDLabelName,
 			segmentStateLabelName,
-			indexCountLabelName,
+		})
+
+	QueryNodeEntitiesSize = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "entity_size",
+			Help:      "entities' memory size, clustered by collection and state",
+		}, []string{
+			nodeIDLabelName,
+			collectionIDLabelName,
+			segmentStateLabelName,
+		})
+
+	QueryNodeLevelZeroSize = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "level_zero_size",
+			Help:      "level zero segments' delete records memory size, clustered by collection and state",
+		}, []string{
+			nodeIDLabelName,
+			collectionIDLabelName,
+			channelNameLabelName,
 		})
 
 	// QueryNodeConsumeCounter counts the bytes QueryNode consumed from message storage.
@@ -345,6 +511,311 @@ var (
 			nodeIDLabelName,
 			channelNameLabelName,
 		})
+
+	QueryNodeSegmentSearchLatencyPerVector = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "segment_latency_per_vector",
+			Help:      "one vector's search latency per segment",
+			Buckets:   buckets,
+		}, []string{
+			nodeIDLabelName,
+			queryTypeLabelName,
+			segmentStateLabelName,
+		})
+
+	QueryNodeWatchDmlChannelLatency = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "watch_dml_channel_latency",
+			Help:      "latency of watch dml channel",
+			Buckets:   buckets,
+		}, []string{
+			nodeIDLabelName,
+		})
+
+	QueryNodeDiskUsedSize = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "disk_used_size",
+			Help:      "disk used size(MB)",
+		}, []string{
+			nodeIDLabelName,
+		})
+
+	StoppingBalanceNodeNum = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "stopping_balance_node_num",
+			Help:      "the number of node which executing stopping balance",
+		}, []string{})
+
+	StoppingBalanceChannelNum = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "stopping_balance_channel_num",
+			Help:      "the number of channel which executing stopping balance",
+		}, []string{nodeIDLabelName})
+
+	StoppingBalanceSegmentNum = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "stopping_balance_segment_num",
+			Help:      "the number of segment which executing stopping balance",
+		}, []string{nodeIDLabelName})
+
+	QueryNodeLoadSegmentConcurrency = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "load_segment_concurrency",
+			Help:      "number of concurrent loading segments in QueryNode",
+		}, []string{
+			nodeIDLabelName,
+			loadTypeName,
+		})
+
+	QueryNodeLoadIndexLatency = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "load_index_latency",
+			Help:      "latency of load per segment's index, in milliseconds",
+			Buckets:   longTaskBuckets, // unit milliseconds
+		}, []string{
+			nodeIDLabelName,
+		})
+
+	// QueryNodeSegmentAccessTotal records the total number of search or query segments accessed.
+	QueryNodeSegmentAccessTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "segment_access_total",
+			Help:      "number of segments accessed",
+		}, []string{
+			nodeIDLabelName,
+			databaseLabelName,
+			ResourceGroupLabelName,
+			queryTypeLabelName,
+		},
+	)
+
+	// QueryNodeSegmentAccessDuration records the total time cost of accessing segments including cache loads.
+	QueryNodeSegmentAccessDuration = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "segment_access_duration",
+			Help:      "total time cost of accessing segments",
+		}, []string{
+			nodeIDLabelName,
+			databaseLabelName,
+			ResourceGroupLabelName,
+			queryTypeLabelName,
+		},
+	)
+
+	// QueryNodeSegmentAccessGlobalDuration records the global time cost of accessing segments.
+	QueryNodeSegmentAccessGlobalDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "segment_access_global_duration",
+			Help:      "global time cost of accessing segments",
+			Buckets:   longTaskBuckets,
+		}, []string{
+			nodeIDLabelName,
+			queryTypeLabelName,
+		},
+	)
+
+	// QueryNodeSegmentAccessWaitCacheTotal records the number of search or query segments that have to wait for loading access.
+	QueryNodeSegmentAccessWaitCacheTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "segment_access_wait_cache_total",
+			Help:      "number of segments waiting for loading access",
+		}, []string{
+			nodeIDLabelName,
+			databaseLabelName,
+			ResourceGroupLabelName,
+			queryTypeLabelName,
+		})
+
+	// QueryNodeSegmentAccessWaitCacheDuration records the total time cost of waiting for loading access.
+	QueryNodeSegmentAccessWaitCacheDuration = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "segment_access_wait_cache_duration",
+			Help:      "total time cost of waiting for loading access",
+		}, []string{
+			nodeIDLabelName,
+			databaseLabelName,
+			ResourceGroupLabelName,
+			queryTypeLabelName,
+		})
+
+	// QueryNodeSegmentAccessWaitCacheGlobalDuration records the global time cost of waiting for loading access.
+	QueryNodeSegmentAccessWaitCacheGlobalDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "segment_access_wait_cache_global_duration",
+			Help:      "global time cost of waiting for loading access",
+			Buckets:   longTaskBuckets,
+		}, []string{
+			nodeIDLabelName,
+			queryTypeLabelName,
+		})
+
+	// QueryNodeDiskCacheLoadTotal records the number of real segments loaded from disk cache.
+	QueryNodeDiskCacheLoadTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Help:      "number of segments loaded from disk cache",
+			Name:      "disk_cache_load_total",
+		}, []string{
+			nodeIDLabelName,
+			databaseLabelName,
+			ResourceGroupLabelName,
+		})
+
+	// QueryNodeDiskCacheLoadBytes records the number of bytes loaded from disk cache.
+	QueryNodeDiskCacheLoadBytes = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Help:      "number of bytes loaded from disk cache",
+			Name:      "disk_cache_load_bytes",
+		}, []string{
+			nodeIDLabelName,
+			databaseLabelName,
+			ResourceGroupLabelName,
+		})
+
+	// QueryNodeDiskCacheLoadDuration records the total time cost of loading segments from disk cache.
+	// With db and resource group labels.
+	QueryNodeDiskCacheLoadDuration = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Help:      "total time cost of loading segments from disk cache",
+			Name:      "disk_cache_load_duration",
+		}, []string{
+			nodeIDLabelName,
+			databaseLabelName,
+			ResourceGroupLabelName,
+		})
+
+	// QueryNodeDiskCacheLoadGlobalDuration records the global time cost of loading segments from disk cache.
+	QueryNodeDiskCacheLoadGlobalDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "disk_cache_load_global_duration",
+			Help:      "global duration of loading segments from disk cache",
+			Buckets:   longTaskBuckets,
+		}, []string{
+			nodeIDLabelName,
+		})
+
+	// QueryNodeDiskCacheEvictTotal records the number of real segments evicted from disk cache.
+	QueryNodeDiskCacheEvictTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "disk_cache_evict_total",
+			Help:      "number of segments evicted from disk cache",
+		}, []string{
+			nodeIDLabelName,
+			databaseLabelName,
+			ResourceGroupLabelName,
+		})
+
+	// QueryNodeDiskCacheEvictBytes records the number of bytes evicted from disk cache.
+	QueryNodeDiskCacheEvictBytes = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "disk_cache_evict_bytes",
+			Help:      "number of bytes evicted from disk cache",
+		}, []string{
+			nodeIDLabelName,
+			databaseLabelName,
+			ResourceGroupLabelName,
+		})
+
+	// QueryNodeDiskCacheEvictDuration records the total time cost of evicting segments from disk cache.
+	QueryNodeDiskCacheEvictDuration = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "disk_cache_evict_duration",
+			Help:      "total time cost of evicting segments from disk cache",
+		}, []string{
+			nodeIDLabelName,
+			databaseLabelName,
+			ResourceGroupLabelName,
+		})
+
+	// QueryNodeDiskCacheEvictGlobalDuration records the global time cost of evicting segments from disk cache.
+	QueryNodeDiskCacheEvictGlobalDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "disk_cache_evict_global_duration",
+			Help:      "global duration of evicting segments from disk cache",
+			Buckets:   longTaskBuckets,
+		}, []string{
+			nodeIDLabelName,
+		})
+
+	QueryNodeDeleteBufferSize = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "delete_buffer_size",
+			Help:      "delegator delete buffer size (in bytes)",
+		}, []string{
+			nodeIDLabelName,
+			channelNameLabelName,
+		},
+	)
+
+	QueryNodeDeleteBufferRowNum = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "delete_buffer_row_num",
+			Help:      "delegator delete buffer row num",
+		}, []string{
+			nodeIDLabelName,
+			channelNameLabelName,
+		},
+	)
+
+	QueryNodeCGOCallLatency = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "cgo_latency",
+			Help:      "latency of each cgo call",
+			Buckets:   buckets,
+		}, []string{
+			nodeIDLabelName,
+			cgoNameLabelName,
+			cgoTypeLabelName,
+		})
 )
 
 // RegisterQueryNode registers QueryNode metrics
@@ -356,7 +827,9 @@ func RegisterQueryNode(registry *prometheus.Registry) {
 	registry.MustRegister(QueryNodeNumDeltaChannels)
 	registry.MustRegister(QueryNodeSQCount)
 	registry.MustRegister(QueryNodeSQReqLatency)
+	registry.MustRegister(QueryNodeSQLatencyWaitTSafe)
 	registry.MustRegister(QueryNodeSQLatencyInQueue)
+	registry.MustRegister(QueryNodeSQPerUserLatencyInQueue)
 	registry.MustRegister(QueryNodeSQSegmentLatency)
 	registry.MustRegister(QueryNodeSQSegmentLatencyInCore)
 	registry.MustRegister(QueryNodeReduceLatency)
@@ -371,32 +844,136 @@ func RegisterQueryNode(registry *prometheus.Registry) {
 	registry.MustRegister(QueryNodeEvictedReadReqCount)
 	registry.MustRegister(QueryNodeSearchGroupTopK)
 	registry.MustRegister(QueryNodeSearchTopK)
+	registry.MustRegister(QueryNodeSearchFTSNumTokens)
 	registry.MustRegister(QueryNodeNumFlowGraphs)
 	registry.MustRegister(QueryNodeNumEntities)
+	registry.MustRegister(QueryNodeEntitiesSize)
+	registry.MustRegister(QueryNodeLevelZeroSize)
 	registry.MustRegister(QueryNodeConsumeCounter)
 	registry.MustRegister(QueryNodeExecuteCounter)
 	registry.MustRegister(QueryNodeConsumerMsgCount)
 	registry.MustRegister(QueryNodeConsumeTimeTickLag)
 	registry.MustRegister(QueryNodeMsgDispatcherTtLag)
+	registry.MustRegister(QueryNodeSegmentSearchLatencyPerVector)
+	registry.MustRegister(QueryNodeWatchDmlChannelLatency)
+	registry.MustRegister(QueryNodeDiskUsedSize)
+	registry.MustRegister(QueryNodeProcessCost)
+	registry.MustRegister(QueryNodeWaitProcessingMsgCount)
+	registry.MustRegister(StoppingBalanceNodeNum)
+	registry.MustRegister(StoppingBalanceChannelNum)
+	registry.MustRegister(StoppingBalanceSegmentNum)
+	registry.MustRegister(QueryNodeLoadSegmentConcurrency)
+	registry.MustRegister(QueryNodeLoadIndexLatency)
+	registry.MustRegister(QueryNodeSegmentAccessTotal)
+	registry.MustRegister(QueryNodeSegmentAccessDuration)
+	registry.MustRegister(QueryNodeSegmentAccessGlobalDuration)
+	registry.MustRegister(QueryNodeSegmentAccessWaitCacheTotal)
+	registry.MustRegister(QueryNodeSegmentAccessWaitCacheDuration)
+	registry.MustRegister(QueryNodeSegmentAccessWaitCacheGlobalDuration)
+	registry.MustRegister(QueryNodeDiskCacheLoadTotal)
+	registry.MustRegister(QueryNodeDiskCacheLoadBytes)
+	registry.MustRegister(QueryNodeDiskCacheLoadDuration)
+	registry.MustRegister(QueryNodeDiskCacheLoadGlobalDuration)
+	registry.MustRegister(QueryNodeDiskCacheEvictTotal)
+	registry.MustRegister(QueryNodeDiskCacheEvictBytes)
+	registry.MustRegister(QueryNodeDiskCacheEvictDuration)
+	registry.MustRegister(QueryNodeDiskCacheEvictGlobalDuration)
+	registry.MustRegister(QueryNodeSegmentPruneRatio)
+	registry.MustRegister(QueryNodeSegmentPruneLatency)
+	registry.MustRegister(QueryNodeSegmentPruneBias)
+	registry.MustRegister(QueryNodeApplyBFCost)
+	registry.MustRegister(QueryNodeForwardDeleteCost)
+	registry.MustRegister(QueryNodeSearchHitSegmentNum)
+	registry.MustRegister(QueryNodeDeleteBufferSize)
+	registry.MustRegister(QueryNodeDeleteBufferRowNum)
+	registry.MustRegister(QueryNodeCGOCallLatency)
+	// Add cgo metrics
+	RegisterCGOMetrics(registry)
+
+	RegisterStreamingServiceClient(registry)
 }
 
 func CleanupQueryNodeCollectionMetrics(nodeID int64, collectionID int64) {
-	for _, label := range []string{DeleteLabel, InsertLabel} {
-		QueryNodeConsumerMsgCount.
-			Delete(
-				prometheus.Labels{
-					nodeIDLabelName:       fmt.Sprint(nodeID),
-					msgTypeLabelName:      label,
-					collectionIDLabelName: fmt.Sprint(collectionID),
-				})
+	nodeIDLabel := fmt.Sprint(nodeID)
+	collectionIDLabel := fmt.Sprint(collectionID)
+	QueryNodeConsumerMsgCount.
+		DeletePartialMatch(
+			prometheus.Labels{
+				nodeIDLabelName:       nodeIDLabel,
+				collectionIDLabelName: collectionIDLabel,
+			})
 
-		QueryNodeConsumeTimeTickLag.
-			Delete(
-				prometheus.Labels{
-					nodeIDLabelName:       fmt.Sprint(nodeID),
-					msgTypeLabelName:      label,
-					collectionIDLabelName: fmt.Sprint(collectionID),
-				})
-	}
+	QueryNodeConsumeTimeTickLag.
+		DeletePartialMatch(
+			prometheus.Labels{
+				nodeIDLabelName:       nodeIDLabel,
+				collectionIDLabelName: collectionIDLabel,
+			})
+	QueryNodeNumEntities.
+		DeletePartialMatch(
+			prometheus.Labels{
+				nodeIDLabelName:       nodeIDLabel,
+				collectionIDLabelName: collectionIDLabel,
+			})
+	QueryNodeEntitiesSize.
+		DeletePartialMatch(
+			prometheus.Labels{
+				nodeIDLabelName:       nodeIDLabel,
+				collectionIDLabelName: collectionIDLabel,
+			})
+	QueryNodeNumSegments.
+		DeletePartialMatch(
+			prometheus.Labels{
+				nodeIDLabelName:       nodeIDLabel,
+				collectionIDLabelName: collectionIDLabel,
+			})
 
+	QueryNodeSQCount.
+		DeletePartialMatch(
+			prometheus.Labels{
+				nodeIDLabelName:       nodeIDLabel,
+				collectionIDLabelName: collectionIDLabel,
+			})
+
+	QueryNodeSearchHitSegmentNum.
+		DeletePartialMatch(
+			prometheus.Labels{
+				nodeIDLabelName:       nodeIDLabel,
+				collectionIDLabelName: collectionIDLabel,
+			})
+
+	QueryNodeSegmentPruneRatio.
+		DeletePartialMatch(
+			prometheus.Labels{
+				nodeIDLabelName:       nodeIDLabel,
+				collectionIDLabelName: collectionIDLabel,
+			})
+
+	QueryNodeSegmentPruneBias.
+		DeletePartialMatch(
+			prometheus.Labels{
+				nodeIDLabelName:       nodeIDLabel,
+				collectionIDLabelName: collectionIDLabel,
+			})
+
+	QueryNodeSegmentPruneLatency.
+		DeletePartialMatch(
+			prometheus.Labels{
+				nodeIDLabelName:       nodeIDLabel,
+				collectionIDLabelName: collectionIDLabel,
+			})
+
+	QueryNodeEntitiesSize.
+		DeletePartialMatch(
+			prometheus.Labels{
+				nodeIDLabelName:       nodeIDLabel,
+				collectionIDLabelName: collectionIDLabel,
+			})
+
+	QueryNodeLevelZeroSize.
+		DeletePartialMatch(
+			prometheus.Labels{
+				nodeIDLabelName:       nodeIDLabel,
+				collectionIDLabelName: collectionIDLabel,
+			})
 }

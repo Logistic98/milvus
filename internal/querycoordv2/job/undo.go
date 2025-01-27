@@ -19,50 +19,65 @@ package job
 import (
 	"context"
 
+	"go.uber.org/zap"
+
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/internal/querycoordv2/observers"
-	"github.com/milvus-io/milvus/internal/querycoordv2/session"
+	"github.com/milvus-io/milvus/pkg/log"
 )
 
 type UndoList struct {
-	PartitionsLoaded  bool // indicates if partitions loaded in QueryNodes during loading
-	TargetUpdated     bool // indicates if target updated during loading
-	NewReplicaCreated bool // indicates if created new replicas during loading
+	IsTargetUpdated  bool // indicates if target updated during loading
+	IsReplicaCreated bool // indicates if created new replicas during loading
+	IsNewCollection  bool // indicates if created new collection during loading
 
 	CollectionID   int64
 	LackPartitions []int64
 
 	ctx            context.Context
 	meta           *meta.Meta
-	cluster        session.Cluster
-	targetMgr      *meta.TargetManager
+	targetMgr      meta.TargetManagerInterface
 	targetObserver *observers.TargetObserver
 }
 
 func NewUndoList(ctx context.Context, meta *meta.Meta,
-	cluster session.Cluster, targetMgr *meta.TargetManager, targetObserver *observers.TargetObserver) *UndoList {
+	targetMgr meta.TargetManagerInterface, targetObserver *observers.TargetObserver,
+) *UndoList {
 	return &UndoList{
 		ctx:            ctx,
 		meta:           meta,
-		cluster:        cluster,
 		targetMgr:      targetMgr,
 		targetObserver: targetObserver,
 	}
 }
 
 func (u *UndoList) RollBack() {
-	if u.PartitionsLoaded {
-		releasePartitions(u.ctx, u.meta, u.cluster, true, u.CollectionID, u.LackPartitions...)
+	log := log.Ctx(u.ctx).With(
+		zap.Int64("collectionID", u.CollectionID),
+		zap.Int64s("partitionIDs", u.LackPartitions),
+	)
+
+	log.Warn("rollback failed loading request...",
+		zap.Bool("isNewCollection", u.IsNewCollection),
+		zap.Bool("isReplicaCreated", u.IsReplicaCreated),
+		zap.Bool("isTargetUpdated", u.IsTargetUpdated),
+	)
+
+	var err error
+	if u.IsNewCollection || u.IsReplicaCreated {
+		err = u.meta.CollectionManager.RemoveCollection(u.ctx, u.CollectionID)
+	} else {
+		err = u.meta.CollectionManager.RemovePartition(u.ctx, u.CollectionID, u.LackPartitions...)
 	}
-	if u.TargetUpdated {
-		if !u.meta.CollectionManager.Exist(u.CollectionID) {
-			u.targetMgr.RemoveCollection(u.CollectionID)
+	if err != nil {
+		log.Warn("failed to rollback collection from meta", zap.Error(err))
+	}
+
+	if u.IsTargetUpdated {
+		if u.IsNewCollection {
 			u.targetObserver.ReleaseCollection(u.CollectionID)
 		} else {
-			u.targetMgr.RemovePartition(u.CollectionID, u.LackPartitions...)
+			u.targetObserver.ReleasePartition(u.CollectionID, u.LackPartitions...)
 		}
-	}
-	if u.NewReplicaCreated {
-		u.meta.ReplicaManager.RemoveCollection(u.CollectionID)
 	}
 }

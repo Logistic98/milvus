@@ -24,23 +24,45 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/errors"
-	"github.com/milvus-io/milvus/internal/util/sessionutil"
-
-	clientv3 "go.etcd.io/etcd/client/v3"
-
 	"github.com/stretchr/testify/assert"
+	"github.com/tikv/client-go/v2/txnkv"
+	clientv3 "go.etcd.io/etcd/client/v3"
+	"google.golang.org/grpc"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus/internal/mocks"
 	"github.com/milvus-io/milvus/internal/rootcoord"
 	"github.com/milvus-io/milvus/internal/types"
+	kvfactory "github.com/milvus-io/milvus/internal/util/dependency/kv"
+	"github.com/milvus-io/milvus/internal/util/sessionutil"
+	"github.com/milvus-io/milvus/pkg/proto/rootcoordpb"
 	"github.com/milvus-io/milvus/pkg/util/etcd"
+	"github.com/milvus-io/milvus/pkg/util/merr"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/util/tikv"
 )
 
 type mockCore struct {
 	types.RootCoordComponent
+}
+
+func (m *mockCore) CreateDatabase(ctx context.Context, request *milvuspb.CreateDatabaseRequest) (*commonpb.Status, error) {
+	return &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success}, nil
+}
+
+func (m *mockCore) DropDatabase(ctx context.Context, request *milvuspb.DropDatabaseRequest) (*commonpb.Status, error) {
+	return &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success}, nil
+}
+
+func (m *mockCore) ListDatabases(ctx context.Context, request *milvuspb.ListDatabasesRequest) (*milvuspb.ListDatabasesResponse, error) {
+	return &milvuspb.ListDatabasesResponse{
+		Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success},
+	}, nil
+}
+
+func (m *mockCore) AlterDatabase(ctx context.Context, request *rootcoordpb.AlterDatabaseRequest) (*commonpb.Status, error) {
+	return &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success}, nil
 }
 
 func (m *mockCore) RenameCollection(ctx context.Context, request *milvuspb.RenameCollectionRequest) (*commonpb.Status, error) {
@@ -52,6 +74,7 @@ func (m *mockCore) CheckHealth(ctx context.Context, req *milvuspb.CheckHealthReq
 		IsHealthy: true,
 	}, nil
 }
+
 func (m *mockCore) UpdateStateCode(commonpb.StateCode) {
 }
 
@@ -61,15 +84,21 @@ func (m *mockCore) SetAddress(address string) {
 func (m *mockCore) SetEtcdClient(etcdClient *clientv3.Client) {
 }
 
-func (m *mockCore) SetDataCoord(types.DataCoord) error {
+func (m *mockCore) SetTiKVClient(client *txnkv.Client) {
+}
+
+func (m *mockCore) SetDataCoordClient(client types.DataCoordClient) error {
 	return nil
 }
 
-func (m *mockCore) SetQueryCoord(types.QueryCoord) error {
+func (m *mockCore) SetQueryCoordClient(client types.QueryCoordClient) error {
 	return nil
 }
 
-func (m *mockCore) SetProxyCreator(func(ctx context.Context, addr string) (types.Proxy, error)) {
+func (m *mockCore) SetProxyCreator(func(ctx context.Context, addr string, nodeID int64) (types.ProxyClient, error)) {
+}
+
+func (m *mockCore) RegisterStreamingCoordGRPCService(server *grpc.Server) {
 }
 
 func (m *mockCore) Register() error {
@@ -88,176 +117,229 @@ func (m *mockCore) Stop() error {
 	return fmt.Errorf("stop error")
 }
 
-type mockDataCoord struct {
-	types.DataCoord
-	initErr  error
-	startErr error
-}
-
-func (m *mockDataCoord) Init() error {
-	return m.initErr
-}
-func (m *mockDataCoord) Start() error {
-	return m.startErr
-}
-func (m *mockDataCoord) GetComponentStates(ctx context.Context) (*milvuspb.ComponentStates, error) {
-	return &milvuspb.ComponentStates{
-		State: &milvuspb.ComponentInfo{
-			StateCode: commonpb.StateCode_Healthy,
-		},
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-		},
-		SubcomponentStates: []*milvuspb.ComponentInfo{
-			{
-				StateCode: commonpb.StateCode_Healthy,
-			},
-		},
-	}, nil
-}
-func (m *mockDataCoord) Stop() error {
-	return fmt.Errorf("stop error")
-}
-
-type mockQueryCoord struct {
-	types.QueryCoord
-	initErr  error
-	startErr error
-}
-
-func (m *mockQueryCoord) Init() error {
-	return m.initErr
-}
-
-func (m *mockQueryCoord) Start() error {
-	return m.startErr
-}
-
-func (m *mockQueryCoord) Stop() error {
-	return fmt.Errorf("stop error")
-}
-
 func TestRun(t *testing.T) {
 	paramtable.Init()
-	ctx, cancel := context.WithCancel(context.Background())
-	svr := Server{
-		rootCoord:   &mockCore{},
-		ctx:         ctx,
-		cancel:      cancel,
-		grpcErrChan: make(chan error),
+	parameters := []string{"tikv", "etcd"}
+	for _, v := range parameters {
+		paramtable.Get().Save(paramtable.Get().MetaStoreCfg.MetaStoreType.Key, v)
+		ctx := context.Background()
+		getTiKVClient = func(cfg *paramtable.TiKVConfig) (*txnkv.Client, error) {
+			return tikv.SetupLocalTxn(), nil
+		}
+		defer func() {
+			getTiKVClient = tikv.GetTiKVClient
+		}()
+		rcServerConfig := &paramtable.Get().RootCoordGrpcServerCfg
+		oldPort := rcServerConfig.Port.GetValue()
+		paramtable.Get().Save(rcServerConfig.Port.Key, "1000000")
+		svr, err := NewServer(ctx, nil)
+		assert.NoError(t, err)
+		err = svr.Prepare()
+		assert.Error(t, err)
+		assert.EqualError(t, err, "listen tcp: address 1000000: invalid port")
+		paramtable.Get().Save(rcServerConfig.Port.Key, oldPort)
+
+		svr, err = NewServer(ctx, nil)
+		assert.NoError(t, err)
+		assert.NotNil(t, svr)
+		svr.rootCoord = &mockCore{}
+
+		mockDataCoord := mocks.NewMockDataCoordClient(t)
+		mockDataCoord.EXPECT().Close().Return(nil)
+		svr.newDataCoordClient = func(_ context.Context) types.DataCoordClient {
+			return mockDataCoord
+		}
+
+		mockQueryCoord := mocks.NewMockQueryCoordClient(t)
+		mockQueryCoord.EXPECT().Close().Return(nil)
+		svr.newQueryCoordClient = func(_ context.Context) types.QueryCoordClient {
+			return mockQueryCoord
+		}
+
+		paramtable.Get().Save(rcServerConfig.Port.Key, fmt.Sprintf("%d", rand.Int()%100+10010))
+		etcdConfig := &paramtable.Get().EtcdCfg
+
+		rand.Seed(time.Now().UnixNano())
+		randVal := rand.Int()
+		rootPath := fmt.Sprintf("/%d/test", randVal)
+		rootcoord.Params.Save("etcd.rootPath", rootPath)
+		// Need to reset global etcd to follow new path
+		// Need to reset global etcd to follow new path
+		kvfactory.CloseEtcdClient()
+
+		etcdCli, err := etcd.GetEtcdClient(
+			etcdConfig.UseEmbedEtcd.GetAsBool(),
+			etcdConfig.EtcdUseSSL.GetAsBool(),
+			etcdConfig.Endpoints.GetAsStrings(),
+			etcdConfig.EtcdTLSCert.GetValue(),
+			etcdConfig.EtcdTLSKey.GetValue(),
+			etcdConfig.EtcdTLSCACert.GetValue(),
+			etcdConfig.EtcdTLSMinVersion.GetValue())
+		assert.NoError(t, err)
+		sessKey := path.Join(rootcoord.Params.EtcdCfg.MetaRootPath.GetValue(), sessionutil.DefaultServiceRoot)
+		_, err = etcdCli.Delete(ctx, sessKey, clientv3.WithPrefix())
+		assert.NoError(t, err)
+		err = svr.Prepare()
+		assert.NoError(t, err)
+		err = svr.Run()
+		assert.NoError(t, err)
+
+		t.Run("CheckHealth", func(t *testing.T) {
+			ret, err := svr.CheckHealth(ctx, nil)
+			assert.NoError(t, err)
+			assert.Equal(t, true, ret.IsHealthy)
+		})
+
+		t.Run("RenameCollection", func(t *testing.T) {
+			_, err := svr.RenameCollection(ctx, nil)
+			assert.NoError(t, err)
+		})
+
+		t.Run("CreateDatabase", func(t *testing.T) {
+			ret, err := svr.CreateDatabase(ctx, nil)
+			assert.Nil(t, err)
+			assert.Equal(t, commonpb.ErrorCode_Success, ret.ErrorCode)
+		})
+
+		t.Run("DropDatabase", func(t *testing.T) {
+			ret, err := svr.DropDatabase(ctx, nil)
+			assert.Nil(t, err)
+			assert.Equal(t, commonpb.ErrorCode_Success, ret.ErrorCode)
+		})
+
+		t.Run("ListDatabases", func(t *testing.T) {
+			ret, err := svr.ListDatabases(ctx, nil)
+			assert.Nil(t, err)
+			assert.Equal(t, commonpb.ErrorCode_Success, ret.GetStatus().GetErrorCode())
+		})
+
+		t.Run("AlterDatabase", func(t *testing.T) {
+			ret, err := svr.AlterDatabase(ctx, nil)
+			assert.Nil(t, err)
+			assert.True(t, merr.Ok(ret))
+		})
+
+		err = svr.Stop()
+		assert.NoError(t, err)
 	}
-	rcServerConfig := &paramtable.Get().RootCoordGrpcServerCfg
-	paramtable.Get().Save(rcServerConfig.Port.Key, "1000000")
-	err := svr.Run()
-	assert.NotNil(t, err)
-	assert.EqualError(t, err, "listen tcp: address 1000000: invalid port")
-
-	svr.newDataCoordClient = func(string, *clientv3.Client) types.DataCoord {
-		return &mockDataCoord{}
-	}
-	svr.newQueryCoordClient = func(string, *clientv3.Client) types.QueryCoord {
-		return &mockQueryCoord{}
-	}
-
-	paramtable.Get().Save(rcServerConfig.Port.Key, fmt.Sprintf("%d", rand.Int()%100+10000))
-	etcdConfig := &paramtable.Get().EtcdCfg
-
-	rand.Seed(time.Now().UnixNano())
-	randVal := rand.Int()
-	rootPath := fmt.Sprintf("/%d/test", randVal)
-	rootcoord.Params.BaseTable.Save("etcd.rootPath", rootPath)
-	rootcoord.Params.Init()
-
-	etcdCli, err := etcd.GetEtcdClient(
-		etcdConfig.UseEmbedEtcd.GetAsBool(),
-		etcdConfig.EtcdUseSSL.GetAsBool(),
-		etcdConfig.Endpoints.GetAsStrings(),
-		etcdConfig.EtcdTLSCert.GetValue(),
-		etcdConfig.EtcdTLSKey.GetValue(),
-		etcdConfig.EtcdTLSCACert.GetValue(),
-		etcdConfig.EtcdTLSMinVersion.GetValue())
-	assert.Nil(t, err)
-	sessKey := path.Join(rootcoord.Params.EtcdCfg.MetaRootPath.GetValue(), sessionutil.DefaultServiceRoot)
-	_, err = etcdCli.Delete(ctx, sessKey, clientv3.WithPrefix())
-	assert.Nil(t, err)
-	err = svr.Run()
-	assert.Nil(t, err)
-
-	t.Run("CheckHealth", func(t *testing.T) {
-		ret, err := svr.CheckHealth(ctx, nil)
-		assert.Nil(t, err)
-		assert.Equal(t, true, ret.IsHealthy)
-	})
-
-	t.Run("RenameCollection", func(t *testing.T) {
-		_, err := svr.RenameCollection(ctx, nil)
-		assert.Nil(t, err)
-	})
-
-	err = svr.Stop()
-	assert.Nil(t, err)
 }
 
 func TestServerRun_DataCoordClientInitErr(t *testing.T) {
 	paramtable.Init()
-	ctx := context.Background()
-	server, err := NewServer(ctx, nil)
-	assert.Nil(t, err)
-	assert.NotNil(t, server)
+	parameters := []string{"tikv", "etcd"}
+	for _, v := range parameters {
+		paramtable.Get().Save(paramtable.Get().MetaStoreCfg.MetaStoreType.Key, v)
+		ctx := context.Background()
+		getTiKVClient = func(cfg *paramtable.TiKVConfig) (*txnkv.Client, error) {
+			return tikv.SetupLocalTxn(), nil
+		}
+		defer func() {
+			getTiKVClient = tikv.GetTiKVClient
+		}()
+		server, err := NewServer(ctx, nil)
+		assert.NoError(t, err)
+		assert.NotNil(t, server)
 
-	server.newDataCoordClient = func(string, *clientv3.Client) types.DataCoord {
-		return &mockDataCoord{initErr: errors.New("mock datacoord init error")}
+		mockDataCoord := mocks.NewMockDataCoordClient(t)
+		mockDataCoord.EXPECT().Close().Return(nil)
+		server.newDataCoordClient = func(_ context.Context) types.DataCoordClient {
+			return mockDataCoord
+		}
+		err = server.Prepare()
+		assert.NoError(t, err)
+		assert.Panics(t, func() { server.Run() })
+
+		err = server.Stop()
+		assert.NoError(t, err)
 	}
-	assert.Panics(t, func() { server.Run() })
-
-	err = server.Stop()
-	assert.Nil(t, err)
 }
 
 func TestServerRun_DataCoordClientStartErr(t *testing.T) {
 	paramtable.Init()
-	ctx := context.Background()
-	server, err := NewServer(ctx, nil)
-	assert.Nil(t, err)
-	assert.NotNil(t, server)
+	parameters := []string{"tikv", "etcd"}
+	for _, v := range parameters {
+		paramtable.Get().Save(paramtable.Get().MetaStoreCfg.MetaStoreType.Key, v)
+		ctx := context.Background()
+		getTiKVClient = func(cfg *paramtable.TiKVConfig) (*txnkv.Client, error) {
+			return tikv.SetupLocalTxn(), nil
+		}
+		defer func() {
+			getTiKVClient = tikv.GetTiKVClient
+		}()
+		server, err := NewServer(ctx, nil)
+		assert.NoError(t, err)
+		assert.NotNil(t, server)
 
-	server.newDataCoordClient = func(string, *clientv3.Client) types.DataCoord {
-		return &mockDataCoord{startErr: errors.New("mock datacoord start error")}
+		mockDataCoord := mocks.NewMockDataCoordClient(t)
+		mockDataCoord.EXPECT().Close().Return(nil)
+		server.newDataCoordClient = func(_ context.Context) types.DataCoordClient {
+			return mockDataCoord
+		}
+		err = server.Prepare()
+		assert.NoError(t, err)
+		assert.Panics(t, func() { server.Run() })
+
+		err = server.Stop()
+		assert.NoError(t, err)
 	}
-	assert.Panics(t, func() { server.Run() })
-
-	err = server.Stop()
-	assert.Nil(t, err)
 }
 
 func TestServerRun_QueryCoordClientInitErr(t *testing.T) {
 	paramtable.Init()
-	ctx := context.Background()
-	server, err := NewServer(ctx, nil)
-	assert.Nil(t, err)
-	assert.NotNil(t, server)
+	parameters := []string{"tikv", "etcd"}
+	for _, v := range parameters {
+		paramtable.Get().Save(paramtable.Get().MetaStoreCfg.MetaStoreType.Key, v)
+		ctx := context.Background()
+		getTiKVClient = func(cfg *paramtable.TiKVConfig) (*txnkv.Client, error) {
+			return tikv.SetupLocalTxn(), nil
+		}
+		defer func() {
+			getTiKVClient = tikv.GetTiKVClient
+		}()
+		server, err := NewServer(ctx, nil)
+		assert.NoError(t, err)
+		assert.NotNil(t, server)
 
-	server.newQueryCoordClient = func(string, *clientv3.Client) types.QueryCoord {
-		return &mockQueryCoord{initErr: errors.New("mock querycoord init error")}
+		mockQueryCoord := mocks.NewMockQueryCoordClient(t)
+		mockQueryCoord.EXPECT().Close().Return(nil)
+		server.newQueryCoordClient = func(_ context.Context) types.QueryCoordClient {
+			return mockQueryCoord
+		}
+		err = server.Prepare()
+		assert.NoError(t, err)
+		assert.Panics(t, func() { server.Run() })
+
+		err = server.Stop()
+		assert.NoError(t, err)
 	}
-	assert.Panics(t, func() { server.Run() })
-
-	err = server.Stop()
-	assert.Nil(t, err)
 }
 
 func TestServer_QueryCoordClientStartErr(t *testing.T) {
 	paramtable.Init()
-	ctx := context.Background()
-	server, err := NewServer(ctx, nil)
-	assert.Nil(t, err)
-	assert.NotNil(t, server)
+	parameters := []string{"tikv", "etcd"}
+	for _, v := range parameters {
+		paramtable.Get().Save(paramtable.Get().MetaStoreCfg.MetaStoreType.Key, v)
+		ctx := context.Background()
+		getTiKVClient = func(cfg *paramtable.TiKVConfig) (*txnkv.Client, error) {
+			return tikv.SetupLocalTxn(), nil
+		}
+		defer func() {
+			getTiKVClient = tikv.GetTiKVClient
+		}()
+		server, err := NewServer(ctx, nil)
+		assert.NoError(t, err)
+		assert.NotNil(t, server)
 
-	server.newQueryCoordClient = func(string, *clientv3.Client) types.QueryCoord {
-		return &mockQueryCoord{startErr: errors.New("mock querycoord start error")}
+		mockQueryCoord := mocks.NewMockQueryCoordClient(t)
+		mockQueryCoord.EXPECT().Close().Return(nil)
+		server.newQueryCoordClient = func(_ context.Context) types.QueryCoordClient {
+			return mockQueryCoord
+		}
+		err = server.Prepare()
+		assert.NoError(t, err)
+		assert.Panics(t, func() { server.Run() })
+
+		err = server.Stop()
+		assert.NoError(t, err)
 	}
-	assert.Panics(t, func() { server.Run() })
-
-	err = server.Stop()
-	assert.Nil(t, err)
 }

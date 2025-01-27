@@ -18,289 +18,803 @@ package datacoord
 
 import (
 	"context"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/errors"
-	"github.com/milvus-io/milvus/pkg/util/tsoutil"
-	"github.com/stretchr/testify/assert"
+	"github.com/samber/lo"
 	"github.com/stretchr/testify/mock"
-	"github.com/stretchr/testify/require"
-	"go.uber.org/zap"
+	"github.com/stretchr/testify/suite"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/datacoord/allocator"
+	"github.com/milvus-io/milvus/internal/datacoord/session"
+	"github.com/milvus-io/milvus/internal/metastore/kv/binlog"
 	"github.com/milvus-io/milvus/internal/metastore/kv/datacoord"
-	"github.com/milvus-io/milvus/internal/mocks"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/util/metautil"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
-func Test_compactionPlanHandler_execCompactionPlan(t *testing.T) {
-	type fields struct {
-		plans            map[int64]*compactionTask
-		sessions         *SessionManager
-		chManager        *ChannelManager
-		allocatorFactory func() allocator
+func TestCompactionPlanHandlerSuite(t *testing.T) {
+	suite.Run(t, new(CompactionPlanHandlerSuite))
+}
+
+type CompactionPlanHandlerSuite struct {
+	suite.Suite
+
+	mockMeta    *MockCompactionMeta
+	mockAlloc   *allocator.MockAllocator
+	mockCm      *MockChannelManager
+	mockSessMgr *session.MockDataNodeManager
+	handler     *compactionPlanHandler
+	mockHandler *NMockHandler
+	cluster     *MockCluster
+}
+
+func (s *CompactionPlanHandlerSuite) SetupTest() {
+	s.mockMeta = NewMockCompactionMeta(s.T())
+	s.mockMeta.EXPECT().SaveCompactionTask(mock.Anything, mock.Anything).Return(nil).Maybe()
+	s.mockAlloc = allocator.NewMockAllocator(s.T())
+	s.mockCm = NewMockChannelManager(s.T())
+	s.mockSessMgr = session.NewMockDataNodeManager(s.T())
+	s.cluster = NewMockCluster(s.T())
+	s.handler = newCompactionPlanHandler(s.cluster, s.mockSessMgr, s.mockMeta, s.mockAlloc, nil, nil)
+	s.mockHandler = NewNMockHandler(s.T())
+	s.mockHandler.EXPECT().GetCollection(mock.Anything, mock.Anything).Return(&collectionInfo{}, nil).Maybe()
+}
+
+func (s *CompactionPlanHandlerSuite) TestScheduleEmpty() {
+	s.SetupTest()
+
+	assigner := newSlotBasedNodeAssigner(s.cluster)
+	s.handler.schedule(assigner)
+	s.Empty(s.handler.executingTasks)
+}
+
+func (s *CompactionPlanHandlerSuite) generateInitTasksForSchedule() {
+	task1 := &mixCompactionTask{
+		sessions: s.mockSessMgr,
+		meta:     s.mockMeta,
 	}
-	type args struct {
-		signal *compactionSignal
-		plan   *datapb.CompactionPlan
+	task1.SetTask(&datapb.CompactionTask{
+		PlanID:  1,
+		Type:    datapb.CompactionType_MixCompaction,
+		State:   datapb.CompactionTaskState_pipelining,
+		Channel: "ch-1",
+		NodeID:  100,
+	})
+
+	task2 := &mixCompactionTask{
+		sessions: s.mockSessMgr,
+		meta:     s.mockMeta,
 	}
+	task2.SetTask(&datapb.CompactionTask{
+		PlanID:  2,
+		Type:    datapb.CompactionType_MixCompaction,
+		State:   datapb.CompactionTaskState_pipelining,
+		Channel: "ch-1",
+		NodeID:  100,
+	})
+
+	task3 := &mixCompactionTask{
+		sessions: s.mockSessMgr,
+		meta:     s.mockMeta,
+	}
+	task3.SetTask(&datapb.CompactionTask{
+		PlanID:  3,
+		Type:    datapb.CompactionType_MixCompaction,
+		State:   datapb.CompactionTaskState_pipelining,
+		Channel: "ch-2",
+		NodeID:  101,
+	})
+
+	task4 := &mixCompactionTask{
+		sessions: s.mockSessMgr,
+		meta:     s.mockMeta,
+	}
+	task4.SetTask(&datapb.CompactionTask{
+		PlanID:  4,
+		Type:    datapb.CompactionType_Level0DeleteCompaction,
+		State:   datapb.CompactionTaskState_pipelining,
+		Channel: "ch-3",
+		NodeID:  102,
+	})
+
+	ret := []CompactionTask{task1, task2, task3, task4}
+	for _, t := range ret {
+		s.handler.restoreTask(t)
+	}
+}
+
+func (s *CompactionPlanHandlerSuite) TestScheduleNodeWith1ParallelTask() {
+	// dataNode 101's paralleTasks has 1 task running, not L0 task
 	tests := []struct {
-		name    string
-		fields  fields
-		args    args
-		wantErr bool
-		err     error
+		description string
+		tasks       []CompactionTask
+		plans       []*datapb.CompactionPlan
+		expectedOut []UniqueID // planID
 	}{
 		{
-			"test exec compaction",
-			fields{
-				plans: map[int64]*compactionTask{},
-				sessions: &SessionManager{
-					sessions: struct {
-						sync.RWMutex
-						data map[int64]*Session
-					}{
-						data: map[int64]*Session{
-							1: {client: &mockDataNodeClient{ch: make(chan interface{}, 1)}},
-						},
-					},
-				},
-				chManager: &ChannelManager{
-					store: &ChannelStore{
-						channelsInfo: map[int64]*NodeChannelInfo{
-							1: {NodeID: 1, Channels: []*channel{{Name: "ch1"}}},
-						},
-					},
-				},
-				allocatorFactory: func() allocator { return newMockAllocator() },
+			"with L0 tasks diff channel",
+			[]CompactionTask{
+				newL0CompactionTask(&datapb.CompactionTask{
+					PlanID:  10,
+					Type:    datapb.CompactionType_Level0DeleteCompaction,
+					State:   datapb.CompactionTaskState_pipelining,
+					Channel: "ch-10",
+					NodeID:  101,
+				}, nil, s.mockMeta, s.mockSessMgr),
+				newL0CompactionTask(&datapb.CompactionTask{
+					PlanID:  11,
+					Type:    datapb.CompactionType_MixCompaction,
+					State:   datapb.CompactionTaskState_pipelining,
+					Channel: "ch-11",
+					NodeID:  101,
+				}, nil, s.mockMeta, s.mockSessMgr),
 			},
-			args{
-				signal: &compactionSignal{id: 100},
-				plan:   &datapb.CompactionPlan{PlanID: 1, Channel: "ch1", Type: datapb.CompactionType_MergeCompaction},
+			[]*datapb.CompactionPlan{
+				{PlanID: 10, Channel: "ch-10", Type: datapb.CompactionType_Level0DeleteCompaction},
+				{PlanID: 11, Channel: "ch-11", Type: datapb.CompactionType_MixCompaction},
 			},
-			false,
-			nil,
+			[]UniqueID{10, 11},
 		},
 		{
-			"test exec compaction failed",
-			fields{
-				plans: map[int64]*compactionTask{},
-				sessions: &SessionManager{
-					sessions: struct {
-						sync.RWMutex
-						data map[int64]*Session
-					}{
-						data: map[int64]*Session{
-							1: {client: &mockDataNodeClient{ch: make(chan interface{}, 1), compactionResp: &commonpb.Status{ErrorCode: commonpb.ErrorCode_CacheFailed}}},
-						},
-					},
-				},
-				chManager: &ChannelManager{
-					store: &ChannelStore{
-						channelsInfo: map[int64]*NodeChannelInfo{
-							1: {NodeID: 1, Channels: []*channel{{Name: "ch1"}}},
-						},
-					},
-				},
-				allocatorFactory: func() allocator { return newMockAllocator() },
+			"with L0 tasks same channel",
+			[]CompactionTask{
+				newMixCompactionTask(&datapb.CompactionTask{
+					PlanID:  11,
+					Type:    datapb.CompactionType_MixCompaction,
+					State:   datapb.CompactionTaskState_pipelining,
+					Channel: "ch-11",
+					NodeID:  101,
+				}, nil, s.mockMeta, s.mockSessMgr),
+				newL0CompactionTask(&datapb.CompactionTask{
+					PlanID:  10,
+					Type:    datapb.CompactionType_Level0DeleteCompaction,
+					State:   datapb.CompactionTaskState_pipelining,
+					Channel: "ch-11",
+					NodeID:  101,
+				}, nil, s.mockMeta, s.mockSessMgr),
 			},
-			args{
-				signal: &compactionSignal{id: 100},
-				plan:   &datapb.CompactionPlan{PlanID: 1, Channel: "ch1", Type: datapb.CompactionType_MergeCompaction},
+			[]*datapb.CompactionPlan{
+				{PlanID: 11, Channel: "ch-11", Type: datapb.CompactionType_MixCompaction},
+				{PlanID: 10, Channel: "ch-11", Type: datapb.CompactionType_Level0DeleteCompaction},
 			},
-			true,
-			nil,
+			[]UniqueID{10},
 		},
 		{
-			"test_allocate_ts_failed",
-			fields{
-				plans: map[int64]*compactionTask{},
-				sessions: &SessionManager{
-					sessions: struct {
-						sync.RWMutex
-						data map[int64]*Session
-					}{
-						data: map[int64]*Session{
-							1: {client: &mockDataNodeClient{ch: make(chan interface{}, 1), compactionResp: &commonpb.Status{ErrorCode: commonpb.ErrorCode_CacheFailed}}},
-						},
-					},
-				},
-				chManager: &ChannelManager{
-					store: &ChannelStore{
-						channelsInfo: map[int64]*NodeChannelInfo{
-							1: {NodeID: 1, Channels: []*channel{{Name: "ch1"}}},
-						},
-					},
-				},
-				allocatorFactory: func() allocator {
-					a := &NMockAllocator{}
-					start := time.Now()
-					a.EXPECT().allocTimestamp(mock.Anything).Call.Return(func(_ context.Context) Timestamp {
-						return tsoutil.ComposeTSByTime(time.Now(), 0)
-					}, func(_ context.Context) error {
-						if time.Since(start) > time.Second*2 {
-							return nil
-						}
-						return errors.New("mocked")
-					})
-					return a
-				},
+			"without L0 tasks",
+			[]CompactionTask{
+				newMixCompactionTask(&datapb.CompactionTask{
+					PlanID:  14,
+					Type:    datapb.CompactionType_MixCompaction,
+					State:   datapb.CompactionTaskState_pipelining,
+					Channel: "ch-2",
+					NodeID:  101,
+				}, nil, s.mockMeta, s.mockSessMgr),
+				newMixCompactionTask(&datapb.CompactionTask{
+					PlanID:  13,
+					Type:    datapb.CompactionType_MixCompaction,
+					State:   datapb.CompactionTaskState_pipelining,
+					Channel: "ch-11",
+					NodeID:  101,
+				}, nil, s.mockMeta, s.mockSessMgr),
 			},
-			args{
-				signal: &compactionSignal{id: 100},
-				plan:   &datapb.CompactionPlan{PlanID: 1, Channel: "ch1", Type: datapb.CompactionType_MergeCompaction},
+			[]*datapb.CompactionPlan{
+				{PlanID: 14, Channel: "ch-2", Type: datapb.CompactionType_MixCompaction},
+				{PlanID: 13, Channel: "ch-11", Type: datapb.CompactionType_MixCompaction},
 			},
-			true,
-			nil,
+			[]UniqueID{13, 14},
+		},
+		{
+			"empty tasks",
+			[]CompactionTask{},
+			[]*datapb.CompactionPlan{},
+			[]UniqueID{},
 		},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			c := &compactionPlanHandler{
-				plans:      tt.fields.plans,
-				sessions:   tt.fields.sessions,
-				chManager:  tt.fields.chManager,
-				parallelCh: make(map[int64]chan struct{}),
-				allocator:  tt.fields.allocatorFactory(),
-			}
-			Params.Save(Params.DataCoordCfg.CompactionCheckIntervalInSeconds.Key, "1")
-			c.start()
-			err := c.execCompactionPlan(tt.args.signal, tt.args.plan)
-			assert.Equal(t, tt.err, err)
-			if err == nil {
-				task := c.getCompaction(tt.args.plan.PlanID)
-				if !tt.wantErr {
-					assert.Equal(t, tt.args.plan, task.plan)
-					assert.Equal(t, tt.args.signal, task.triggerInfo)
-					assert.Equal(t, 1, c.executingTaskNum)
-				} else {
 
-					assert.Eventually(t,
-						func() bool {
-							c.mu.RLock()
-							defer c.mu.RUnlock()
-							return c.executingTaskNum == 0 && len(c.parallelCh[1]) == 0
-						},
-						5*time.Second, 100*time.Millisecond)
-				}
+	for _, test := range tests {
+		s.Run(test.description, func() {
+			s.SetupTest()
+			s.generateInitTasksForSchedule()
+			// submit the testing tasks
+			for _, t := range test.tasks {
+				// t.SetPlan(test.plans[i])
+				s.handler.submitTask(t)
 			}
-			c.stop()
+
+			assigner := newSlotBasedNodeAssigner(s.cluster)
+			gotTasks := s.handler.schedule(assigner)
+			s.Equal(test.expectedOut, lo.Map(gotTasks, func(t CompactionTask, _ int) int64 {
+				return t.GetTaskProto().GetPlanID()
+			}))
 		})
 	}
 }
 
-func Test_compactionPlanHandler_execWithParallels(t *testing.T) {
-
-	mockDataNode := &mocks.DataNode{}
-	paramtable.Get().Save(Params.DataCoordCfg.CompactionCheckIntervalInSeconds.Key, "1")
-	defer paramtable.Get().Reset(Params.DataCoordCfg.CompactionCheckIntervalInSeconds.Key)
-	c := &compactionPlanHandler{
-		plans: map[int64]*compactionTask{},
-		sessions: &SessionManager{
-			sessions: struct {
-				sync.RWMutex
-				data map[int64]*Session
-			}{
-				data: map[int64]*Session{
-					1: {client: mockDataNode},
-				},
+func (s *CompactionPlanHandlerSuite) TestScheduleWithSlotLimit() {
+	tests := []struct {
+		description string
+		tasks       []CompactionTask
+		plans       []*datapb.CompactionPlan
+		expectedOut []UniqueID // planID
+	}{
+		{
+			"2 L0 tasks, only 1 can be scheduled",
+			[]CompactionTask{
+				newL0CompactionTask(&datapb.CompactionTask{
+					PlanID:  10,
+					Type:    datapb.CompactionType_Level0DeleteCompaction,
+					State:   datapb.CompactionTaskState_pipelining,
+					Channel: "ch-10",
+				}, nil, s.mockMeta, s.mockSessMgr),
+				newL0CompactionTask(&datapb.CompactionTask{
+					PlanID:  11,
+					Type:    datapb.CompactionType_MixCompaction,
+					State:   datapb.CompactionTaskState_pipelining,
+					Channel: "ch-11",
+				}, nil, s.mockMeta, s.mockSessMgr),
 			},
-		},
-		chManager: &ChannelManager{
-			store: &ChannelStore{
-				channelsInfo: map[int64]*NodeChannelInfo{
-					1: {NodeID: 1, Channels: []*channel{{Name: "ch1"}}},
-				},
+			[]*datapb.CompactionPlan{
+				{PlanID: 10, Channel: "ch-10", Type: datapb.CompactionType_Level0DeleteCompaction},
+				{PlanID: 11, Channel: "ch-11", Type: datapb.CompactionType_MixCompaction},
 			},
+			[]UniqueID{10},
 		},
-		parallelCh: make(map[int64]chan struct{}),
-		allocator:  newMockAllocator(),
+		{
+			"2 Mix tasks, only 1 can be scheduled",
+			[]CompactionTask{
+				newMixCompactionTask(&datapb.CompactionTask{
+					PlanID:  14,
+					Type:    datapb.CompactionType_MixCompaction,
+					State:   datapb.CompactionTaskState_pipelining,
+					Channel: "ch-2",
+				}, nil, s.mockMeta, s.mockSessMgr),
+				newMixCompactionTask(&datapb.CompactionTask{
+					PlanID:  13,
+					Type:    datapb.CompactionType_MixCompaction,
+					State:   datapb.CompactionTaskState_pipelining,
+					Channel: "ch-11",
+				}, nil, s.mockMeta, s.mockSessMgr),
+			},
+			[]*datapb.CompactionPlan{
+				{PlanID: 14, Channel: "ch-2", Type: datapb.CompactionType_MixCompaction},
+				{PlanID: 13, Channel: "ch-11", Type: datapb.CompactionType_MixCompaction},
+			},
+			[]UniqueID{13},
+		},
 	}
 
-	signal := &compactionSignal{id: 100}
-	plan1 := &datapb.CompactionPlan{PlanID: 1, Channel: "ch1", Type: datapb.CompactionType_MergeCompaction}
-	plan2 := &datapb.CompactionPlan{PlanID: 2, Channel: "ch1", Type: datapb.CompactionType_MergeCompaction}
-	plan3 := &datapb.CompactionPlan{PlanID: 3, Channel: "ch1", Type: datapb.CompactionType_MergeCompaction}
+	for _, test := range tests {
+		s.Run(test.description, func() {
+			s.SetupTest()
+			s.cluster.EXPECT().QuerySlots().Return(map[int64]int64{
+				101: 8,
+			}).Maybe()
+			s.generateInitTasksForSchedule()
+			// submit the testing tasks
+			for _, t := range test.tasks {
+				// t.SetPlan(test.plans[i])
+				s.handler.submitTask(t)
+			}
+			assigner := newSlotBasedNodeAssigner(s.cluster)
+			gotTasks := s.handler.schedule(assigner)
+			s.Equal(test.expectedOut, lo.Map(gotTasks, func(t CompactionTask, _ int) int64 {
+				return t.GetTaskProto().GetPlanID()
+			}))
+		})
+	}
+}
 
-	c.parallelCh[1] = make(chan struct{}, 2)
-
-	var mut sync.RWMutex
-	called := 0
-
-	mockDataNode.EXPECT().Compaction(mock.Anything, mock.Anything).Run(func(ctx context.Context, req *datapb.CompactionPlan) {
-		mut.Lock()
-		defer mut.Unlock()
-		called++
-	}).Return(&commonpb.Status{ErrorCode: commonpb.ErrorCode_Success}, nil).Times(3)
-	go func() {
-		c.execCompactionPlan(signal, plan1)
-		c.execCompactionPlan(signal, plan2)
-		c.execCompactionPlan(signal, plan3)
-	}()
-
-	// wait for dispatch signal
-	<-c.parallelCh[1]
-	<-c.parallelCh[1]
-	<-c.parallelCh[1]
-
-	// wait for compaction called
-	assert.Eventually(t, func() bool {
-		mut.RLock()
-		defer mut.RUnlock()
-		return called == 3
-	}, time.Second, time.Millisecond*10)
-
-	tasks := c.getCompactionTasksBySignalID(0)
-	max, min := uint64(0), uint64(0)
-	for _, v := range tasks {
-		if max < v.plan.GetStartTime() {
-			max = v.plan.GetStartTime()
-		}
-		if min > v.plan.GetStartTime() {
-			min = v.plan.GetStartTime()
-		}
+func (s *CompactionPlanHandlerSuite) TestScheduleNodeWithL0Executing() {
+	// dataNode 102's paralleTasks has running L0 tasks
+	// nothing of the same channel will be able to schedule
+	tests := []struct {
+		description string
+		tasks       []CompactionTask
+		plans       []*datapb.CompactionPlan
+		expectedOut []UniqueID // planID
+	}{
+		{
+			"with L0 tasks diff channel",
+			[]CompactionTask{
+				newL0CompactionTask(&datapb.CompactionTask{
+					PlanID:  10,
+					Type:    datapb.CompactionType_Level0DeleteCompaction,
+					State:   datapb.CompactionTaskState_pipelining,
+					Channel: "ch-10",
+					NodeID:  102,
+				}, nil, s.mockMeta, s.mockSessMgr),
+				newMixCompactionTask(&datapb.CompactionTask{
+					PlanID:  11,
+					Type:    datapb.CompactionType_MixCompaction,
+					State:   datapb.CompactionTaskState_pipelining,
+					Channel: "ch-11",
+					NodeID:  102,
+				}, nil, s.mockMeta, s.mockSessMgr),
+			},
+			[]*datapb.CompactionPlan{{}, {}},
+			[]UniqueID{10, 11},
+		},
+		{
+			"with L0 tasks same channel",
+			[]CompactionTask{
+				newL0CompactionTask(&datapb.CompactionTask{
+					PlanID:  10,
+					Type:    datapb.CompactionType_Level0DeleteCompaction,
+					State:   datapb.CompactionTaskState_pipelining,
+					Channel: "ch-11",
+					NodeID:  102,
+				}, nil, s.mockMeta, s.mockSessMgr),
+				newMixCompactionTask(&datapb.CompactionTask{
+					PlanID:  11,
+					Type:    datapb.CompactionType_MixCompaction,
+					State:   datapb.CompactionTaskState_pipelining,
+					Channel: "ch-11",
+					NodeID:  102,
+				}, nil, s.mockMeta, s.mockSessMgr),
+				newMixCompactionTask(&datapb.CompactionTask{
+					PlanID:  13,
+					Type:    datapb.CompactionType_MixCompaction,
+					State:   datapb.CompactionTaskState_pipelining,
+					Channel: "ch-3",
+					NodeID:  102,
+				}, nil, s.mockMeta, s.mockSessMgr),
+			},
+			[]*datapb.CompactionPlan{
+				{PlanID: 10, Channel: "ch-3", Type: datapb.CompactionType_Level0DeleteCompaction},
+				{PlanID: 11, Channel: "ch-11", Type: datapb.CompactionType_MixCompaction},
+				{PlanID: 13, Channel: "ch-3", Type: datapb.CompactionType_MixCompaction},
+			},
+			[]UniqueID{10, 13},
+		},
+		{
+			"with multiple L0 tasks same channel",
+			[]CompactionTask{
+				newL0CompactionTask(&datapb.CompactionTask{
+					PlanID:  10,
+					Type:    datapb.CompactionType_Level0DeleteCompaction,
+					State:   datapb.CompactionTaskState_pipelining,
+					Channel: "ch-11",
+					NodeID:  102,
+				}, nil, s.mockMeta, s.mockSessMgr),
+				newL0CompactionTask(&datapb.CompactionTask{
+					PlanID:  11,
+					Type:    datapb.CompactionType_Level0DeleteCompaction,
+					State:   datapb.CompactionTaskState_pipelining,
+					Channel: "ch-11",
+					NodeID:  102,
+				}, nil, s.mockMeta, s.mockSessMgr),
+				newL0CompactionTask(&datapb.CompactionTask{
+					PlanID:  12,
+					Type:    datapb.CompactionType_Level0DeleteCompaction,
+					State:   datapb.CompactionTaskState_pipelining,
+					Channel: "ch-11",
+					NodeID:  102,
+				}, nil, s.mockMeta, s.mockSessMgr),
+			},
+			[]*datapb.CompactionPlan{
+				{PlanID: 10, Channel: "ch-3", Type: datapb.CompactionType_Level0DeleteCompaction},
+				{PlanID: 11, Channel: "ch-3", Type: datapb.CompactionType_Level0DeleteCompaction},
+				{PlanID: 12, Channel: "ch-3", Type: datapb.CompactionType_Level0DeleteCompaction},
+			},
+			[]UniqueID{10, 11, 12},
+		},
+		{
+			"without L0 tasks",
+			[]CompactionTask{
+				newMixCompactionTask(&datapb.CompactionTask{
+					PlanID:  14,
+					Type:    datapb.CompactionType_MixCompaction,
+					Channel: "ch-3",
+					NodeID:  102,
+				}, nil, s.mockMeta, s.mockSessMgr),
+				newMixCompactionTask(&datapb.CompactionTask{
+					PlanID:  13,
+					Type:    datapb.CompactionType_MixCompaction,
+					Channel: "ch-11",
+					NodeID:  102,
+				}, nil, s.mockMeta, s.mockSessMgr),
+			},
+			[]*datapb.CompactionPlan{
+				{PlanID: 14, Channel: "ch-3", Type: datapb.CompactionType_MixCompaction},
+				{},
+			},
+			[]UniqueID{13, 14},
+		},
+		{"empty tasks", []CompactionTask{}, []*datapb.CompactionPlan{}, []UniqueID{}},
 	}
 
-	log.Debug("start time", zap.Uint64("min", min), zap.Uint64("max", max))
-	assert.Less(t, uint64(2), max-min)
+	for _, test := range tests {
+		s.Run(test.description, func() {
+			s.SetupTest()
+
+			// submit the testing tasks
+			for _, t := range test.tasks {
+				s.handler.submitTask(t)
+			}
+			assigner := newSlotBasedNodeAssigner(s.cluster)
+			gotTasks := s.handler.schedule(assigner)
+			s.Equal(test.expectedOut, lo.Map(gotTasks, func(t CompactionTask, _ int) int64 {
+				return t.GetTaskProto().GetPlanID()
+			}))
+		})
+	}
 }
 
-func getInsertLogPath(rootPath string, segmentID typeutil.UniqueID) string {
-	return metautil.BuildInsertLogPath(rootPath, 10, 100, segmentID, 1000, 10000)
+func (s *CompactionPlanHandlerSuite) TestPickAnyNode() {
+	s.SetupTest()
+
+	assigner := newSlotBasedNodeAssigner(s.cluster)
+	assigner.slots = map[int64]int64{
+		100: 9,
+		101: 16,
+	}
+
+	task1 := newMixCompactionTask(&datapb.CompactionTask{
+		Type: datapb.CompactionType_MixCompaction,
+	}, nil, s.mockMeta, nil)
+	ok := assigner.assign(task1)
+	s.Equal(true, ok)
+	s.Equal(int64(101), task1.GetTaskProto().GetNodeID())
+
+	task2 := newMixCompactionTask(&datapb.CompactionTask{
+		Type: datapb.CompactionType_MixCompaction,
+	}, nil, s.mockMeta, nil)
+	ok = assigner.assign(task2)
+	s.Equal(true, ok)
+	s.Equal(int64(100), task2.GetTaskProto().GetNodeID())
+
+	task3 := newMixCompactionTask(&datapb.CompactionTask{
+		Type: datapb.CompactionType_MixCompaction,
+	}, nil, s.mockMeta, nil)
+
+	ok = assigner.assign(task3)
+	s.Equal(true, ok)
+	s.Equal(int64(101), task3.GetTaskProto().GetNodeID())
+
+	ok = assigner.assign(&mixCompactionTask{})
+	s.Equal(false, ok)
 }
 
-func getStatsLogPath(rootPath string, segmentID typeutil.UniqueID) string {
-	return metautil.BuildStatsLogPath(rootPath, 10, 100, segmentID, 1000, 10000)
+func (s *CompactionPlanHandlerSuite) TestPickAnyNodeForClusteringTask() {
+	s.SetupTest()
+	nodeSlots := map[int64]int64{
+		100: 2,
+		101: 16,
+		102: 10,
+	}
+	executingTasks := make(map[int64]CompactionTask, 0)
+
+	task1 := newClusteringCompactionTask(&datapb.CompactionTask{
+		Type: datapb.CompactionType_ClusteringCompaction,
+	}, nil, s.mockMeta, nil, nil, nil)
+
+	task2 := newClusteringCompactionTask(&datapb.CompactionTask{
+		Type: datapb.CompactionType_ClusteringCompaction,
+	}, nil, s.mockMeta, nil, nil, nil)
+
+	executingTasks[1] = task1
+	executingTasks[2] = task2
+	s.handler.executingTasks = executingTasks
+
+	assigner := newSlotBasedNodeAssigner(s.cluster)
+	assigner.slots = nodeSlots
+	ok := assigner.assign(task1)
+	s.Equal(true, ok)
+	s.Equal(int64(101), task1.GetTaskProto().GetNodeID())
+
+	ok = assigner.assign(task2)
+	s.Equal(false, ok)
 }
 
-func getDeltaLogPath(rootPath string, segmentID typeutil.UniqueID) string {
-	return metautil.BuildDeltaLogPath(rootPath, 10, 100, segmentID, 10000)
+func (s *CompactionPlanHandlerSuite) TestRemoveTasksByChannel() {
+	s.SetupTest()
+	ch := "ch1"
+
+	t1 := newMixCompactionTask(&datapb.CompactionTask{
+		PlanID:  19530,
+		Type:    datapb.CompactionType_MixCompaction,
+		Channel: ch,
+		NodeID:  1,
+	}, nil, s.mockMeta, s.mockSessMgr)
+
+	t2 := newMixCompactionTask(&datapb.CompactionTask{
+		PlanID:  19531,
+		Type:    datapb.CompactionType_MixCompaction,
+		Channel: ch,
+		NodeID:  1,
+	}, nil, s.mockMeta, s.mockSessMgr)
+
+	s.handler.submitTask(t1)
+	s.handler.restoreTask(t2)
+	s.handler.removeTasksByChannel(ch)
 }
 
-func TestCompactionPlanHandler_handleMergeCompactionResult(t *testing.T) {
-	mockDataNode := &mocks.DataNode{}
-	call := mockDataNode.EXPECT().SyncSegments(mock.Anything, mock.Anything).Run(func(ctx context.Context, req *datapb.SyncSegmentsRequest) {}).Return(&commonpb.Status{ErrorCode: commonpb.ErrorCode_Success}, nil)
+func (s *CompactionPlanHandlerSuite) TestGetCompactionTask() {
+	s.SetupTest()
+
+	t1 := newMixCompactionTask(&datapb.CompactionTask{
+		TriggerID: 1,
+		PlanID:    1,
+		Type:      datapb.CompactionType_MixCompaction,
+		Channel:   "ch-01",
+		State:     datapb.CompactionTaskState_executing,
+	}, nil, s.mockMeta, s.mockSessMgr)
+
+	t2 := newMixCompactionTask(&datapb.CompactionTask{
+		TriggerID: 1,
+		PlanID:    2,
+		Type:      datapb.CompactionType_MixCompaction,
+		Channel:   "ch-01",
+		State:     datapb.CompactionTaskState_completed,
+	}, nil, s.mockMeta, s.mockSessMgr)
+
+	t3 := newL0CompactionTask(&datapb.CompactionTask{
+		TriggerID: 1,
+		PlanID:    3,
+		Type:      datapb.CompactionType_Level0DeleteCompaction,
+		Channel:   "ch-02",
+		State:     datapb.CompactionTaskState_failed,
+	}, nil, s.mockMeta, s.mockSessMgr)
+
+	inTasks := map[int64]CompactionTask{
+		1: t1,
+		2: t2,
+		3: t3,
+	}
+	s.mockMeta.EXPECT().GetCompactionTasksByTriggerID(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, i int64) []*datapb.CompactionTask {
+		var ret []*datapb.CompactionTask
+		for _, t := range inTasks {
+			if t.GetTaskProto().GetTriggerID() != i {
+				continue
+			}
+			ret = append(ret, t.ShadowClone())
+		}
+		return ret
+	})
+
+	for _, t := range inTasks {
+		s.handler.submitTask(t)
+	}
+
+	assigner := newSlotBasedNodeAssigner(s.cluster)
+	s.handler.schedule(assigner)
+
+	info := s.handler.getCompactionInfo(context.TODO(), 1)
+	s.Equal(1, info.completedCnt)
+	s.Equal(1, info.executingCnt)
+	s.Equal(1, info.failedCnt)
+}
+
+func (s *CompactionPlanHandlerSuite) TestCompactionQueueFull() {
+	s.SetupTest()
+	paramtable.Get().Save("dataCoord.compaction.taskQueueCapacity", "1")
+	defer paramtable.Get().Reset("dataCoord.compaction.taskQueueCapacity")
+
+	s.handler = newCompactionPlanHandler(s.cluster, s.mockSessMgr, s.mockMeta, s.mockAlloc, nil, nil)
+
+	t1 := newMixCompactionTask(&datapb.CompactionTask{
+		TriggerID: 1,
+		PlanID:    1,
+		Type:      datapb.CompactionType_MixCompaction,
+		Channel:   "ch-01",
+		State:     datapb.CompactionTaskState_executing,
+	}, nil, s.mockMeta, s.mockSessMgr)
+
+	s.NoError(s.handler.submitTask(t1))
+
+	t2 := newMixCompactionTask(&datapb.CompactionTask{
+		TriggerID: 1,
+		PlanID:    2,
+		Type:      datapb.CompactionType_MixCompaction,
+		Channel:   "ch-01",
+		State:     datapb.CompactionTaskState_completed,
+	}, nil, s.mockMeta, s.mockSessMgr)
+
+	s.Error(s.handler.submitTask(t2))
+}
+
+func (s *CompactionPlanHandlerSuite) TestExecCompactionPlan() {
+	s.SetupTest()
+	s.mockMeta.EXPECT().CheckAndSetSegmentsCompacting(mock.Anything, mock.Anything).Return(true, true).Maybe()
+	handler := newCompactionPlanHandler(nil, s.mockSessMgr, s.mockMeta, s.mockAlloc, nil, nil)
+
+	task := &datapb.CompactionTask{
+		TriggerID: 1,
+		PlanID:    1,
+		Channel:   "ch-1",
+		Type:      datapb.CompactionType_MixCompaction,
+	}
+	err := handler.enqueueCompaction(task)
+	s.NoError(err)
+	t := handler.getCompactionTask(1)
+	s.NotNil(t)
+	task.PlanID = 2
+	err = s.handler.enqueueCompaction(task)
+	s.NoError(err)
+}
+
+func (s *CompactionPlanHandlerSuite) TestCheckCompaction() {
+	s.SetupTest()
+
+	s.mockSessMgr.EXPECT().GetCompactionPlanResult(UniqueID(111), int64(1)).Return(
+		&datapb.CompactionPlanResult{PlanID: 1, State: datapb.CompactionTaskState_executing}, nil).Once()
+
+	s.mockSessMgr.EXPECT().GetCompactionPlanResult(UniqueID(111), int64(2)).Return(
+		&datapb.CompactionPlanResult{
+			PlanID:   2,
+			State:    datapb.CompactionTaskState_completed,
+			Segments: []*datapb.CompactionSegment{{PlanID: 2}},
+		}, nil).Once()
+
+	s.mockSessMgr.EXPECT().GetCompactionPlanResult(UniqueID(111), int64(6)).Return(
+		&datapb.CompactionPlanResult{
+			PlanID:   6,
+			Channel:  "ch-2",
+			State:    datapb.CompactionTaskState_completed,
+			Segments: []*datapb.CompactionSegment{{PlanID: 6}},
+		}, nil).Once()
+
+	s.mockSessMgr.EXPECT().DropCompactionPlan(mock.Anything, mock.Anything).Return(nil)
+	s.mockMeta.EXPECT().SetSegmentsCompacting(mock.Anything, mock.Anything, mock.Anything).Return()
+
+	t1 := newMixCompactionTask(&datapb.CompactionTask{
+		PlanID:           1,
+		Type:             datapb.CompactionType_MixCompaction,
+		TimeoutInSeconds: 1,
+		Channel:          "ch-1",
+		State:            datapb.CompactionTaskState_executing,
+		NodeID:           111,
+	}, nil, s.mockMeta, s.mockSessMgr)
+
+	t2 := newMixCompactionTask(&datapb.CompactionTask{
+		PlanID:  2,
+		Type:    datapb.CompactionType_MixCompaction,
+		Channel: "ch-1",
+		State:   datapb.CompactionTaskState_executing,
+		NodeID:  111,
+	}, nil, s.mockMeta, s.mockSessMgr)
+
+	t3 := newMixCompactionTask(&datapb.CompactionTask{
+		PlanID:  3,
+		Type:    datapb.CompactionType_MixCompaction,
+		Channel: "ch-1",
+		State:   datapb.CompactionTaskState_timeout,
+		NodeID:  111,
+	}, nil, s.mockMeta, s.mockSessMgr)
+
+	t4 := newMixCompactionTask(&datapb.CompactionTask{
+		PlanID:  4,
+		Type:    datapb.CompactionType_MixCompaction,
+		Channel: "ch-1",
+		State:   datapb.CompactionTaskState_timeout,
+		NodeID:  111,
+	}, nil, s.mockMeta, s.mockSessMgr)
+
+	t6 := newMixCompactionTask(&datapb.CompactionTask{
+		PlanID:  6,
+		Type:    datapb.CompactionType_MixCompaction,
+		Channel: "ch-2",
+		State:   datapb.CompactionTaskState_executing,
+		NodeID:  111,
+	}, nil, s.mockMeta, s.mockSessMgr)
+
+	inTasks := map[int64]CompactionTask{
+		1: t1,
+		2: t2,
+		3: t3,
+		4: t4,
+		6: t6,
+	}
+
+	// s.mockSessMgr.EXPECT().SyncSegments(int64(111), mock.Anything).Return(nil)
+	// s.mockMeta.EXPECT().UpdateSegmentsInfo(mock.Anything).Return(nil)
+	s.mockMeta.EXPECT().CompleteCompactionMutation(mock.Anything, mock.Anything, mock.Anything).RunAndReturn(
+		func(ctx context.Context, t *datapb.CompactionTask, result *datapb.CompactionPlanResult) ([]*SegmentInfo, *segMetricMutation, error) {
+			if t.GetPlanID() == 2 {
+				segment := NewSegmentInfo(&datapb.SegmentInfo{ID: 100})
+				return []*SegmentInfo{segment}, &segMetricMutation{}, nil
+			} else if t.GetPlanID() == 6 {
+				return nil, nil, errors.Errorf("intended error")
+			}
+			return nil, nil, errors.Errorf("unexpected error")
+		}).Twice()
+
+	for _, t := range inTasks {
+		s.handler.submitTask(t)
+	}
+
+	assigner := newSlotBasedNodeAssigner(s.cluster)
+	s.handler.schedule(assigner)
+	// time.Sleep(2 * time.Second)
+	s.handler.checkCompaction(assigner)
+
+	t := s.handler.getCompactionTask(1)
+	s.NotNil(t)
+
+	t = s.handler.getCompactionTask(2)
+	// completed
+	s.Nil(t)
+
+	t = s.handler.getCompactionTask(3)
+	s.Nil(t)
+
+	t = s.handler.getCompactionTask(4)
+	s.Nil(t)
+
+	t = s.handler.getCompactionTask(5)
+	// not exist
+	s.Nil(t)
+
+	t = s.handler.getCompactionTask(6)
+	s.Equal(datapb.CompactionTaskState_executing, t.GetTaskProto().GetState())
+}
+
+func (s *CompactionPlanHandlerSuite) TestCompactionGC() {
+	s.SetupTest()
+	inTasks := []*datapb.CompactionTask{
+		{
+			PlanID:    1,
+			Type:      datapb.CompactionType_MixCompaction,
+			State:     datapb.CompactionTaskState_completed,
+			StartTime: time.Now().Add(-time.Second * 100000).Unix(),
+		},
+		{
+			PlanID:    2,
+			Type:      datapb.CompactionType_MixCompaction,
+			State:     datapb.CompactionTaskState_cleaned,
+			StartTime: time.Now().Add(-time.Second * 100000).Unix(),
+		},
+		{
+			PlanID:    3,
+			Type:      datapb.CompactionType_MixCompaction,
+			State:     datapb.CompactionTaskState_cleaned,
+			StartTime: time.Now().Unix(),
+		},
+	}
+
+	catalog := &datacoord.Catalog{MetaKv: NewMetaMemoryKV()}
+	compactionTaskMeta, err := newCompactionTaskMeta(context.TODO(), catalog)
+	s.NoError(err)
+	s.handler.meta = &meta{compactionTaskMeta: compactionTaskMeta}
+	for _, t := range inTasks {
+		s.handler.meta.SaveCompactionTask(context.TODO(), t)
+	}
+
+	s.handler.cleanCompactionTaskMeta()
+	// two task should be cleaned, one remains
+	tasks := s.handler.meta.GetCompactionTaskMeta().GetCompactionTasks()
+	s.Equal(1, len(tasks))
+}
+
+func (s *CompactionPlanHandlerSuite) TestProcessCompleteCompaction() {
+	s.SetupTest()
+
+	// s.mockSessMgr.EXPECT().SyncSegments(mock.Anything, mock.Anything).Return(nil).Once()
+	s.mockMeta.EXPECT().SetSegmentsCompacting(mock.Anything, mock.Anything, mock.Anything).Return().Once()
+	segment := NewSegmentInfo(&datapb.SegmentInfo{ID: 100})
+	s.mockMeta.EXPECT().CompleteCompactionMutation(mock.Anything, mock.Anything, mock.Anything).Return(
+		[]*SegmentInfo{segment},
+		&segMetricMutation{}, nil).Once()
 
 	dataNodeID := UniqueID(111)
 
 	seg1 := &datapb.SegmentInfo{
 		ID:        1,
-		Binlogs:   []*datapb.FieldBinlog{getFieldBinlogPaths(101, getInsertLogPath("log1", 1))},
-		Statslogs: []*datapb.FieldBinlog{getFieldBinlogPaths(101, getStatsLogPath("log2", 1))},
-		Deltalogs: []*datapb.FieldBinlog{getFieldBinlogPaths(101, getDeltaLogPath("log3", 1))},
+		Binlogs:   []*datapb.FieldBinlog{getFieldBinlogIDs(101, 1)},
+		Statslogs: []*datapb.FieldBinlog{getFieldBinlogIDs(101, 2)},
+		Deltalogs: []*datapb.FieldBinlog{getFieldBinlogIDs(101, 3)},
 	}
 
 	seg2 := &datapb.SegmentInfo{
 		ID:        2,
-		Binlogs:   []*datapb.FieldBinlog{getFieldBinlogPaths(101, getInsertLogPath("log4", 2))},
-		Statslogs: []*datapb.FieldBinlog{getFieldBinlogPaths(101, getStatsLogPath("log5", 2))},
-		Deltalogs: []*datapb.FieldBinlog{getFieldBinlogPaths(101, getDeltaLogPath("log6", 2))},
+		Binlogs:   []*datapb.FieldBinlog{getFieldBinlogIDs(101, 4)},
+		Statslogs: []*datapb.FieldBinlog{getFieldBinlogIDs(101, 5)},
+		Deltalogs: []*datapb.FieldBinlog{getFieldBinlogIDs(101, 6)},
 	}
 
 	plan := &datapb.CompactionPlan{
@@ -319,609 +833,292 @@ func TestCompactionPlanHandler_handleMergeCompactionResult(t *testing.T) {
 				Deltalogs:           seg2.GetDeltalogs(),
 			},
 		},
-		Type: datapb.CompactionType_MergeCompaction,
+		Type: datapb.CompactionType_MixCompaction,
 	}
 
-	sessions := &SessionManager{
-		sessions: struct {
-			sync.RWMutex
-			data map[int64]*Session
-		}{
-			data: map[int64]*Session{
-				dataNodeID: {client: mockDataNode}},
-		},
-	}
+	task := newMixCompactionTask(&datapb.CompactionTask{
+		PlanID:        plan.GetPlanID(),
+		TriggerID:     1,
+		Type:          plan.GetType(),
+		State:         datapb.CompactionTaskState_executing,
+		NodeID:        dataNodeID,
+		InputSegments: []UniqueID{1, 2},
+	}, nil, s.mockMeta, s.mockSessMgr)
 
-	task := &compactionTask{
-		triggerInfo: &compactionSignal{id: 1},
-		state:       executing,
-		plan:        plan,
-		dataNodeID:  dataNodeID,
-	}
-
-	plans := map[int64]*compactionTask{1: task}
-
-	errMeta := &meta{
-		catalog: &datacoord.Catalog{MetaKv: &saveFailKV{MetaKv: NewMetaMemoryKV()}},
-		segments: &SegmentsInfo{
-			map[int64]*SegmentInfo{
-				seg1.ID: {SegmentInfo: seg1},
-				seg2.ID: {SegmentInfo: seg2},
+	compactionResult := datapb.CompactionPlanResult{
+		PlanID: 1,
+		State:  datapb.CompactionTaskState_completed,
+		Segments: []*datapb.CompactionSegment{
+			{
+				SegmentID:           3,
+				NumOfRows:           15,
+				InsertLogs:          []*datapb.FieldBinlog{getFieldBinlogIDs(101, 301)},
+				Field2StatslogPaths: []*datapb.FieldBinlog{getFieldBinlogIDs(101, 302)},
+				Deltalogs:           []*datapb.FieldBinlog{getFieldBinlogIDs(101, 303)},
 			},
 		},
 	}
 
-	meta := &meta{
-		catalog: &datacoord.Catalog{MetaKv: NewMetaMemoryKV()},
-		segments: &SegmentsInfo{
-			map[int64]*SegmentInfo{
-				seg1.ID: {SegmentInfo: seg1},
-				seg2.ID: {SegmentInfo: seg2},
-			},
-		},
-	}
+	s.mockSessMgr.EXPECT().GetCompactionPlanResult(UniqueID(111), int64(1)).Return(&compactionResult, nil).Once()
+	s.mockSessMgr.EXPECT().DropCompactionPlan(mock.Anything, mock.Anything).Return(nil)
 
-	c := &compactionPlanHandler{
-		plans:    plans,
-		sessions: sessions,
-		meta:     meta,
-	}
+	s.handler.submitTask(task)
 
-	c2 := &compactionPlanHandler{
-		plans:    plans,
-		sessions: sessions,
-		meta:     errMeta,
-	}
-
-	compactionResult := &datapb.CompactionResult{
-		PlanID:              1,
-		SegmentID:           3,
-		NumOfRows:           15,
-		InsertLogs:          []*datapb.FieldBinlog{getFieldBinlogPaths(101, getInsertLogPath("log301", 3))},
-		Field2StatslogPaths: []*datapb.FieldBinlog{getFieldBinlogPaths(101, getStatsLogPath("log302", 3))},
-		Deltalogs:           []*datapb.FieldBinlog{getFieldBinlogPaths(101, getDeltaLogPath("log303", 3))},
-	}
-
-	compactionResult2 := &datapb.CompactionResult{
-		PlanID:              1,
-		SegmentID:           3,
-		NumOfRows:           0,
-		InsertLogs:          []*datapb.FieldBinlog{getFieldBinlogPaths(101, getInsertLogPath("log301", 3))},
-		Field2StatslogPaths: []*datapb.FieldBinlog{getFieldBinlogPaths(101, getStatsLogPath("log302", 3))},
-		Deltalogs:           []*datapb.FieldBinlog{getFieldBinlogPaths(101, getDeltaLogPath("log303", 3))},
-	}
-
-	has, err := c.meta.HasSegments([]UniqueID{1, 2})
-	require.NoError(t, err)
-	require.True(t, has)
-
-	has, err = c.meta.HasSegments([]UniqueID{3})
-	require.Error(t, err)
-	require.False(t, has)
-
-	err = c.handleMergeCompactionResult(plan, compactionResult)
-	assert.NoError(t, err)
-
-	err = c.handleMergeCompactionResult(plan, compactionResult2)
-	assert.NoError(t, err)
-
-	err = c2.handleMergeCompactionResult(plan, compactionResult2)
-	assert.Error(t, err)
-
-	has, err = c.meta.HasSegments([]UniqueID{1, 2, 3})
-	require.NoError(t, err)
-	require.True(t, has)
-
-	call.Unset()
-	call = mockDataNode.EXPECT().SyncSegments(mock.Anything, mock.Anything).Run(func(ctx context.Context, req *datapb.SyncSegmentsRequest) {}).Return(&commonpb.Status{ErrorCode: commonpb.ErrorCode_UnexpectedError}, nil)
-	err = c.handleMergeCompactionResult(plan, compactionResult2)
-	assert.Error(t, err)
+	assigner := newSlotBasedNodeAssigner(s.cluster)
+	s.handler.schedule(assigner)
+	err := s.handler.checkCompaction(assigner)
+	s.NoError(err)
 }
 
-func TestCompactionPlanHandler_completeCompaction(t *testing.T) {
-	t.Run("test not exists compaction task", func(t *testing.T) {
-		c := &compactionPlanHandler{
-			plans: map[int64]*compactionTask{1: {}},
-		}
-		err := c.completeCompaction(&datapb.CompactionResult{PlanID: 2})
-		assert.Error(t, err)
-	})
-	t.Run("test completed compaction task", func(t *testing.T) {
-		c := &compactionPlanHandler{
-			plans: map[int64]*compactionTask{1: {state: completed}},
-		}
-		err := c.completeCompaction(&datapb.CompactionResult{PlanID: 1})
-		assert.Error(t, err)
-	})
+func (s *CompactionPlanHandlerSuite) TestCleanCompaction() {
+	s.SetupTest()
 
-	t.Run("test complete merge compaction task", func(t *testing.T) {
-		mockDataNode := &mocks.DataNode{}
-		mockDataNode.EXPECT().SyncSegments(mock.Anything, mock.Anything).Run(func(ctx context.Context, req *datapb.SyncSegmentsRequest) {}).Return(&commonpb.Status{ErrorCode: commonpb.ErrorCode_Success}, nil)
+	tests := []struct {
+		task CompactionTask
+	}{
+		{
+			newMixCompactionTask(
+				&datapb.CompactionTask{
+					PlanID:        1,
+					TriggerID:     1,
+					Type:          datapb.CompactionType_MixCompaction,
+					State:         datapb.CompactionTaskState_failed,
+					NodeID:        1,
+					InputSegments: []UniqueID{1, 2},
+				},
+				nil, s.mockMeta, s.mockSessMgr),
+		},
+		{
+			newL0CompactionTask(&datapb.CompactionTask{
+				PlanID:        1,
+				TriggerID:     1,
+				Type:          datapb.CompactionType_Level0DeleteCompaction,
+				State:         datapb.CompactionTaskState_failed,
+				NodeID:        1,
+				InputSegments: []UniqueID{1, 2},
+			},
+				nil, s.mockMeta, s.mockSessMgr),
+		},
+	}
+	for _, test := range tests {
+		task := test.task
+		s.mockMeta.EXPECT().SetSegmentsCompacting(mock.Anything, mock.Anything, mock.Anything).Return().Once()
+		s.mockSessMgr.EXPECT().DropCompactionPlan(mock.Anything, mock.Anything).Return(nil)
+		s.mockMeta.EXPECT().SaveCompactionTask(mock.Anything, mock.Anything).Return(nil)
+		s.mockSessMgr.EXPECT().DropCompactionPlan(mock.Anything, mock.Anything).Return(nil)
 
-		dataNodeID := UniqueID(111)
+		s.handler.executingTasks[1] = task
+		s.Equal(1, len(s.handler.executingTasks))
 
-		seg1 := &datapb.SegmentInfo{
-			ID:        1,
-			Binlogs:   []*datapb.FieldBinlog{getFieldBinlogPaths(101, getInsertLogPath("log1", 1))},
-			Statslogs: []*datapb.FieldBinlog{getFieldBinlogPaths(101, getStatsLogPath("log2", 1))},
-			Deltalogs: []*datapb.FieldBinlog{getFieldBinlogPaths(101, getDeltaLogPath("log3", 1))},
-		}
+		assigner := newSlotBasedNodeAssigner(s.cluster)
+		err := s.handler.checkCompaction(assigner)
+		s.NoError(err)
+		s.Equal(0, len(s.handler.executingTasks))
+		s.Equal(1, len(s.handler.cleaningTasks))
+		s.handler.cleanFailedTasks()
+		s.Equal(0, len(s.handler.cleaningTasks))
+	}
+}
 
-		seg2 := &datapb.SegmentInfo{
-			ID:        2,
-			Binlogs:   []*datapb.FieldBinlog{getFieldBinlogPaths(101, getInsertLogPath("log4", 2))},
-			Statslogs: []*datapb.FieldBinlog{getFieldBinlogPaths(101, getStatsLogPath("log5", 2))},
-			Deltalogs: []*datapb.FieldBinlog{getFieldBinlogPaths(101, getDeltaLogPath("log6", 2))},
-		}
+func (s *CompactionPlanHandlerSuite) TestCleanClusteringCompaction() {
+	s.SetupTest()
 
-		plan := &datapb.CompactionPlan{
+	task := newClusteringCompactionTask(
+		&datapb.CompactionTask{
+			PlanID:        1,
+			TriggerID:     1,
+			CollectionID:  1001,
+			Type:          datapb.CompactionType_ClusteringCompaction,
+			State:         datapb.CompactionTaskState_failed,
+			NodeID:        1,
+			InputSegments: []UniqueID{1, 2},
+		},
+		nil, s.mockMeta, s.mockSessMgr, s.mockHandler, nil)
+	s.mockMeta.EXPECT().GetHealthySegment(mock.Anything, mock.Anything).Return(nil)
+	s.mockMeta.EXPECT().SetSegmentsCompacting(mock.Anything, mock.Anything, mock.Anything).Return().Once()
+	s.mockMeta.EXPECT().UpdateSegmentsInfo(mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	s.mockMeta.EXPECT().CleanPartitionStatsInfo(mock.Anything, mock.Anything).Return(nil)
+	s.mockMeta.EXPECT().SaveCompactionTask(mock.Anything, mock.Anything).Return(nil)
+	s.mockSessMgr.EXPECT().DropCompactionPlan(mock.Anything, mock.Anything).Return(nil)
+
+	s.handler.executingTasks[1] = task
+	assigner := newSlotBasedNodeAssigner(s.cluster)
+	s.Equal(1, len(s.handler.executingTasks))
+	s.handler.checkCompaction(assigner)
+	s.Equal(0, len(s.handler.executingTasks))
+	s.Equal(1, len(s.handler.cleaningTasks))
+	s.handler.cleanFailedTasks()
+	s.Equal(0, len(s.handler.cleaningTasks))
+}
+
+func (s *CompactionPlanHandlerSuite) TestCleanClusteringCompactionCommitFail() {
+	s.SetupTest()
+
+	task := newClusteringCompactionTask(&datapb.CompactionTask{
+		PlanID:        1,
+		TriggerID:     1,
+		CollectionID:  1001,
+		Channel:       "ch-1",
+		Type:          datapb.CompactionType_ClusteringCompaction,
+		State:         datapb.CompactionTaskState_executing,
+		NodeID:        1,
+		InputSegments: []UniqueID{1, 2},
+		ClusteringKeyField: &schemapb.FieldSchema{
+			FieldID:         100,
+			Name:            Int64Field,
+			IsPrimaryKey:    true,
+			DataType:        schemapb.DataType_Int64,
+			AutoID:          true,
+			IsClusteringKey: true,
+		},
+	},
+		nil, s.mockMeta, s.mockSessMgr, s.mockHandler, nil)
+
+	s.mockMeta.EXPECT().GetHealthySegment(mock.Anything, mock.Anything).Return(nil)
+	s.mockMeta.EXPECT().SaveCompactionTask(mock.Anything, mock.Anything).Return(nil)
+	s.mockSessMgr.EXPECT().GetCompactionPlanResult(UniqueID(1), int64(1)).Return(
+		&datapb.CompactionPlanResult{
 			PlanID: 1,
-			SegmentBinlogs: []*datapb.CompactionSegmentBinlogs{
+			State:  datapb.CompactionTaskState_completed,
+			Segments: []*datapb.CompactionSegment{
 				{
-					SegmentID:           seg1.ID,
-					FieldBinlogs:        seg1.GetBinlogs(),
-					Field2StatslogPaths: seg1.GetStatslogs(),
-					Deltalogs:           seg1.GetDeltalogs(),
-				},
-				{
-					SegmentID:           seg2.ID,
-					FieldBinlogs:        seg2.GetBinlogs(),
-					Field2StatslogPaths: seg2.GetStatslogs(),
-					Deltalogs:           seg2.GetDeltalogs(),
+					PlanID:    1,
+					SegmentID: 101,
 				},
 			},
-			Type: datapb.CompactionType_MergeCompaction,
-		}
+		}, nil).Once()
+	s.mockMeta.EXPECT().CompleteCompactionMutation(mock.Anything, mock.Anything, mock.Anything).Return(nil, nil, errors.New("mock error"))
+	s.mockSessMgr.EXPECT().DropCompactionPlan(mock.Anything, mock.Anything).Return(nil)
+	s.handler.executingTasks[1] = task
+	s.Equal(1, len(s.handler.executingTasks))
 
-		sessions := &SessionManager{
-			sessions: struct {
-				sync.RWMutex
-				data map[int64]*Session
-			}{
-				data: map[int64]*Session{
-					dataNodeID: {client: mockDataNode}},
-			},
-		}
+	assigner := newSlotBasedNodeAssigner(s.cluster)
+	s.handler.checkCompaction(assigner)
+	s.Equal(0, len(task.GetTaskProto().GetResultSegments()))
 
-		task := &compactionTask{
-			triggerInfo: &compactionSignal{id: 1},
-			state:       executing,
-			plan:        plan,
-			dataNodeID:  dataNodeID,
-		}
+	s.Equal(datapb.CompactionTaskState_failed, task.GetTaskProto().GetState())
+	s.Equal(0, len(s.handler.executingTasks))
+	s.Equal(1, len(s.handler.cleaningTasks))
 
-		plans := map[int64]*compactionTask{1: task}
-
-		meta := &meta{
-			catalog: &datacoord.Catalog{MetaKv: NewMetaMemoryKV()},
-			segments: &SegmentsInfo{
-				map[int64]*SegmentInfo{
-					seg1.ID: {SegmentInfo: seg1},
-					seg2.ID: {SegmentInfo: seg2},
-				},
-			},
-		}
-		compactionResult := datapb.CompactionResult{
-			PlanID:              1,
-			SegmentID:           3,
-			NumOfRows:           15,
-			InsertLogs:          []*datapb.FieldBinlog{getFieldBinlogPaths(101, getInsertLogPath("log301", 3))},
-			Field2StatslogPaths: []*datapb.FieldBinlog{getFieldBinlogPaths(101, getStatsLogPath("log302", 3))},
-			Deltalogs:           []*datapb.FieldBinlog{getFieldBinlogPaths(101, getDeltaLogPath("log303", 3))},
-		}
-
-		flushCh := make(chan UniqueID, 1)
-		c := &compactionPlanHandler{
-			plans:    plans,
-			sessions: sessions,
-			meta:     meta,
-			flushCh:  flushCh,
-		}
-
-		err := c.completeCompaction(&compactionResult)
-
-		segID, ok := <-flushCh
-		assert.True(t, ok)
-		assert.Equal(t, compactionResult.GetSegmentID(), segID)
-		assert.NoError(t, err)
-	})
-
-	t.Run("test empty result merge compaction task", func(t *testing.T) {
-		mockDataNode := &mocks.DataNode{}
-		mockDataNode.EXPECT().SyncSegments(mock.Anything, mock.Anything).Run(func(ctx context.Context, req *datapb.SyncSegmentsRequest) {}).Return(&commonpb.Status{ErrorCode: commonpb.ErrorCode_Success}, nil)
-
-		dataNodeID := UniqueID(111)
-
-		seg1 := &datapb.SegmentInfo{
-			ID:        1,
-			Binlogs:   []*datapb.FieldBinlog{getFieldBinlogPaths(101, getInsertLogPath("log1", 1))},
-			Statslogs: []*datapb.FieldBinlog{getFieldBinlogPaths(101, getStatsLogPath("log2", 1))},
-			Deltalogs: []*datapb.FieldBinlog{getFieldBinlogPaths(101, getDeltaLogPath("log3", 1))},
-		}
-
-		seg2 := &datapb.SegmentInfo{
-			ID:        2,
-			Binlogs:   []*datapb.FieldBinlog{getFieldBinlogPaths(101, getInsertLogPath("log4", 2))},
-			Statslogs: []*datapb.FieldBinlog{getFieldBinlogPaths(101, getStatsLogPath("log5", 2))},
-			Deltalogs: []*datapb.FieldBinlog{getFieldBinlogPaths(101, getDeltaLogPath("log6", 2))},
-		}
-
-		plan := &datapb.CompactionPlan{
-			PlanID: 1,
-			SegmentBinlogs: []*datapb.CompactionSegmentBinlogs{
-				{
-					SegmentID:           seg1.ID,
-					FieldBinlogs:        seg1.GetBinlogs(),
-					Field2StatslogPaths: seg1.GetStatslogs(),
-					Deltalogs:           seg1.GetDeltalogs(),
-				},
-				{
-					SegmentID:           seg2.ID,
-					FieldBinlogs:        seg2.GetBinlogs(),
-					Field2StatslogPaths: seg2.GetStatslogs(),
-					Deltalogs:           seg2.GetDeltalogs(),
-				},
-			},
-			Type: datapb.CompactionType_MergeCompaction,
-		}
-
-		sessions := &SessionManager{
-			sessions: struct {
-				sync.RWMutex
-				data map[int64]*Session
-			}{
-				data: map[int64]*Session{
-					dataNodeID: {client: mockDataNode}},
-			},
-		}
-
-		task := &compactionTask{
-			triggerInfo: &compactionSignal{id: 1},
-			state:       executing,
-			plan:        plan,
-			dataNodeID:  dataNodeID,
-		}
-
-		plans := map[int64]*compactionTask{1: task}
-
-		meta := &meta{
-			catalog: &datacoord.Catalog{MetaKv: NewMetaMemoryKV()},
-			segments: &SegmentsInfo{
-				map[int64]*SegmentInfo{
-					seg1.ID: {SegmentInfo: seg1},
-					seg2.ID: {SegmentInfo: seg2},
-				},
-			},
-		}
-
-		meta.AddSegment(NewSegmentInfo(seg1))
-		meta.AddSegment(NewSegmentInfo(seg2))
-
-		segments := meta.GetAllSegmentsUnsafe()
-		assert.Equal(t, len(segments), 2)
-		compactionResult := datapb.CompactionResult{
-			PlanID:              1,
-			SegmentID:           3,
-			NumOfRows:           0,
-			InsertLogs:          []*datapb.FieldBinlog{getFieldBinlogPaths(101, getInsertLogPath("log301", 3))},
-			Field2StatslogPaths: []*datapb.FieldBinlog{getFieldBinlogPaths(101, getStatsLogPath("log302", 3))},
-			Deltalogs:           []*datapb.FieldBinlog{getFieldBinlogPaths(101, getDeltaLogPath("log303", 3))},
-		}
-
-		flushCh := make(chan UniqueID, 1)
-		c := &compactionPlanHandler{
-			plans:    plans,
-			sessions: sessions,
-			meta:     meta,
-			flushCh:  flushCh,
-		}
-
-		err := c.completeCompaction(&compactionResult)
-
-		segID, ok := <-flushCh
-		assert.True(t, ok)
-		assert.Equal(t, compactionResult.GetSegmentID(), segID)
-		assert.NoError(t, err)
-
-		segments = meta.GetAllSegmentsUnsafe()
-		assert.Equal(t, len(segments), 3)
-
-		for _, segment := range segments {
-			assert.True(t, segment.State == commonpb.SegmentState_Dropped)
-		}
-	})
+	s.mockMeta.EXPECT().SetSegmentsCompacting(mock.Anything, mock.Anything, mock.Anything).Return().Once()
+	s.mockMeta.EXPECT().UpdateSegmentsInfo(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	s.mockMeta.EXPECT().CleanPartitionStatsInfo(mock.Anything, mock.Anything).Return(nil)
+	s.handler.cleanFailedTasks()
+	s.Equal(0, len(s.handler.cleaningTasks))
 }
 
-func Test_compactionPlanHandler_getCompaction(t *testing.T) {
-	type fields struct {
-		plans    map[int64]*compactionTask
-		sessions *SessionManager
-	}
-	type args struct {
-		planID int64
-	}
+// test compactionHandler should keep clean the failed task until it become cleaned
+func (s *CompactionPlanHandlerSuite) TestKeepClean() {
+	s.SetupTest()
+
 	tests := []struct {
-		name   string
-		fields fields
-		args   args
-		want   *compactionTask
+		task CompactionTask
 	}{
 		{
-			"test get non existed task",
-			fields{plans: map[int64]*compactionTask{}},
-			args{planID: 1},
-			nil,
-		},
-		{
-			"test get existed task",
-			fields{
-				plans: map[int64]*compactionTask{1: {
-					state: executing,
-				}},
+			newClusteringCompactionTask(&datapb.CompactionTask{
+				PlanID:        1,
+				TriggerID:     1,
+				Type:          datapb.CompactionType_ClusteringCompaction,
+				State:         datapb.CompactionTaskState_failed,
+				NodeID:        1,
+				InputSegments: []UniqueID{1, 2},
 			},
-			args{planID: 1},
-			&compactionTask{
-				state: executing,
-			},
+				nil, s.mockMeta, s.mockSessMgr, s.mockHandler, nil),
 		},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			c := &compactionPlanHandler{
-				plans:    tt.fields.plans,
-				sessions: tt.fields.sessions,
-			}
-			got := c.getCompaction(tt.args.planID)
-			assert.EqualValues(t, tt.want, got)
-		})
+	for _, test := range tests {
+		task := test.task
+		s.mockMeta.EXPECT().GetHealthySegment(mock.Anything, mock.Anything).Return(nil)
+		s.mockMeta.EXPECT().SetSegmentsCompacting(mock.Anything, mock.Anything, mock.Anything).Return()
+		s.mockMeta.EXPECT().UpdateSegmentsInfo(mock.Anything, mock.Anything, mock.Anything).Return(nil)
+		s.mockMeta.EXPECT().CleanPartitionStatsInfo(mock.Anything, mock.Anything).Return(errors.New("mock error")).Once()
+		s.mockMeta.EXPECT().SaveCompactionTask(mock.Anything, mock.Anything).Return(nil)
+		s.mockSessMgr.EXPECT().DropCompactionPlan(mock.Anything, mock.Anything).Return(nil)
+
+		s.handler.executingTasks[1] = task
+
+		assigner := newSlotBasedNodeAssigner(s.cluster)
+		s.Equal(1, len(s.handler.executingTasks))
+		s.handler.checkCompaction(assigner)
+		s.Equal(0, len(s.handler.executingTasks))
+		s.Equal(1, len(s.handler.cleaningTasks))
+		s.handler.cleanFailedTasks()
+		s.Equal(1, len(s.handler.cleaningTasks))
+		s.mockMeta.EXPECT().CleanPartitionStatsInfo(mock.Anything, mock.Anything).Return(nil).Once()
+		s.handler.cleanFailedTasks()
+		s.Equal(0, len(s.handler.cleaningTasks))
 	}
 }
 
-func Test_compactionPlanHandler_updateCompaction(t *testing.T) {
-	type fields struct {
-		plans    map[int64]*compactionTask
-		sessions *SessionManager
-		meta     *meta
-	}
-	type args struct {
-		ts Timestamp
-	}
-
-	ts := time.Now()
-	tests := []struct {
-		name      string
-		fields    fields
-		args      args
-		wantErr   bool
-		timeout   []int64
-		failed    []int64
-		unexpired []int64
-	}{
-		{
-			"test update compaction task",
-			fields{
-				plans: map[int64]*compactionTask{
-					1: {
-						state:      executing,
-						dataNodeID: 1,
-						plan: &datapb.CompactionPlan{
-							PlanID:           1,
-							StartTime:        tsoutil.ComposeTS(ts.UnixNano()/int64(time.Millisecond), 0),
-							TimeoutInSeconds: 10,
-							SegmentBinlogs: []*datapb.CompactionSegmentBinlogs{
-								{SegmentID: 1},
-							},
-						},
-					},
-					2: {
-						state:      executing,
-						dataNodeID: 2,
-						plan: &datapb.CompactionPlan{
-							PlanID:           2,
-							StartTime:        tsoutil.ComposeTS(ts.UnixNano()/int64(time.Millisecond), 0),
-							TimeoutInSeconds: 1,
-						},
-					},
-					3: {
-						state:      executing,
-						dataNodeID: 2,
-						plan: &datapb.CompactionPlan{
-							PlanID:           3,
-							StartTime:        tsoutil.ComposeTS(ts.UnixNano()/int64(time.Millisecond), 0),
-							TimeoutInSeconds: 1,
-						},
-					},
-					4: {
-						state:      executing,
-						dataNodeID: 2,
-						plan: &datapb.CompactionPlan{
-							PlanID:           4,
-							StartTime:        tsoutil.ComposeTS(ts.UnixNano()/int64(time.Millisecond), 0) - 200*1000,
-							TimeoutInSeconds: 1,
-						},
-					},
-				},
-				meta: &meta{
-					segments: &SegmentsInfo{
-						map[int64]*SegmentInfo{
-							1: {SegmentInfo: &datapb.SegmentInfo{ID: 1}},
-						},
-					},
-				},
-				sessions: &SessionManager{
-					sessions: struct {
-						sync.RWMutex
-						data map[int64]*Session
-					}{
-						data: map[int64]*Session{
-							1: {client: &mockDataNodeClient{
-								compactionStateResp: &datapb.CompactionStateResponse{
-									Results: []*datapb.CompactionStateResult{
-										{PlanID: 1, State: commonpb.CompactionState_Executing},
-										{PlanID: 3, State: commonpb.CompactionState_Completed, Result: &datapb.CompactionResult{PlanID: 3}},
-										{PlanID: 4, State: commonpb.CompactionState_Executing},
-									},
-								},
-							}},
-						},
-					},
-				},
-			},
-			args{ts: tsoutil.ComposeTS(ts.Add(5*time.Second).UnixNano()/int64(time.Millisecond), 0)},
-			false,
-			[]int64{4},
-			[]int64{2},
-			[]int64{1, 3},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			c := &compactionPlanHandler{
-				plans:    tt.fields.plans,
-				sessions: tt.fields.sessions,
-				meta:     tt.fields.meta,
-			}
-
-			err := c.updateCompaction(tt.args.ts)
-			assert.Equal(t, tt.wantErr, err != nil)
-
-			for _, id := range tt.timeout {
-				task := c.getCompaction(id)
-				assert.Equal(t, timeout, task.state)
-			}
-
-			for _, id := range tt.failed {
-				task := c.getCompaction(id)
-				assert.Equal(t, failed, task.state)
-			}
-
-			for _, id := range tt.unexpired {
-				task := c.getCompaction(id)
-				assert.NotEqual(t, failed, task.state)
-			}
-		})
-	}
-}
-
-func Test_newCompactionPlanHandler(t *testing.T) {
-	type args struct {
-		sessions  *SessionManager
-		cm        *ChannelManager
-		meta      *meta
-		allocator allocator
-		flush     chan UniqueID
-	}
-	tests := []struct {
-		name string
-		args args
-		want *compactionPlanHandler
-	}{
-		{
-			"test new handler",
-			args{
-				&SessionManager{},
-				&ChannelManager{},
-				&meta{},
-				newMockAllocator(),
-				nil,
-			},
-			&compactionPlanHandler{
-				plans:      map[int64]*compactionTask{},
-				sessions:   &SessionManager{},
-				chManager:  &ChannelManager{},
-				meta:       &meta{},
-				allocator:  newMockAllocator(),
-				flushCh:    nil,
-				parallelCh: make(map[int64]chan struct{}),
-			},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := newCompactionPlanHandler(tt.args.sessions, tt.args.cm, tt.args.meta, tt.args.allocator, tt.args.flush)
-			assert.EqualValues(t, tt.want, got)
-		})
-	}
-}
-
-func Test_getCompactionTasksBySignalID(t *testing.T) {
-	type fields struct {
-		plans map[int64]*compactionTask
-	}
-	type args struct {
-		signalID int64
-	}
-	tests := []struct {
-		name   string
-		fields fields
-		args   args
-		want   []*compactionTask
-	}{
-		{
-			"test get compaction tasks",
-			fields{
-				plans: map[int64]*compactionTask{
-					1: {
-						triggerInfo: &compactionSignal{id: 1},
-						state:       executing,
-					},
-					2: {
-						triggerInfo: &compactionSignal{id: 1},
-						state:       completed,
-					},
-					3: {
-						triggerInfo: &compactionSignal{id: 1},
-						state:       failed,
-					},
-				},
-			},
-			args{1},
-			[]*compactionTask{
-				{
-					triggerInfo: &compactionSignal{id: 1},
-					state:       executing,
-				},
-				{
-					triggerInfo: &compactionSignal{id: 1},
-					state:       completed,
-				},
-				{
-					triggerInfo: &compactionSignal{id: 1},
-					state:       failed,
-				},
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			h := &compactionPlanHandler{
-				plans: tt.fields.plans,
-			}
-			got := h.getCompactionTasksBySignalID(tt.args.signalID)
-			assert.ElementsMatch(t, tt.want, got)
-		})
-	}
-}
-
-func getFieldBinlogPaths(id int64, paths ...string) *datapb.FieldBinlog {
+func getFieldBinlogIDs(fieldID int64, logIDs ...int64) *datapb.FieldBinlog {
 	l := &datapb.FieldBinlog{
-		FieldID: id,
+		FieldID: fieldID,
+		Binlogs: make([]*datapb.Binlog, 0, len(logIDs)),
+	}
+	for _, id := range logIDs {
+		l.Binlogs = append(l.Binlogs, &datapb.Binlog{LogID: id})
+	}
+	err := binlog.CompressFieldBinlogs([]*datapb.FieldBinlog{l})
+	if err != nil {
+		panic(err)
+	}
+	return l
+}
+
+func getFieldBinlogPaths(fieldID int64, paths ...string) *datapb.FieldBinlog {
+	l := &datapb.FieldBinlog{
+		FieldID: fieldID,
 		Binlogs: make([]*datapb.Binlog, 0, len(paths)),
 	}
 	for _, path := range paths {
 		l.Binlogs = append(l.Binlogs, &datapb.Binlog{LogPath: path})
 	}
+	err := binlog.CompressFieldBinlogs([]*datapb.FieldBinlog{l})
+	if err != nil {
+		panic(err)
+	}
 	return l
 }
 
-func getFieldBinlogPathsWithEntry(id int64, entry int64, paths ...string) *datapb.FieldBinlog {
+func getFieldBinlogIDsWithEntry(fieldID int64, entry int64, logIDs ...int64) *datapb.FieldBinlog {
 	l := &datapb.FieldBinlog{
-		FieldID: id,
-		Binlogs: make([]*datapb.Binlog, 0, len(paths)),
+		FieldID: fieldID,
+		Binlogs: make([]*datapb.Binlog, 0, len(logIDs)),
 	}
-	for _, path := range paths {
-		l.Binlogs = append(l.Binlogs, &datapb.Binlog{LogPath: path, EntriesNum: entry})
+	for _, id := range logIDs {
+		l.Binlogs = append(l.Binlogs, &datapb.Binlog{LogID: id, EntriesNum: entry})
+	}
+	err := binlog.CompressFieldBinlogs([]*datapb.FieldBinlog{l})
+	if err != nil {
+		panic(err)
 	}
 	return l
+}
+
+func getInsertLogPath(rootPath string, segmentID typeutil.UniqueID) string {
+	return metautil.BuildInsertLogPath(rootPath, 10, 100, segmentID, 1000, 10000)
+}
+
+func getStatsLogPath(rootPath string, segmentID typeutil.UniqueID) string {
+	return metautil.BuildStatsLogPath(rootPath, 10, 100, segmentID, 1000, 10000)
+}
+
+func getDeltaLogPath(rootPath string, segmentID typeutil.UniqueID) string {
+	return metautil.BuildDeltaLogPath(rootPath, 10, 100, segmentID, 10000)
+}
+
+func TestCheckDelay(t *testing.T) {
+	handler := &compactionPlanHandler{}
+	t1 := newMixCompactionTask(&datapb.CompactionTask{
+		StartTime: time.Now().Add(-100 * time.Minute).Unix(),
+	}, nil, nil, nil)
+	handler.checkDelay(t1)
+	t2 := newL0CompactionTask(&datapb.CompactionTask{
+		StartTime: time.Now().Add(-100 * time.Minute).Unix(),
+	}, nil, nil, nil)
+	handler.checkDelay(t2)
+	t3 := newClusteringCompactionTask(&datapb.CompactionTask{
+		StartTime: time.Now().Add(-100 * time.Minute).Unix(),
+	}, nil, nil, nil, nil, nil)
+	handler.checkDelay(t3)
 }

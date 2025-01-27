@@ -67,6 +67,9 @@ func (set Set[T]) Union(other Set[T]) Set[T] {
 
 // Complement returns the complement with the given set
 func (set Set[T]) Complement(other Set[T]) Set[T] {
+	if other == nil {
+		return set
+	}
 	ret := NewSet(set.Collect()...)
 	ret.Remove(other.Collect()...)
 	return ret
@@ -109,6 +112,24 @@ func (set Set[T]) Len() int {
 	return len(set)
 }
 
+// Range iterates over elements in the set
+func (set Set[T]) Range(f func(element T) bool) {
+	for elem := range set {
+		if !f(elem) {
+			break
+		}
+	}
+}
+
+// Clone returns a new set with the same elements
+func (set Set[T]) Clone() Set[T] {
+	ret := make(Set[T], set.Len())
+	for elem := range set {
+		ret.Insert(elem)
+	}
+	return ret
+}
+
 type ConcurrentSet[T comparable] struct {
 	inner sync.Map
 }
@@ -149,6 +170,13 @@ func (set *ConcurrentSet[T]) Remove(elements ...T) {
 	}
 }
 
+// Try remove element from set,
+// return false if not exist
+func (set *ConcurrentSet[T]) TryRemove(element T) bool {
+	_, exist := set.inner.LoadAndDelete(element)
+	return exist
+}
+
 // Get all elements in the set
 func (set *ConcurrentSet[T]) Collect() []T {
 	elements := make([]T, 0)
@@ -157,4 +185,11 @@ func (set *ConcurrentSet[T]) Collect() []T {
 		return true
 	})
 	return elements
+}
+
+func (set *ConcurrentSet[T]) Range(f func(element T) bool) {
+	set.inner.Range(func(key, value any) bool {
+		trueKey := key.(T)
+		return f(trueKey)
+	})
 }

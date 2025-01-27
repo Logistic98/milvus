@@ -17,6 +17,7 @@
 package etcdkv_test
 
 import (
+	"context"
 	"os"
 	"testing"
 
@@ -33,15 +34,15 @@ func TestEtcdRestartLoad(te *testing.T) {
 	te.Setenv(metricsinfo.DeployModeEnvKey, metricsinfo.StandaloneDeployMode)
 	te.Setenv("ETCD_USE_EMBED", "true")
 	param := new(paramtable.ComponentParam)
-	param.Init()
-	param.BaseTable.Save("etcd.config.path", "../../../configs/advanced/etcd.yaml")
-	param.BaseTable.Save("etcd.data.dir", etcdDataDir)
-	//clean up data
+	param.Init(paramtable.NewBaseTable())
+	param.Save("etcd.config.path", "../../../configs/advanced/etcd.yaml")
+	param.Save("etcd.data.dir", etcdDataDir)
+	// clean up data
 	defer func() {
 		err := os.RemoveAll(etcdDataDir)
 		assert.NoError(te, err)
 	}()
-	te.Run("EtcdKV SaveRestartAndLoad", func(t *testing.T) {
+	te.Run("etcdKV SaveRestartAndLoad", func(t *testing.T) {
 		rootPath := "/etcd/test/root/saveRestartAndLoad"
 		metaKv, err := embed_etcd_kv.NewMetaKvFactory(rootPath, &param.EtcdCfg)
 		require.NoError(te, err)
@@ -49,7 +50,7 @@ func TestEtcdRestartLoad(te *testing.T) {
 		require.NoError(t, err)
 
 		defer metaKv.Close()
-		defer metaKv.RemoveWithPrefix("")
+		defer metaKv.RemoveWithPrefix(context.TODO(), "")
 
 		saveAndLoadTests := []struct {
 			key   string
@@ -64,14 +65,14 @@ func TestEtcdRestartLoad(te *testing.T) {
 		// save some data
 		for i, test := range saveAndLoadTests {
 			if i < 4 {
-				err = metaKv.Save(test.key, test.value)
+				err = metaKv.Save(context.TODO(), test.key, test.value)
 				assert.NoError(t, err)
 			}
 		}
 
 		// check test result
 		for _, test := range saveAndLoadTests {
-			val, err := metaKv.Load(test.key)
+			val, err := metaKv.Load(context.TODO(), test.key)
 			assert.NoError(t, err)
 			assert.Equal(t, test.value, val)
 		}
@@ -79,11 +80,11 @@ func TestEtcdRestartLoad(te *testing.T) {
 		embed := metaKv.(*embed_etcd_kv.EmbedEtcdKV)
 		embed.Close()
 
-		//restart and check test result
+		// restart and check test result
 		metaKv, _ = embed_etcd_kv.NewMetaKvFactory(rootPath, &param.EtcdCfg)
 
 		for _, test := range saveAndLoadTests {
-			val, err := metaKv.Load(test.key)
+			val, err := metaKv.Load(context.TODO(), test.key)
 			assert.NoError(t, err)
 			assert.Equal(t, test.value, val)
 		}

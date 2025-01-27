@@ -12,17 +12,18 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
-	"github.com/golang/protobuf/proto"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	pb "github.com/milvus-io/milvus/internal/proto/etcdpb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/pkg/kv"
 	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/proto/datapb"
+	pb "github.com/milvus-io/milvus/pkg/proto/etcdpb"
+	"github.com/milvus-io/milvus/pkg/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/util/etcd"
 	"github.com/milvus-io/milvus/pkg/util/logutil"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
@@ -51,7 +52,7 @@ type mck struct {
 	taskIDToInvalidPath map[int64][]string
 	segmentIDMap        map[int64]*datapb.SegmentInfo
 	partitionIDMap      map[int64]struct{}
-	etcdKV              *etcdkv.EtcdKV
+	metaKV              kv.MetaKv
 	minioChunkManager   storage.ChunkManager
 
 	etcdIP          string
@@ -105,8 +106,9 @@ func (c *mck) execute(args []string, flags *flag.FlagSet) {
 
 func (c *mck) run() {
 	c.connectMinio()
+	log := log.Ctx(context.TODO())
 
-	_, values, err := c.etcdKV.LoadWithPrefix(segmentPrefix)
+	_, values, err := c.metaKV.LoadWithPrefix(context.TODO(), segmentPrefix)
 	if err != nil {
 		log.Fatal("failed to list the segment info", zap.String("key", segmentPrefix), zap.Error(err))
 	}
@@ -120,7 +122,7 @@ func (c *mck) run() {
 		c.segmentIDMap[info.ID] = info
 	}
 
-	_, values, err = c.etcdKV.LoadWithPrefix(collectionPrefix)
+	_, values, err = c.metaKV.LoadWithPrefix(context.TODO(), collectionPrefix)
 	if err != nil {
 		log.Fatal("failed to list the collection info", zap.String("key", collectionPrefix), zap.Error(err))
 	}
@@ -149,13 +151,13 @@ func (c *mck) run() {
 	}
 	log.Info("partition ids", zap.Int64s("ids", ids))
 
-	keys, values, err := c.etcdKV.LoadWithPrefix(triggerTaskPrefix)
+	keys, values, err := c.metaKV.LoadWithPrefix(context.TODO(), triggerTaskPrefix)
 	if err != nil {
 		log.Fatal("failed to list the trigger task info", zap.Error(err))
 	}
 	c.extractTask(triggerTaskPrefix, keys, values)
 
-	keys, values, err = c.etcdKV.LoadWithPrefix(activeTaskPrefix)
+	keys, values, err = c.metaKV.LoadWithPrefix(context.TODO(), activeTaskPrefix)
 	if err != nil {
 		log.Fatal("failed to list the active task info", zap.Error(err))
 	}
@@ -205,18 +207,22 @@ func (c *mck) formatFlags(args []string, flags *flag.FlagSet) {
 	if err := flags.Parse(os.Args[2:]); err != nil {
 		log.Fatal("failed to parse flags", zap.Error(err))
 	}
-	log.Info("args", zap.Strings("args", args))
+	log.Ctx(context.TODO()).Info("args", zap.Strings("args", args))
 }
 
 func (c *mck) connectEctd() {
-	c.params.Init()
+	c.params.Init(paramtable.NewBaseTable())
 	var etcdCli *clientv3.Client
 	var err error
+	log := log.Ctx(context.TODO())
 	if c.etcdIP != "" {
 		etcdCli, err = etcd.GetRemoteEtcdClient([]string{c.etcdIP})
 	} else {
-		etcdCli, err = etcd.GetEtcdClient(
+		etcdCli, err = etcd.CreateEtcdClient(
 			c.params.EtcdCfg.UseEmbedEtcd.GetAsBool(),
+			c.params.EtcdCfg.EtcdEnableAuth.GetAsBool(),
+			c.params.EtcdCfg.EtcdAuthUserName.GetValue(),
+			c.params.EtcdCfg.EtcdAuthPassword.GetValue(),
 			c.params.EtcdCfg.EtcdUseSSL.GetAsBool(),
 			c.params.EtcdCfg.Endpoints.GetAsStrings(),
 			c.params.EtcdCfg.EtcdTLSCert.GetValue(),
@@ -229,7 +235,7 @@ func (c *mck) connectEctd() {
 	}
 
 	rootPath := getConfigValue(c.ectdRootPath, c.params.EtcdCfg.MetaRootPath.GetValue(), "ectd_root_path")
-	c.etcdKV = etcdkv.NewEtcdKV(etcdCli, rootPath)
+	c.metaKV = etcdkv.NewEtcdKV(etcdCli, rootPath)
 	log.Info("Etcd root path", zap.String("root_path", rootPath))
 }
 
@@ -239,7 +245,7 @@ func (c *mck) connectMinio() {
 	var err error
 	c.minioChunkManager, err = chunkManagerFactory.NewPersistentStorageChunkManager(context.Background())
 	if err != nil {
-		log.Fatal("failed to connect to minio", zap.Error(err))
+		log.Ctx(context.TODO()).Fatal("failed to connect to minio", zap.Error(err))
 	}
 }
 
@@ -250,12 +256,13 @@ func getConfigValue(a string, b string, name string) string {
 	if b != "" {
 		return b
 	}
-	log.Panic(fmt.Sprintf("the config '%s' is empty", name))
+	log.Ctx(context.TODO()).Panic(fmt.Sprintf("the config '%s' is empty", name))
 	return ""
 }
 
 func (c *mck) cleanTrash() {
-	keys, _, err := c.etcdKV.LoadWithPrefix(MckTrash)
+	log := log.Ctx(context.TODO())
+	keys, _, err := c.metaKV.LoadWithPrefix(context.TODO(), MckTrash)
 	if err != nil {
 		log.Error("failed to load backup info", zap.Error(err))
 		return
@@ -269,7 +276,7 @@ func (c *mck) cleanTrash() {
 	deleteAll := ""
 	fmt.Scanln(&deleteAll)
 	if deleteAll == "Y" {
-		err = c.etcdKV.RemoveWithPrefix(MckTrash)
+		err = c.metaKV.RemoveWithPrefix(context.TODO(), MckTrash)
 		if err != nil {
 			log.Error("failed to remove backup infos", zap.String("key", MckTrash), zap.Error(err))
 			return
@@ -363,7 +370,7 @@ func getTrashKey(taskType, key string) string {
 }
 
 func (c *mck) extractTask(prefix string, keys []string, values []string) {
-
+	log := log.Ctx(context.TODO())
 	for i := range keys {
 		taskID, err := strconv.ParseInt(filepath.Base(keys[i]), 10, 64)
 		if err != nil {
@@ -390,33 +397,34 @@ func (c *mck) extractTask(prefix string, keys []string, values []string) {
 }
 
 func (c *mck) removeTask(invalidTask int64) bool {
+	log := log.Ctx(context.TODO())
 	taskType := c.taskNameMap[invalidTask]
 	key := c.taskKeyMap[invalidTask]
-	err := c.etcdKV.Save(getTrashKey(taskType, key), c.allTaskInfo[key])
+	err := c.metaKV.Save(context.TODO(), getTrashKey(taskType, key), c.allTaskInfo[key])
 	if err != nil {
 		log.Warn("failed to backup task", zap.String("key", getTrashKey(taskType, key)), zap.Int64("task_id", invalidTask), zap.Error(err))
 		return false
 	}
 	fmt.Printf("Back up task successfully, back path: %s\n", getTrashKey(taskType, key))
-	err = c.etcdKV.Remove(key)
+	err = c.metaKV.Remove(context.TODO(), key)
 	if err != nil {
 		log.Warn("failed to remove task", zap.Int64("task_id", invalidTask), zap.Error(err))
 		return false
 	}
 
 	key = fmt.Sprintf("%s/%d", taskInfoPrefix, invalidTask)
-	taskInfo, err := c.etcdKV.Load(key)
+	taskInfo, err := c.metaKV.Load(context.TODO(), key)
 	if err != nil {
 		log.Warn("failed to load task info", zap.Int64("task_id", invalidTask), zap.Error(err))
 		return false
 	}
-	err = c.etcdKV.Save(getTrashKey(taskType, key), taskInfo)
+	err = c.metaKV.Save(context.TODO(), getTrashKey(taskType, key), taskInfo)
 	if err != nil {
 		log.Warn("failed to backup task info", zap.Int64("task_id", invalidTask), zap.Error(err))
 		return false
 	}
 	fmt.Printf("Back up task info successfully, back path: %s\n", getTrashKey(taskType, key))
-	err = c.etcdKV.Remove(key)
+	err = c.metaKV.Remove(context.TODO(), key)
 	if err != nil {
 		log.Warn("failed to remove task info", zap.Int64("task_id", invalidTask), zap.Error(err))
 	}
@@ -517,49 +525,49 @@ func (c *mck) extractVecFieldIndexInfo(taskID int64, infos []*querypb.FieldIndex
 
 // return partitionIDs,segmentIDs,error
 func (c *mck) unmarshalTask(taskID int64, t string) (string, []int64, []int64, error) {
+	log := log.Ctx(context.TODO())
 	header := commonpb.MsgHeader{}
 	err := proto.Unmarshal([]byte(t), &header)
-
 	if err != nil {
 		return errReturn(taskID, "MsgHeader", err)
 	}
 
 	switch header.Base.MsgType {
 	case commonpb.MsgType_LoadCollection:
-		loadReq := querypb.LoadCollectionRequest{}
-		err = proto.Unmarshal([]byte(t), &loadReq)
+		loadReq := &querypb.LoadCollectionRequest{}
+		err = proto.Unmarshal([]byte(t), loadReq)
 		if err != nil {
 			return errReturn(taskID, "LoadCollectionRequest", err)
 		}
 		log.Info("LoadCollection", zap.String("detail", fmt.Sprintf("+%v", loadReq)))
 		return "LoadCollection", emptyInt64(), emptyInt64(), nil
 	case commonpb.MsgType_LoadPartitions:
-		loadReq := querypb.LoadPartitionsRequest{}
-		err = proto.Unmarshal([]byte(t), &loadReq)
+		loadReq := &querypb.LoadPartitionsRequest{}
+		err = proto.Unmarshal([]byte(t), loadReq)
 		if err != nil {
 			return errReturn(taskID, "LoadPartitionsRequest", err)
 		}
 		log.Info("LoadPartitions", zap.String("detail", fmt.Sprintf("+%v", loadReq)))
 		return "LoadPartitions", loadReq.PartitionIDs, emptyInt64(), nil
 	case commonpb.MsgType_ReleaseCollection:
-		loadReq := querypb.ReleaseCollectionRequest{}
-		err = proto.Unmarshal([]byte(t), &loadReq)
+		loadReq := &querypb.ReleaseCollectionRequest{}
+		err = proto.Unmarshal([]byte(t), loadReq)
 		if err != nil {
 			return errReturn(taskID, "ReleaseCollectionRequest", err)
 		}
 		log.Info("ReleaseCollection", zap.String("detail", fmt.Sprintf("+%v", loadReq)))
 		return "ReleaseCollection", emptyInt64(), emptyInt64(), nil
 	case commonpb.MsgType_ReleasePartitions:
-		loadReq := querypb.ReleasePartitionsRequest{}
-		err = proto.Unmarshal([]byte(t), &loadReq)
+		loadReq := &querypb.ReleasePartitionsRequest{}
+		err = proto.Unmarshal([]byte(t), loadReq)
 		if err != nil {
 			return errReturn(taskID, "ReleasePartitionsRequest", err)
 		}
 		log.Info("ReleasePartitions", zap.String("detail", fmt.Sprintf("+%v", loadReq)))
 		return "ReleasePartitions", loadReq.PartitionIDs, emptyInt64(), nil
 	case commonpb.MsgType_LoadSegments:
-		loadReq := querypb.LoadSegmentsRequest{}
-		err = proto.Unmarshal([]byte(t), &loadReq)
+		loadReq := &querypb.LoadSegmentsRequest{}
+		err = proto.Unmarshal([]byte(t), loadReq)
 		if err != nil {
 			return errReturn(taskID, "LoadSegmentsRequest", err)
 		}
@@ -582,16 +590,16 @@ func (c *mck) unmarshalTask(taskID int64, t string) (string, []int64, []int64, e
 		log.Info("LoadSegments", zap.String("detail", fmt.Sprintf("+%v", loadReq)))
 		return "LoadSegments", removeRepeatElement(partitionIDs), removeRepeatElement(segmentIDs), nil
 	case commonpb.MsgType_ReleaseSegments:
-		loadReq := querypb.ReleaseSegmentsRequest{}
-		err = proto.Unmarshal([]byte(t), &loadReq)
+		loadReq := &querypb.ReleaseSegmentsRequest{}
+		err = proto.Unmarshal([]byte(t), loadReq)
 		if err != nil {
 			return errReturn(taskID, "ReleaseSegmentsRequest", err)
 		}
 		log.Info("ReleaseSegments", zap.String("detail", fmt.Sprintf("+%v", loadReq)))
 		return "ReleaseSegments", loadReq.PartitionIDs, loadReq.SegmentIDs, nil
 	case commonpb.MsgType_WatchDmChannels:
-		loadReq := querypb.WatchDmChannelsRequest{}
-		err = proto.Unmarshal([]byte(t), &loadReq)
+		loadReq := &querypb.WatchDmChannelsRequest{}
+		err = proto.Unmarshal([]byte(t), loadReq)
 		if err != nil {
 			return errReturn(taskID, "WatchDmChannelsRequest", err)
 		}
@@ -617,16 +625,16 @@ func (c *mck) unmarshalTask(taskID int64, t string) (string, []int64, []int64, e
 		log.Warn("legacy WatchQueryChannels type found, ignore")
 		return "WatchQueryChannels", emptyInt64(), emptyInt64(), nil
 	case commonpb.MsgType_LoadBalanceSegments:
-		loadReq := querypb.LoadBalanceRequest{}
-		err = proto.Unmarshal([]byte(t), &loadReq)
+		loadReq := &querypb.LoadBalanceRequest{}
+		err = proto.Unmarshal([]byte(t), loadReq)
 		if err != nil {
 			return errReturn(taskID, "LoadBalanceRequest", err)
 		}
 		log.Info("LoadBalanceSegments", zap.String("detail", fmt.Sprintf("+%v", loadReq)))
 		return "LoadBalanceSegments", emptyInt64(), loadReq.SealedSegmentIDs, nil
 	case commonpb.MsgType_HandoffSegments:
-		handoffReq := querypb.HandoffSegmentsRequest{}
-		err = proto.Unmarshal([]byte(t), &handoffReq)
+		handoffReq := &querypb.HandoffSegmentsRequest{}
+		err = proto.Unmarshal([]byte(t), handoffReq)
 		if err != nil {
 			return errReturn(taskID, "HandoffSegmentsRequest", err)
 		}

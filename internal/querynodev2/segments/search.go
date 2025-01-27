@@ -21,9 +21,12 @@ import (
 	"fmt"
 	"sync"
 
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus/internal/querynodev2/segments/metricsutil"
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/metrics"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
@@ -32,100 +35,216 @@ import (
 
 // searchOnSegments performs search on listed segments
 // all segment ids are validated before calling this function
-func searchSegments(ctx context.Context, manager *Manager, segType SegmentType, searchReq *SearchRequest, segIDs []int64) ([]*SearchResult, error) {
-	var (
-		// results variables
-		resultCh = make(chan *SearchResult, len(segIDs))
-		errs     = make([]error, len(segIDs))
-		wg       sync.WaitGroup
-
-		// For log only
-		mu                   sync.Mutex
-		segmentsWithoutIndex []int64
-	)
-
+func searchSegments(ctx context.Context, mgr *Manager, segments []Segment, segType SegmentType, searchReq *SearchRequest) ([]*SearchResult, error) {
 	searchLabel := metrics.SealedSegmentLabel
 	if segType == commonpb.SegmentState_Growing {
 		searchLabel = metrics.GrowingSegmentLabel
 	}
 
+	resultCh := make(chan *SearchResult, len(segments))
+	searcher := func(ctx context.Context, s Segment) error {
+		// record search time
+		tr := timerecord.NewTimeRecorder("searchOnSegments")
+		searchResult, err := s.Search(ctx, searchReq)
+		if err != nil {
+			return err
+		}
+		resultCh <- searchResult
+		// update metrics
+		elapsed := tr.ElapseSpan().Milliseconds()
+		metrics.QueryNodeSQSegmentLatency.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()),
+			metrics.SearchLabel, searchLabel).Observe(float64(elapsed))
+		metrics.QueryNodeSegmentSearchLatencyPerVector.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()),
+			metrics.SearchLabel, searchLabel).Observe(float64(elapsed) / float64(searchReq.GetNumOfQuery()))
+		return nil
+	}
+
 	// calling segment search in goroutines
-	for i, segID := range segIDs {
-		wg.Add(1)
-		go func(segID int64, i int) {
-			defer wg.Done()
-			seg, _ := manager.Segment.GetWithType(segID, segType).(*LocalSegment)
-			if seg == nil {
-				log.Warn("segment released while searching", zap.Int64("segmentID", segID))
-				return
+	errGroup, ctx := errgroup.WithContext(ctx)
+	segmentsWithoutIndex := make([]int64, 0)
+	for _, segment := range segments {
+		seg := segment
+		if !seg.ExistIndex(searchReq.SearchFieldID()) {
+			segmentsWithoutIndex = append(segmentsWithoutIndex, seg.ID())
+		}
+		errGroup.Go(func() error {
+			if ctx.Err() != nil {
+				return ctx.Err()
 			}
 
-			if !seg.ExistIndex(searchReq.searchFieldID) {
-				mu.Lock()
-				segmentsWithoutIndex = append(segmentsWithoutIndex, segID)
-				mu.Unlock()
+			var err error
+			accessRecord := metricsutil.NewSearchSegmentAccessRecord(getSegmentMetricLabel(seg))
+			defer func() {
+				accessRecord.Finish(err)
+			}()
+
+			if seg.IsLazyLoad() {
+				ctx, cancel := withLazyLoadTimeoutContext(ctx)
+				defer cancel()
+
+				var missing bool
+				missing, err = mgr.DiskCache.Do(ctx, seg.ID(), searcher)
+				if missing {
+					accessRecord.CacheMissing()
+				}
+				if err != nil {
+					log.Warn("failed to do search for disk cache", zap.Int64("segID", seg.ID()), zap.Error(err))
+				}
+				return err
 			}
-			// record search time
-			tr := timerecord.NewTimeRecorder("searchOnSegments")
-			searchResult, err := seg.Search(ctx, searchReq)
-			errs[i] = err
-			resultCh <- searchResult
-			// update metrics
-			metrics.QueryNodeSQSegmentLatency.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()),
-				metrics.SearchLabel, searchLabel).Observe(float64(tr.ElapseSpan().Milliseconds()))
-		}(segID, i)
+			return searcher(ctx, seg)
+		})
 	}
-	wg.Wait()
+	err := errGroup.Wait()
 	close(resultCh)
 
-	searchResults := make([]*SearchResult, 0, len(segIDs))
+	searchResults := make([]*SearchResult, 0, len(segments))
 	for result := range resultCh {
 		searchResults = append(searchResults, result)
 	}
 
-	for _, err := range errs {
-		if err != nil {
-			DeleteSearchResults(searchResults)
-			return nil, err
-		}
+	if err != nil {
+		DeleteSearchResults(searchResults)
+		return nil, err
 	}
 
 	if len(segmentsWithoutIndex) > 0 {
-		log.Ctx(ctx).Info("search growing/sealed segments without indexes", zap.Int64s("segmentIDs", segmentsWithoutIndex))
+		log.Ctx(ctx).Debug("search growing/sealed segments without indexes", zap.Int64s("segmentIDs", segmentsWithoutIndex))
 	}
 
 	return searchResults, nil
+}
+
+// searchSegmentsStreamly performs search on listed segments in a stream mode instead of a batch mode
+// all segment ids are validated before calling this function
+func searchSegmentsStreamly(ctx context.Context,
+	mgr *Manager,
+	segments []Segment,
+	searchReq *SearchRequest,
+	streamReduce func(result *SearchResult) error,
+) error {
+	searchLabel := metrics.SealedSegmentLabel
+	searchResultsToClear := make([]*SearchResult, 0)
+	var reduceMutex sync.Mutex
+	var sumReduceDuration atomic.Duration
+	searcher := func(ctx context.Context, seg Segment) error {
+		// record search time
+		tr := timerecord.NewTimeRecorder("searchOnSegments")
+		searchResult, searchErr := seg.Search(ctx, searchReq)
+		searchDuration := tr.RecordSpan().Milliseconds()
+		if searchErr != nil {
+			return searchErr
+		}
+		reduceMutex.Lock()
+		searchResultsToClear = append(searchResultsToClear, searchResult)
+		reducedErr := streamReduce(searchResult)
+		reduceMutex.Unlock()
+		reduceDuration := tr.RecordSpan()
+		if reducedErr != nil {
+			return reducedErr
+		}
+		sumReduceDuration.Add(reduceDuration)
+		// update metrics
+		metrics.QueryNodeSQSegmentLatency.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()),
+			metrics.SearchLabel, searchLabel).Observe(float64(searchDuration))
+		metrics.QueryNodeSegmentSearchLatencyPerVector.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()),
+			metrics.SearchLabel, searchLabel).Observe(float64(searchDuration) / float64(searchReq.GetNumOfQuery()))
+		return nil
+	}
+
+	// calling segment search in goroutines
+	errGroup, ctx := errgroup.WithContext(ctx)
+	log := log.Ctx(ctx)
+	for _, segment := range segments {
+		seg := segment
+		errGroup.Go(func() error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+
+			var err error
+			accessRecord := metricsutil.NewSearchSegmentAccessRecord(getSegmentMetricLabel(seg))
+			defer func() {
+				accessRecord.Finish(err)
+			}()
+			if seg.IsLazyLoad() {
+				log.Debug("before doing stream search in DiskCache", zap.Int64("segID", seg.ID()))
+				ctx, cancel := withLazyLoadTimeoutContext(ctx)
+				defer cancel()
+
+				var missing bool
+				missing, err = mgr.DiskCache.Do(ctx, seg.ID(), searcher)
+				if missing {
+					accessRecord.CacheMissing()
+				}
+				if err != nil {
+					log.Warn("failed to do search for disk cache", zap.Int64("segID", seg.ID()), zap.Error(err))
+				}
+				log.Debug("after doing stream search in DiskCache", zap.Int64("segID", seg.ID()), zap.Error(err))
+				return err
+			}
+			return searcher(ctx, seg)
+		})
+	}
+	err := errGroup.Wait()
+	DeleteSearchResults(searchResultsToClear)
+	if err != nil {
+		return err
+	}
+	metrics.QueryNodeReduceLatency.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()),
+		metrics.SearchLabel,
+		metrics.ReduceSegments,
+		metrics.StreamReduce).Observe(float64(sumReduceDuration.Load().Milliseconds()))
+	log.Debug("stream reduce sum duration:", zap.Duration("duration", sumReduceDuration.Load()))
+	return nil
 }
 
 // search will search on the historical segments the target segments in historical.
 // if segIDs is not specified, it will search on all the historical segments speficied by partIDs.
 // if segIDs is specified, it will only search on the segments specified by the segIDs.
 // if partIDs is empty, it means all the partitions of the loaded collection or all the partitions loaded.
-func SearchHistorical(ctx context.Context, manager *Manager, searchReq *SearchRequest, collID int64, partIDs []int64, segIDs []int64) ([]*SearchResult, []int64, []int64, error) {
-	var err error
-	var searchResults []*SearchResult
-	var searchSegmentIDs []int64
-	var searchPartIDs []int64
-	searchPartIDs, searchSegmentIDs, err = validateOnHistorical(ctx, manager, collID, partIDs, segIDs)
-	if err != nil {
-		return searchResults, searchSegmentIDs, searchPartIDs, err
+func SearchHistorical(ctx context.Context, manager *Manager, searchReq *SearchRequest, collID int64, partIDs []int64, segIDs []int64) ([]*SearchResult, []Segment, error) {
+	if ctx.Err() != nil {
+		return nil, nil, ctx.Err()
 	}
-	searchResults, err = searchSegments(ctx, manager, SegmentTypeSealed, searchReq, searchSegmentIDs)
-	return searchResults, searchPartIDs, searchSegmentIDs, err
+
+	segments, err := validateOnHistorical(ctx, manager, collID, partIDs, segIDs)
+	if err != nil {
+		return nil, nil, err
+	}
+	searchResults, err := searchSegments(ctx, manager, segments, SegmentTypeSealed, searchReq)
+	return searchResults, segments, err
 }
 
 // searchStreaming will search all the target segments in streaming
 // if partIDs is empty, it means all the partitions of the loaded collection or all the partitions loaded.
-func SearchStreaming(ctx context.Context, manager *Manager, searchReq *SearchRequest, collID int64, partIDs []int64, segIDs []int64) ([]*SearchResult, []int64, []int64, error) {
-	var err error
-	var searchResults []*SearchResult
-	var searchPartIDs []int64
-	var searchSegmentIDs []int64
-
-	searchPartIDs, searchSegmentIDs, err = validateOnStream(ctx, manager, collID, partIDs, segIDs)
-	if err != nil {
-		return searchResults, searchSegmentIDs, searchPartIDs, err
+func SearchStreaming(ctx context.Context, manager *Manager, searchReq *SearchRequest, collID int64, partIDs []int64, segIDs []int64) ([]*SearchResult, []Segment, error) {
+	if ctx.Err() != nil {
+		return nil, nil, ctx.Err()
 	}
-	searchResults, err = searchSegments(ctx, manager, SegmentTypeGrowing, searchReq, searchSegmentIDs)
-	return searchResults, searchPartIDs, searchSegmentIDs, err
+
+	segments, err := validateOnStream(ctx, manager, collID, partIDs, segIDs)
+	if err != nil {
+		return nil, nil, err
+	}
+	searchResults, err := searchSegments(ctx, manager, segments, SegmentTypeGrowing, searchReq)
+	return searchResults, segments, err
+}
+
+func SearchHistoricalStreamly(ctx context.Context, manager *Manager, searchReq *SearchRequest,
+	collID int64, partIDs []int64, segIDs []int64, streamReduce func(result *SearchResult) error,
+) ([]Segment, error) {
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
+	segments, err := validateOnHistorical(ctx, manager, collID, partIDs, segIDs)
+	if err != nil {
+		return segments, err
+	}
+	err = searchSegmentsStreamly(ctx, manager, segments, searchReq, streamReduce)
+	if err != nil {
+		return segments, err
+	}
+	return segments, nil
 }

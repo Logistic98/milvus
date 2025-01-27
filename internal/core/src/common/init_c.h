@@ -28,16 +28,25 @@ void
 InitIndexSliceSize(const int64_t);
 
 void
-InitThreadCoreCoefficient(const int64_t);
+InitHighPriorityThreadCoreCoefficient(const int64_t);
+
+void
+InitMiddlePriorityThreadCoreCoefficient(const int64_t);
+
+void
+InitLowPriorityThreadCoreCoefficient(const int64_t);
+
+void
+InitDefaultExprEvalBatchSize(int64_t val);
 
 void
 InitCpuNum(const int);
 
 void
-InitLocalRootPath(const char*);
+InitTrace(CTraceConfig* config);
 
 void
-InitTrace(CTraceConfig* config);
+SetTrace(CTraceConfig* config);
 
 #ifdef __cplusplus
 };

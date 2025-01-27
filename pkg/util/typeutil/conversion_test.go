@@ -18,9 +18,13 @@ package typeutil
 
 import (
 	"math"
+	"math/rand"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus/pkg/log"
 )
 
 func TestConversion(t *testing.T) {
@@ -41,7 +45,7 @@ func TestConversion(t *testing.T) {
 		comp := func(i int64) {
 			ib := Int64ToBytes(i)
 			i1, err := BytesToInt64(ib)
-			assert.Nil(t, err)
+			assert.NoError(t, err)
 			assert.Equal(t, i, i1)
 		}
 		comp(int64(314))
@@ -51,14 +55,14 @@ func TestConversion(t *testing.T) {
 		comp(int64(math.MinInt64))
 
 		_, err := BytesToInt64([]byte("ab"))
-		assert.NotNil(t, err)
+		assert.Error(t, err)
 	})
 
 	t.Run("TestConvertUint64", func(t *testing.T) {
 		comp := func(u uint64) {
 			ub := Uint64ToBytes(u)
 			u1, err := BytesToUint64(ub)
-			assert.Nil(t, err)
+			assert.NoError(t, err)
 			assert.Equal(t, u, u1)
 		}
 		comp(uint64(314))
@@ -67,14 +71,14 @@ func TestConversion(t *testing.T) {
 		comp(uint64(math.MaxUint64))
 
 		_, err := BytesToUint64([]byte("ab"))
-		assert.NotNil(t, err)
+		assert.Error(t, err)
 	})
 
 	t.Run("TestConvertUint64BigEndian", func(t *testing.T) {
 		comp := func(u uint64) {
 			ub := Uint64ToBytesBigEndian(u)
 			u1, err := BigEndianBytesToUint64(ub)
-			assert.Nil(t, err)
+			assert.NoError(t, err)
 			assert.Equal(t, u, u1)
 		}
 		comp(uint64(314))
@@ -83,7 +87,7 @@ func TestConversion(t *testing.T) {
 		comp(uint64(math.MaxUint64))
 
 		_, err := BytesToUint64([]byte("ab"))
-		assert.NotNil(t, err)
+		assert.Error(t, err)
 	})
 
 	t.Run("TestSliceRemoveDuplicate", func(t *testing.T) {
@@ -95,4 +99,41 @@ func TestConversion(t *testing.T) {
 		assert.Equal(t, 3, len(ret1))
 	})
 
+	t.Run("TestFloat16", func(t *testing.T) {
+		for i := 0; i < 100; i++ {
+			v := (rand.Float32() - 0.5) * 100
+			b := Float32ToFloat16Bytes(v)
+			v2 := Float16BytesToFloat32(b)
+			log.Info("float16", zap.Float32("v", v), zap.Float32("v2", v2))
+			assert.Less(t, math.Abs(float64(v2/v-1)), 0.001)
+		}
+	})
+
+	t.Run("TestBFloat16", func(t *testing.T) {
+		for i := 0; i < 100; i++ {
+			v := (rand.Float32() - 0.5) * 100
+			b := Float32ToBFloat16Bytes(v)
+			v2 := BFloat16BytesToFloat32(b)
+			log.Info("bfloat16", zap.Float32("v", v), zap.Float32("v2", v2))
+			assert.Less(t, math.Abs(float64(v2/v-1)), 0.01)
+		}
+	})
+
+	t.Run("TestFloatArrays", func(t *testing.T) {
+		parameters := []float32{0.11111, 0.22222}
+		assert.Equal(t, "\xa4\x8d\xe3=\xa4\x8dc>", string(Float32ArrayToBytes(parameters)))
+
+		f16vec := Float32ArrayToFloat16Bytes(parameters)
+		assert.Equal(t, 4, len(f16vec))
+		// \x1c/ is 0.1111, \x1c3 is 0.2222
+		assert.Equal(t, "\x1c/\x1c3", string(f16vec))
+		assert.Equal(t, "\x1c/", string(Float32ToFloat16Bytes(0.11111)))
+		assert.Equal(t, "\x1c3", string(Float32ToFloat16Bytes(0.22222)))
+
+		bf16vec := Float32ArrayToBFloat16Bytes(parameters)
+		assert.Equal(t, 4, len(bf16vec))
+		assert.Equal(t, "\xe3=c>", string(bf16vec))
+		assert.Equal(t, "\xe3=", string(Float32ToBFloat16Bytes(0.11111)))
+		assert.Equal(t, "c>", string(Float32ToBFloat16Bytes(0.22222)))
+	})
 }

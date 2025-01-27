@@ -23,45 +23,42 @@ import (
 	"github.com/cockroachdb/errors"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
+	"github.com/milvus-io/milvus/internal/querycoordv2/observers"
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
-	"github.com/milvus-io/milvus/internal/querycoordv2/utils"
 	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/proto/querypb"
 )
 
 type SyncNewCreatedPartitionJob struct {
 	*BaseJob
-	req     *querypb.SyncNewCreatedPartitionRequest
-	meta    *meta.Meta
-	cluster session.Cluster
+	req            *querypb.SyncNewCreatedPartitionRequest
+	meta           *meta.Meta
+	cluster        session.Cluster
+	broker         meta.Broker
+	targetObserver *observers.TargetObserver
+	targetMgr      meta.TargetManagerInterface
 }
 
 func NewSyncNewCreatedPartitionJob(
 	ctx context.Context,
 	req *querypb.SyncNewCreatedPartitionRequest,
 	meta *meta.Meta,
-	cluster session.Cluster,
+	broker meta.Broker,
+	targetObserver *observers.TargetObserver,
+	targetMgr meta.TargetManagerInterface,
 ) *SyncNewCreatedPartitionJob {
 	return &SyncNewCreatedPartitionJob{
-		BaseJob: NewBaseJob(ctx, req.Base.GetMsgID(), req.GetCollectionID()),
-		req:     req,
-		meta:    meta,
-		cluster: cluster,
+		BaseJob:        NewBaseJob(ctx, req.Base.GetMsgID(), req.GetCollectionID()),
+		req:            req,
+		meta:           meta,
+		broker:         broker,
+		targetObserver: targetObserver,
+		targetMgr:      targetMgr,
 	}
 }
 
 func (job *SyncNewCreatedPartitionJob) PreExecute() error {
-	// check if collection not load or loadType is loadPartition
-	collection := job.meta.GetCollection(job.req.GetCollectionID())
-	if collection == nil || collection.GetLoadType() == querypb.LoadType_LoadPartition {
-		return ErrPartitionNotInTarget
-	}
-
-	// check if partition already existed
-	if partition := job.meta.GetPartition(job.req.GetPartitionID()); partition != nil {
-		return ErrPartitionNotInTarget
-	}
 	return nil
 }
 
@@ -72,9 +69,15 @@ func (job *SyncNewCreatedPartitionJob) Execute() error {
 		zap.Int64("partitionID", req.GetPartitionID()),
 	)
 
-	err := loadPartitions(job.ctx, job.meta, job.cluster, false, req.GetCollectionID(), req.GetPartitionID())
-	if err != nil {
-		return err
+	// check if collection not load or loadType is loadPartition
+	collection := job.meta.GetCollection(job.ctx, job.req.GetCollectionID())
+	if collection == nil || collection.GetLoadType() == querypb.LoadType_LoadPartition {
+		return nil
+	}
+
+	// check if partition already existed
+	if partition := job.meta.GetPartition(job.ctx, job.req.GetPartitionID()); partition != nil {
+		return nil
 	}
 
 	partition := &meta.Partition{
@@ -86,18 +89,12 @@ func (job *SyncNewCreatedPartitionJob) Execute() error {
 		LoadPercentage: 100,
 		CreatedAt:      time.Now(),
 	}
-	err = job.meta.CollectionManager.PutPartition(partition)
+	err := job.meta.CollectionManager.PutPartition(job.ctx, partition)
 	if err != nil {
 		msg := "failed to store partitions"
-		log.Error(msg, zap.Error(err))
-		return utils.WrapError(msg, err)
+		log.Warn(msg, zap.Error(err))
+		return errors.Wrap(err, msg)
 	}
 
-	return nil
-}
-
-func (job *SyncNewCreatedPartitionJob) PostExecute() {
-	if job.Error() != nil && !errors.Is(job.Error(), ErrPartitionNotInTarget) {
-		releasePartitions(job.ctx, job.meta, job.cluster, true, job.req.GetCollectionID(), job.req.GetPartitionID())
-	}
+	return waitCurrentTargetUpdated(job.ctx, job.targetObserver, job.req.GetCollectionID())
 }

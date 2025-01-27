@@ -21,81 +21,129 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/protobuf/proto"
-	"github.com/milvus-io/milvus/pkg/util/tsoutil"
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/suite"
 
-	"github.com/milvus-io/milvus-proto/go-api/msgpb"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/pkg/proto/querypb"
 )
 
-func Test_packLoadSegmentRequest(t *testing.T) {
-	mockVChannel := "fake-by-dev-rootcoord-dml-1-test-packLoadSegmentRequest-v0"
-	mockPChannel := "fake-by-dev-rootcoord-dml-1"
+type UtilsSuite struct {
+	suite.Suite
+}
 
-	t0 := tsoutil.ComposeTSByTime(time.Now().Add(-20*time.Minute), 0)
-	t1 := tsoutil.ComposeTSByTime(time.Now().Add(-8*time.Minute), 0)
-	t2 := tsoutil.ComposeTSByTime(time.Now().Add(-5*time.Minute), 0)
+func (s *UtilsSuite) TestPackLoadSegmentRequest() {
+	ctx := context.Background()
 
-	segmentInfo := &datapb.SegmentInfo{
-		ID:            0,
-		InsertChannel: mockVChannel,
-		StartPosition: &msgpb.MsgPosition{
-			ChannelName: mockPChannel,
-			Timestamp:   t1,
+	action := NewSegmentAction(1, ActionTypeGrow, "test-ch", 100)
+	task, err := NewSegmentTask(
+		ctx,
+		time.Second,
+		nil,
+		1,
+		newReplicaDefaultRG(10),
+		action,
+	)
+	s.NoError(err)
+
+	collectionInfoResp := &milvuspb.DescribeCollectionResponse{
+		Schema: &schemapb.CollectionSchema{
+			Fields: []*schemapb.FieldSchema{
+				{
+					FieldID:      100,
+					DataType:     schemapb.DataType_Int64,
+					IsPrimaryKey: true,
+				},
+			},
 		},
-		DmlPosition: &msgpb.MsgPosition{
-			ChannelName: mockPChannel,
-			Timestamp:   t2,
+		Properties: []*commonpb.KeyValuePair{
+			{
+				Key:   common.MmapEnabledKey,
+				Value: "false",
+			},
 		},
 	}
 
-	t.Run("test set deltaPosition from segment dmlPosition", func(t *testing.T) {
-		segmentAction := NewSegmentAction(0, 0, "", 0)
-		segmentTask, err := NewSegmentTask(context.TODO(), 5*time.Second, 0, 0, 0, segmentAction)
-		assert.NoError(t, err)
+	req := packLoadSegmentRequest(
+		task,
+		action,
+		collectionInfoResp.GetSchema(),
+		collectionInfoResp.GetProperties(),
+		&querypb.LoadMetaInfo{
+			LoadType: querypb.LoadType_LoadCollection,
+		},
+		&querypb.SegmentLoadInfo{},
+		nil,
+	)
 
-		resp := &datapb.GetSegmentInfoResponse{
-			Infos: []*datapb.SegmentInfo{
-				proto.Clone(segmentInfo).(*datapb.SegmentInfo),
+	s.True(req.GetNeedTransfer())
+	s.Equal(task.CollectionID(), req.CollectionID)
+	s.Equal(task.ReplicaID(), req.ReplicaID)
+	s.Equal(action.Node(), req.GetDstNodeID())
+	for _, field := range req.GetSchema().GetFields() {
+		mmapEnable, ok := common.IsMmapDataEnabled(field.GetTypeParams()...)
+		s.False(mmapEnable)
+		s.True(ok)
+	}
+}
+
+func (s *UtilsSuite) TestPackLoadSegmentRequestMmap() {
+	ctx := context.Background()
+
+	action := NewSegmentAction(1, ActionTypeGrow, "test-ch", 100)
+	task, err := NewSegmentTask(
+		ctx,
+		time.Second,
+		nil,
+		1,
+		newReplicaDefaultRG(10),
+		action,
+	)
+	s.NoError(err)
+
+	collectionInfoResp := &milvuspb.DescribeCollectionResponse{
+		Schema: &schemapb.CollectionSchema{
+			Fields: []*schemapb.FieldSchema{
+				{
+					FieldID:      100,
+					DataType:     schemapb.DataType_Int64,
+					IsPrimaryKey: true,
+				},
 			},
-		}
-		req := packLoadSegmentRequest(segmentTask, segmentAction, nil, nil, &querypb.SegmentLoadInfo{}, resp)
-		assert.Equal(t, 1, len(req.GetDeltaPositions()))
-		assert.Equal(t, mockPChannel, req.DeltaPositions[0].ChannelName)
-		assert.Equal(t, t2, req.DeltaPositions[0].Timestamp)
-	})
+		},
+		Properties: []*commonpb.KeyValuePair{
+			{
+				Key:   common.MmapEnabledKey,
+				Value: "true",
+			},
+		},
+	}
 
-	t.Run("test set deltaPosition from segment startPosition", func(t *testing.T) {
-		segmentAction := NewSegmentAction(0, 0, "", 0)
-		segmentTask, err := NewSegmentTask(context.TODO(), 5*time.Second, 0, 0, 0, segmentAction)
-		assert.NoError(t, err)
+	req := packLoadSegmentRequest(
+		task,
+		action,
+		collectionInfoResp.GetSchema(),
+		collectionInfoResp.GetProperties(),
+		&querypb.LoadMetaInfo{
+			LoadType: querypb.LoadType_LoadCollection,
+		},
+		&querypb.SegmentLoadInfo{},
+		nil,
+	)
 
-		segInfo := proto.Clone(segmentInfo).(*datapb.SegmentInfo)
-		segInfo.DmlPosition = nil
-		resp := &datapb.GetSegmentInfoResponse{
-			Infos: []*datapb.SegmentInfo{segInfo},
-		}
-		req := packLoadSegmentRequest(segmentTask, segmentAction, nil, nil, &querypb.SegmentLoadInfo{}, resp)
-		assert.Equal(t, 1, len(req.GetDeltaPositions()))
-		assert.Equal(t, mockPChannel, req.DeltaPositions[0].ChannelName)
-		assert.Equal(t, t1, req.DeltaPositions[0].Timestamp)
-	})
+	s.True(req.GetNeedTransfer())
+	s.Equal(task.CollectionID(), req.CollectionID)
+	s.Equal(task.ReplicaID(), req.ReplicaID)
+	s.Equal(action.Node(), req.GetDstNodeID())
+	for _, field := range req.GetSchema().GetFields() {
+		mmapEnable, ok := common.IsMmapDataEnabled(field.GetTypeParams()...)
+		s.True(mmapEnable)
+		s.True(ok)
+	}
+}
 
-	t.Run("test tsLag > 10minutes", func(t *testing.T) {
-		segmentAction := NewSegmentAction(0, 0, "", 0)
-		segmentTask, err := NewSegmentTask(context.TODO(), 5*time.Second, 0, 0, 0, segmentAction)
-		assert.NoError(t, err)
-
-		segInfo := proto.Clone(segmentInfo).(*datapb.SegmentInfo)
-		segInfo.DmlPosition.Timestamp = t0
-		resp := &datapb.GetSegmentInfoResponse{
-			Infos: []*datapb.SegmentInfo{segInfo},
-		}
-		req := packLoadSegmentRequest(segmentTask, segmentAction, nil, nil, &querypb.SegmentLoadInfo{}, resp)
-		assert.Equal(t, 1, len(req.GetDeltaPositions()))
-		assert.Equal(t, mockPChannel, req.DeltaPositions[0].ChannelName)
-		assert.Equal(t, t0, req.DeltaPositions[0].Timestamp)
-	})
+func TestUtils(t *testing.T) {
+	suite.Run(t, new(UtilsSuite))
 }

@@ -23,15 +23,18 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus/internal/querynodev2/delegator"
-	"github.com/milvus-io/milvus/internal/querynodev2/segments"
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/metrics"
 	"github.com/milvus-io/milvus/pkg/mq/msgdispatcher"
+	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/util/metricsinfo"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/util/timerecord"
+	"github.com/milvus-io/milvus/pkg/util/tsoutil"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
-//Manager manage pipeline in querynode
+// Manager manage pipeline in querynode
 type Manager interface {
 	Num() int
 	Add(collectionID UniqueID, channel string) (Pipeline, error)
@@ -39,6 +42,7 @@ type Manager interface {
 	Remove(channels ...string)
 	Start(channels ...string) error
 	Close()
+	GetChannelStats(collectionID int64) []*metricsinfo.Channel
 }
 
 type manager struct {
@@ -46,47 +50,50 @@ type manager struct {
 	dataManager      *DataManager
 	delegators       *typeutil.ConcurrentMap[string, delegator.ShardDelegator]
 
-	tSafeManager TSafeManager
-	dispatcher   msgdispatcher.Client
-	mu           sync.Mutex
+	dispatcher msgdispatcher.Client
+	mu         sync.RWMutex
 }
 
 func (m *manager) Num() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return len(m.channel2Pipeline)
 }
 
-//Add pipeline for each channel of collection
+// Add pipeline for each channel of collection
 func (m *manager) Add(collectionID UniqueID, channel string) (Pipeline, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	log.Debug("start create pipeine",
+	log.Info("start create pipeine",
 		zap.Int64("collectionID", collectionID),
 		zap.String("channel", channel),
 	)
+	tr := timerecord.NewTimeRecorder("add dmChannel")
 	collection := m.dataManager.Collection.Get(collectionID)
 	if collection == nil {
-		return nil, segments.WrapCollectionNotFound(collectionID)
+		return nil, merr.WrapErrCollectionNotFound(collectionID)
 	}
 
 	if pipeline, ok := m.channel2Pipeline[channel]; ok {
 		return pipeline, nil
 	}
 
-	//get shard delegator for add growing in pipeline
+	// get shard delegator for add growing in pipeline
 	delegator, ok := m.delegators.Get(channel)
 	if !ok {
-		return nil, WrapErrShardDelegatorNotFound(channel)
+		return nil, merr.WrapErrChannelNotFound(channel, "delegator not found")
 	}
 
-	newPipeLine, err := NewPipeLine(collectionID, channel, m.dataManager, m.tSafeManager, m.dispatcher, delegator)
+	newPipeLine, err := NewPipeLine(collection, channel, m.dataManager, m.dispatcher, delegator)
 	if err != nil {
-		return nil, WrapErrNewPipelineFailed(err)
+		return nil, merr.WrapErrServiceUnavailable(err.Error(), "failed to create new pipeline")
 	}
 
 	m.channel2Pipeline[channel] = newPipeLine
 	metrics.QueryNodeNumFlowGraphs.WithLabelValues(fmt.Sprint(paramtable.GetNodeID())).Inc()
 	metrics.QueryNodeNumDmlChannels.WithLabelValues(fmt.Sprint(paramtable.GetNodeID())).Inc()
+	metrics.QueryNodeWatchDmlChannelLatency.WithLabelValues(fmt.Sprint(paramtable.GetNodeID())).Observe(float64(tr.ElapseSpan().Milliseconds()))
 	return newPipeLine, nil
 }
 
@@ -105,7 +112,7 @@ func (m *manager) Get(channel string) Pipeline {
 	return pipeline
 }
 
-//Remove pipeline from Manager by channel
+// Remove pipeline from Manager by channel
 func (m *manager) Remove(channels ...string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -115,22 +122,23 @@ func (m *manager) Remove(channels ...string) {
 			pipeline.Close()
 			delete(m.channel2Pipeline, channel)
 		} else {
-			log.Warn("pipeline to be removed doesn't existed", zap.Any("channel", channel))
+			log.Warn("pipeline to be removed doesn't existed", zap.String("channel", channel))
 		}
 	}
 	metrics.QueryNodeNumFlowGraphs.WithLabelValues(fmt.Sprint(paramtable.GetNodeID())).Dec()
 	metrics.QueryNodeNumDmlChannels.WithLabelValues(fmt.Sprint(paramtable.GetNodeID())).Dec()
 }
 
-//Start pipeline by channel
+// Start pipeline by channel
 func (m *manager) Start(channels ...string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	//check pipelie all exist before start
+	// check pipelie all exist before start
 	for _, channel := range channels {
 		if _, ok := m.channel2Pipeline[channel]; !ok {
-			return WrapErrStartPipeline(fmt.Sprintf("pipeline with channel %s not exist", channel))
+			reason := fmt.Sprintf("pipeline with channel %s not exist", channel)
+			return merr.WrapErrServiceUnavailable(reason, "pipine start failed")
 		}
 	}
 
@@ -140,7 +148,7 @@ func (m *manager) Start(channels ...string) error {
 	return nil
 }
 
-//Close all pipeline of Manager
+// Close all pipeline of Manager
 func (m *manager) Close() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -149,8 +157,31 @@ func (m *manager) Close() {
 	}
 }
 
+func (m *manager) GetChannelStats(collectionID int64) []*metricsinfo.Channel {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	ret := make([]*metricsinfo.Channel, 0, len(m.channel2Pipeline))
+	for ch, p := range m.channel2Pipeline {
+		if collectionID > 0 && p.GetCollectionID() != collectionID {
+			continue
+		}
+		delegator, ok := m.delegators.Get(ch)
+		if ok {
+			tt := delegator.GetTSafe()
+			ret = append(ret, &metricsinfo.Channel{
+				Name:           ch,
+				WatchState:     p.Status(),
+				LatestTimeTick: tsoutil.PhysicalTimeFormat(tt),
+				NodeID:         paramtable.GetNodeID(),
+				CollectionID:   p.GetCollectionID(),
+			})
+		}
+	}
+	return ret
+}
+
 func NewManager(dataManager *DataManager,
-	tSafeManager TSafeManager,
 	dispatcher msgdispatcher.Client,
 	delegators *typeutil.ConcurrentMap[string, delegator.ShardDelegator],
 ) Manager {
@@ -158,8 +189,6 @@ func NewManager(dataManager *DataManager,
 		channel2Pipeline: make(map[string]Pipeline),
 		dataManager:      dataManager,
 		delegators:       delegators,
-		tSafeManager:     tSafeManager,
 		dispatcher:       dispatcher,
-		mu:               sync.Mutex{},
 	}
 }

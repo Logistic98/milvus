@@ -18,15 +18,17 @@ package components
 
 import (
 	"context"
+	"time"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-	"github.com/milvus-io/milvus/internal/util/dependency"
+	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/util/typeutil"
-
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	grpcquerycoord "github.com/milvus-io/milvus/internal/distributed/querycoord"
+	"github.com/milvus-io/milvus/internal/util/dependency"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 // QueryCoord implements QueryCoord grpc server
@@ -39,7 +41,7 @@ type QueryCoord struct {
 func NewQueryCoord(ctx context.Context, factory dependency.Factory) (*QueryCoord, error) {
 	svr, err := grpcquerycoord.NewServer(ctx, factory)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 
 	return &QueryCoord{
@@ -48,21 +50,24 @@ func NewQueryCoord(ctx context.Context, factory dependency.Factory) (*QueryCoord
 	}, nil
 }
 
+func (qs *QueryCoord) Prepare() error {
+	return qs.svr.Prepare()
+}
+
 // Run starts service
 func (qs *QueryCoord) Run() error {
 	if err := qs.svr.Run(); err != nil {
-		panic(err)
+		log.Ctx(qs.ctx).Error("QueryCoord starts error", zap.Error(err))
+		return err
 	}
-	log.Debug("QueryCoord successfully started")
+	log.Ctx(qs.ctx).Info("QueryCoord successfully started")
 	return nil
 }
 
 // Stop terminates service
 func (qs *QueryCoord) Stop() error {
-	if err := qs.svr.Stop(); err != nil {
-		return err
-	}
-	return nil
+	timeout := paramtable.Get().QueryCoordCfg.GracefulStopTimeout.GetAsDuration(time.Second)
+	return exitWhenStopTimeout(qs.svr.Stop, timeout)
 }
 
 // GetComponentStates returns QueryCoord's states

@@ -22,20 +22,16 @@
 extern "C" {
 #endif
 
+// WARNING: do not change the enum value of Growing and Sealed
 enum SegmentType {
     Invalid = 0,
     Growing = 1,
     Sealed = 2,
     Indexing = 3,
+    ChunkedSealed = 4,
 };
 
 typedef enum SegmentType SegmentType;
-
-enum ErrorCode {
-    Success = 0,
-    UnexpectedError = 1,
-    IllegalArgument = 5,
-};
 
 // pure C don't support that we use schemapb.DataType directly.
 // Note: the value of all enumerations must match the corresponding schemapb.DataType.
@@ -56,8 +52,14 @@ enum CDataType {
 
     BinaryVector = 100,
     FloatVector = 101,
+    Float16Vector = 102,
+    BFloat16Vector = 103,
+    SparseFloatVector = 104,
+    Int8Vector = 105,
 };
 typedef enum CDataType CDataType;
+
+typedef void* CSegmentInterface;
 
 typedef struct CStatus {
     int error_code;
@@ -68,16 +70,6 @@ typedef struct CProto {
     const void* proto_blob;
     int64_t proto_size;
 } CProto;
-
-typedef struct CLoadFieldDataInfo {
-    int64_t field_id;
-    const uint8_t* blob;
-    uint64_t blob_size;
-    int64_t row_count;
-    // Set null to disable mmap,
-    // mmap file path will be {mmap_dir_path}/{segment_id}/{field_id}
-    const char* mmap_dir_path;
-} CLoadFieldDataInfo;
 
 typedef struct CLoadDeletedRecordInfo {
     void* timestamps;
@@ -91,18 +83,36 @@ typedef struct CStorageConfig {
     const char* bucket_name;
     const char* access_key_id;
     const char* access_key_value;
-    const char* remote_root_path;
+    const char* root_path;
     const char* storage_type;
+    const char* cloud_provider;
     const char* iam_endpoint;
+    const char* log_level;
+    const char* region;
     bool useSSL;
+    const char* sslCACert;
     bool useIAM;
+    bool useVirtualHost;
+    int64_t requestTimeoutMs;
+    const char* gcp_credential_json;
 } CStorageConfig;
+
+typedef struct CMmapConfig {
+    const char* cache_read_ahead_policy;
+    const char* mmap_path;
+    uint64_t disk_limit;
+    uint64_t fix_file_size;
+    bool growing_enable_mmap;
+    bool scalar_index_enable_mmap;
+} CMmapConfig;
 
 typedef struct CTraceConfig {
     const char* exporter;
-    int sampleFraction;
+    float sampleFraction;
     const char* jaegerURL;
     const char* otlpEndpoint;
+    const char* otlpMethod;
+    bool oltpSecure;
 
     int nodeID;
 } CTraceConfig;
@@ -110,8 +120,14 @@ typedef struct CTraceConfig {
 typedef struct CTraceContext {
     const uint8_t* traceID;
     const uint8_t* spanID;
-    uint8_t flag;
+    uint8_t traceFlags;
 } CTraceContext;
+
+typedef struct CNewSegmentResult {
+    CStatus status;
+    CSegmentInterface segmentPtr;
+} CNewSegmentResult;
 #ifdef __cplusplus
 }
+
 #endif

@@ -1,8 +1,8 @@
 package segments
 
 import (
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/proto/segcorepb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/pkg/proto/segcorepb"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
@@ -61,6 +61,15 @@ func swapFieldData(field *schemapb.FieldData, i int, j int) {
 		case *schemapb.ScalarField_StringData:
 			data := sd.StringData.Data
 			data[i], data[j] = data[j], data[i]
+		case *schemapb.ScalarField_JsonData:
+			data := sd.JsonData.Data
+			data[i], data[j] = data[j], data[i]
+		case *schemapb.ScalarField_ArrayData:
+			data := sd.ArrayData.Data
+			data[i], data[j] = data[j], data[i]
+		default:
+			errMsg := "undefined data type " + field.Type.String()
+			panic(errMsg)
 		}
 	case *schemapb.FieldData_Vectors:
 		dim := int(field.GetVectors().GetDim())

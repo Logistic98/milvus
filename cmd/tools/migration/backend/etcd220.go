@@ -1,16 +1,14 @@
 package backend
 
 import (
+	"context"
 	"fmt"
 
-	"github.com/milvus-io/milvus/internal/metastore/kv/querycoord"
-
 	"github.com/milvus-io/milvus/cmd/tools/migration/configs"
-
-	"github.com/milvus-io/milvus/pkg/util"
-
 	"github.com/milvus-io/milvus/cmd/tools/migration/meta"
+	"github.com/milvus-io/milvus/internal/metastore/kv/querycoord"
 	"github.com/milvus-io/milvus/internal/metastore/kv/rootcoord"
+	"github.com/milvus-io/milvus/pkg/util"
 )
 
 // etcd220 implements Backend.
@@ -39,7 +37,7 @@ func printSaves(saves map[string]string) {
 
 func (b etcd220) save(saves map[string]string) error {
 	for k, v := range saves {
-		if err := b.txn.Save(k, v); err != nil {
+		if err := b.txn.Save(context.TODO(), k, v); err != nil {
 			return err
 		}
 	}

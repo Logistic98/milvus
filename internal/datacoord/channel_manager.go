@@ -22,875 +22,782 @@ import (
 	"sync"
 	"time"
 
-	v3rpc "go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
-	clientv3 "go.etcd.io/etcd/client/v3"
+	"github.com/cockroachdb/errors"
+	"github.com/samber/lo"
 	"go.uber.org/zap"
-	"stathat.com/c/consistent"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/kv"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus/internal/allocator"
+	"github.com/milvus-io/milvus/internal/util/streamingutil"
+	"github.com/milvus-io/milvus/pkg/kv"
 	"github.com/milvus-io/milvus/pkg/log"
-	"github.com/milvus-io/milvus/pkg/mq/msgstream"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/util/logutil"
+	"github.com/milvus-io/milvus/pkg/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/util/conc"
+	"github.com/milvus-io/milvus/pkg/util/lock"
+	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
-// ChannelManager manages the allocation and the balance between channels and data nodes.
-type ChannelManager struct {
-	ctx              context.Context
-	mu               sync.RWMutex
-	h                Handler
-	store            RWChannelStore
-	factory          ChannelPolicyFactory
-	registerPolicy   RegisterPolicy
-	deregisterPolicy DeregisterPolicy
-	assignPolicy     ChannelAssignPolicy
-	reassignPolicy   ChannelReassignPolicy
-	bgChecker        ChannelBGChecker
-	balancePolicy    BalanceChannelPolicy
-	msgstreamFactory msgstream.Factory
+type ChannelManager interface {
+	Startup(ctx context.Context, legacyNodes, allNodes []int64) error
+	Close()
 
-	stateChecker channelStateChecker
-	stopChecker  context.CancelFunc
-	stateTimer   *channelStateTimer
+	AddNode(nodeID UniqueID) error
+	DeleteNode(nodeID UniqueID) error
+	Watch(ctx context.Context, ch RWChannel) error
+	Release(nodeID UniqueID, channelName string) error
+
+	Match(nodeID UniqueID, channel string) bool
+	FindWatcher(channel string) (UniqueID, error)
+
+	GetChannel(nodeID int64, channel string) (RWChannel, bool)
+	GetNodeChannelsByCollectionID(collectionID int64) map[int64][]string
+	GetChannelsByCollectionID(collectionID int64) []RWChannel
+	GetChannelNamesByCollectionID(collectionID int64) []string
+
+	GetChannelWatchInfos() map[int64]map[string]*datapb.ChannelWatchInfo
+}
+
+// An interface sessionManager implments
+type SubCluster interface {
+	NotifyChannelOperation(ctx context.Context, nodeID int64, req *datapb.ChannelOperationsRequest) error
+	CheckChannelOperationProgress(ctx context.Context, nodeID int64, info *datapb.ChannelWatchInfo) (*datapb.ChannelOperationProgressResponse, error)
+}
+
+type ChannelManagerImpl struct {
+	cancel context.CancelFunc
+	mu     lock.RWMutex
+	wg     sync.WaitGroup
+
+	h          Handler
+	store      RWChannelStore
+	subCluster SubCluster // sessionManager
+	allocator  allocator.GlobalIDAllocatorInterface
+
+	factory       ChannelPolicyFactory
+	balancePolicy BalanceChannelPolicy
+	assignPolicy  AssignPolicy
+
+	balanceCheckLoop ChannelBGChecker
+
+	legacyNodes typeutil.UniqueSet
 
 	lastActiveTimestamp time.Time
 }
 
-type channel struct {
-	Name           string
-	CollectionID   UniqueID
-	StartPositions []*commonpb.KeyDataPair
-	Schema         *schemapb.CollectionSchema
+// ChannelBGChecker are goroutining running background
+type ChannelBGChecker func(ctx context.Context)
+
+// ChannelmanagerOpt is to set optional parameters in channel manager.
+type ChannelmanagerOpt func(c *ChannelManagerImpl)
+
+func withEmptyPolicyFactory() ChannelmanagerOpt {
+	return func(c *ChannelManagerImpl) { c.factory = NewEmptyChannelPolicyFactory() }
 }
 
-// String implement Stringer.
-func (ch *channel) String() string {
-	// schema maybe too large to print
-	return fmt.Sprintf("Name: %s, CollectionID: %d, StartPositions: %v", ch.Name, ch.CollectionID, ch.StartPositions)
+func withCheckerV2() ChannelmanagerOpt {
+	return func(c *ChannelManagerImpl) { c.balanceCheckLoop = c.CheckLoop }
 }
 
-// ChannelManagerOpt is to set optional parameters in channel manager.
-type ChannelManagerOpt func(c *ChannelManager)
-
-func withFactory(f ChannelPolicyFactory) ChannelManagerOpt {
-	return func(c *ChannelManager) { c.factory = f }
-}
-
-func defaultFactory(hash *consistent.Consistent) ChannelPolicyFactory {
-	return NewConsistentHashChannelPolicyFactory(hash)
-}
-
-func withMsgstreamFactory(f msgstream.Factory) ChannelManagerOpt {
-	return func(c *ChannelManager) { c.msgstreamFactory = f }
-}
-
-func withStateChecker() ChannelManagerOpt {
-	return func(c *ChannelManager) { c.stateChecker = c.watchChannelStatesLoop }
-}
-
-func withBgChecker() ChannelManagerOpt {
-	return func(c *ChannelManager) { c.bgChecker = c.bgCheckChannelsWork }
-}
-
-// NewChannelManager creates and returns a new ChannelManager instance.
 func NewChannelManager(
-	kv kv.MetaKv, // for TxnKv and MetaKv
+	kv kv.TxnKV,
 	h Handler,
-	options ...ChannelManagerOpt,
-) (*ChannelManager, error) {
-	c := &ChannelManager{
-		ctx:        context.TODO(),
+	subCluster SubCluster, // sessionManager
+	alloc allocator.GlobalIDAllocatorInterface,
+	options ...ChannelmanagerOpt,
+) (*ChannelManagerImpl, error) {
+	m := &ChannelManagerImpl{
 		h:          h,
-		factory:    NewChannelPolicyFactoryV1(kv),
-		store:      NewChannelStore(kv),
-		stateTimer: newChannelStateTimer(kv),
+		factory:    NewChannelPolicyFactoryV1(),
+		store:      NewChannelStoreV2(kv),
+		subCluster: subCluster,
+		allocator:  alloc,
 	}
 
-	if err := c.store.Reload(); err != nil {
+	if err := m.store.Reload(); err != nil {
 		return nil, err
 	}
 
 	for _, opt := range options {
-		opt(c)
+		opt(m)
 	}
 
-	c.registerPolicy = c.factory.NewRegisterPolicy()
-	c.deregisterPolicy = c.factory.NewDeregisterPolicy()
-	c.assignPolicy = c.factory.NewAssignPolicy()
-	c.reassignPolicy = c.factory.NewReassignPolicy()
-	c.balancePolicy = c.factory.NewBalancePolicy()
-	c.lastActiveTimestamp = time.Now()
-	return c, nil
+	m.balancePolicy = m.factory.NewBalancePolicy()
+	m.assignPolicy = m.factory.NewAssignPolicy()
+	m.lastActiveTimestamp = time.Now()
+	return m, nil
 }
 
-// Startup adjusts the channel store according to current cluster states.
-func (c *ChannelManager) Startup(ctx context.Context, nodes []int64) error {
-	c.ctx = ctx
-	channels := c.store.GetNodesChannels()
-	// Retrieve the current old nodes.
-	oNodes := make([]int64, 0, len(channels))
-	for _, c := range channels {
-		oNodes = append(oNodes, c.NodeID)
-	}
+func (m *ChannelManagerImpl) Startup(ctx context.Context, legacyNodes, allNodes []int64) error {
+	ctx, m.cancel = context.WithCancel(ctx)
 
-	// Process watch states for old nodes.
-	oldOnLines := c.getOldOnlines(nodes, oNodes)
-	if err := c.checkOldNodes(oldOnLines); err != nil {
-		return err
-	}
+	m.legacyNodes = typeutil.NewUniqueSet(legacyNodes...)
 
+	m.mu.Lock()
+	m.store.SetLegacyChannelByNode(legacyNodes...)
+	oNodes := m.store.GetNodes()
+	m.mu.Unlock()
+
+	offLines, newOnLines := lo.Difference(oNodes, allNodes)
+	// Delete offlines from the cluster
+	for _, nodeID := range offLines {
+		if err := m.DeleteNode(nodeID); err != nil {
+			return err
+		}
+	}
 	// Add new online nodes to the cluster.
-	newOnLines := c.getNewOnLines(nodes, oNodes)
-	for _, n := range newOnLines {
-		if err := c.AddNode(n); err != nil {
+	for _, nodeID := range newOnLines {
+		if err := m.AddNode(nodeID); err != nil {
 			return err
 		}
 	}
 
-	// Remove new offline nodes from the cluster.
-	offLines := c.getOffLines(nodes, oNodes)
-	for _, n := range offLines {
-		if err := c.DeleteNode(n); err != nil {
-			return err
-		}
+	m.mu.Lock()
+	nodeChannels := m.store.GetNodeChannelsBy(
+		WithAllNodes(),
+		func(ch *StateChannel) bool {
+			return m.h.CheckShouldDropChannel(ch.GetName())
+		})
+	m.mu.Unlock()
+
+	for _, info := range nodeChannels {
+		m.finishRemoveChannel(info.NodeID, lo.Values(info.Channels)...)
 	}
 
-	// Unwatch and drop channel with drop flag.
-	c.unwatchDroppedChannels()
-
-	checkerContext, cancel := context.WithCancel(ctx)
-	c.stopChecker = cancel
-	if c.stateChecker != nil {
-		// TODO get revision from reload logic
-		go c.stateChecker(checkerContext, common.LatestRevision)
-		log.Info("starting etcd states checker")
+	if m.balanceCheckLoop != nil {
+		log.Ctx(ctx).Info("starting channel balance loop")
+		m.wg.Add(1)
+		go func() {
+			defer m.wg.Done()
+			m.balanceCheckLoop(ctx)
+		}()
 	}
 
-	if c.bgChecker != nil {
-		go c.bgChecker(checkerContext)
-		log.Info("starting background balance checker")
-	}
-
-	log.Info("cluster start up",
-		zap.Int64s("nodes", nodes),
-		zap.Int64s("oNodes", oNodes),
-		zap.Int64s("old onlines", oldOnLines),
-		zap.Int64s("new onlines", newOnLines),
+	log.Ctx(ctx).Info("cluster start up",
+		zap.Int64s("allNodes", allNodes),
+		zap.Int64s("legacyNodes", legacyNodes),
+		zap.Int64s("oldNodes", oNodes),
+		zap.Int64s("newOnlines", newOnLines),
 		zap.Int64s("offLines", offLines))
 	return nil
 }
 
-// Close notifies the running checker.
-func (c *ChannelManager) Close() {
-	if c.stopChecker != nil {
-		c.stopChecker()
+func (m *ChannelManagerImpl) Close() {
+	if m.cancel != nil {
+		m.cancel()
+		m.wg.Wait()
 	}
 }
 
-// checkOldNodes processes the existing watch channels when starting up.
-// ToWatch         get startTs and timeoutTs, start timer
-// WatchSuccess    ignore
-// WatchFail       ToRelease
-// ToRelase        get startTs and timeoutTs, start timer
-// ReleaseSuccess  remove
-// ReleaseFail     clean up and remove
-func (c *ChannelManager) checkOldNodes(nodes []UniqueID) error {
-	// Load all the watch infos before processing
-	nodeWatchInfos := make(map[UniqueID][]*datapb.ChannelWatchInfo)
-	for _, nodeID := range nodes {
-		watchInfos, err := c.stateTimer.loadAllChannels(nodeID)
-		if err != nil {
-			return err
-		}
-		nodeWatchInfos[nodeID] = watchInfos
+func (m *ChannelManagerImpl) AddNode(nodeID UniqueID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	log.Info("register node", zap.Int64("registered node", nodeID))
+
+	m.store.AddNode(nodeID)
+	updates := m.assignPolicy(m.store.GetNodesChannels(), m.store.GetBufferChannelInfo(), m.legacyNodes.Collect())
+
+	if updates == nil {
+		log.Info("register node with no reassignment", zap.Int64("registered node", nodeID))
+		return nil
 	}
 
-	for nodeID, watchInfos := range nodeWatchInfos {
-		for _, info := range watchInfos {
-			channelName := info.GetVchan().GetChannelName()
-			checkInterval := Params.DataCoordCfg.WatchTimeoutInterval.GetAsDuration(time.Second)
+	err := m.execute(updates)
+	if err != nil {
+		log.Warn("fail to update channel operation updates into meta", zap.Error(err))
+	}
+	return err
+}
 
-			log.Info("processing watch info",
-				zap.String("watch state", info.GetState().String()),
-				zap.String("channel name", channelName))
+// Release writes ToRelease channel watch states for a channel
+func (m *ChannelManagerImpl) Release(nodeID UniqueID, channelName string) error {
+	log := log.With(
+		zap.Int64("nodeID", nodeID),
+		zap.String("channel", channelName),
+	)
 
-			switch info.GetState() {
-			case datapb.ChannelWatchState_ToWatch, datapb.ChannelWatchState_Uncomplete:
-				c.stateTimer.startOne(datapb.ChannelWatchState_ToWatch, channelName, nodeID, checkInterval)
+	// channel in bufferID are released already
+	if nodeID == bufferID {
+		return nil
+	}
 
-			case datapb.ChannelWatchState_WatchFailure:
-				if err := c.Release(nodeID, channelName); err != nil {
-					return err
-				}
+	log.Info("Releasing channel from watched node")
+	ch, found := m.GetChannel(nodeID, channelName)
+	if !found {
+		return fmt.Errorf("fail to find matching nodeID: %d with channelName: %s", nodeID, channelName)
+	}
 
-			case datapb.ChannelWatchState_ToRelease:
-				c.stateTimer.startOne(datapb.ChannelWatchState_ToRelease, channelName, nodeID, checkInterval)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	updates := NewChannelOpSet(NewChannelOp(nodeID, Release, ch))
+	return m.execute(updates)
+}
 
-			case datapb.ChannelWatchState_ReleaseSuccess:
-				if err := c.Reassign(nodeID, channelName); err != nil {
-					return err
-				}
+func (m *ChannelManagerImpl) Watch(ctx context.Context, ch RWChannel) error {
+	log := log.Ctx(ctx).With(zap.String("channel", ch.GetName()))
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-			case datapb.ChannelWatchState_ReleaseFailure:
-				if err := c.CleanupAndReassign(nodeID, channelName); err != nil {
-					return err
-				}
-			}
+	log.Info("Add channel")
+	updates := NewChannelOpSet(NewChannelOp(bufferID, Watch, ch))
+	// TODO fill in traceID to channelOp's watchInfo
+	err := m.execute(updates)
+	if err != nil {
+		log.Warn("fail to update new channel updates into meta",
+			zap.Array("updates", updates), zap.Error(err))
+	}
+
+	// channel already written into meta, try to assign it to the cluster
+	// not error is returned if failed, the assignment will retry later
+	updates = m.assignPolicy(m.store.GetNodesChannels(), m.store.GetBufferChannelInfo(), m.legacyNodes.Collect())
+	if updates == nil {
+		return nil
+	}
+
+	// TODO fill in traceID to channelOp's watchInfo
+	if err := m.execute(updates); err != nil {
+		log.Warn("fail to assign channel, will retry later", zap.Array("updates", updates), zap.Error(err))
+		return nil
+	}
+
+	log.Info("Assign channel", zap.Array("updates", updates))
+	return nil
+}
+
+func (m *ChannelManagerImpl) DeleteNode(nodeID UniqueID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.legacyNodes.Remove(nodeID)
+	info := m.store.GetNode(nodeID)
+	if info == nil || len(info.Channels) == 0 {
+		if nodeID != bufferID {
+			m.store.RemoveNode(nodeID)
 		}
+		return nil
+	}
+
+	updates := NewChannelOpSet(
+		NewChannelOp(info.NodeID, Delete, lo.Values(info.Channels)...),
+		NewChannelOp(bufferID, Watch, lo.Values(info.Channels)...),
+	)
+	log.Info("deregister node", zap.Int64("nodeID", nodeID), zap.Array("updates", updates))
+
+	err := m.execute(updates)
+	if err != nil {
+		log.Warn("fail to update channel operation updates into meta", zap.Error(err))
+		return err
+	}
+
+	if nodeID != bufferID {
+		m.store.RemoveNode(nodeID)
 	}
 	return nil
 }
 
-// unwatchDroppedChannels removes drops channel that are marked to drop.
-func (c *ChannelManager) unwatchDroppedChannels() {
-	nodeChannels := c.store.GetChannels()
-	for _, nodeChannel := range nodeChannels {
-		for _, ch := range nodeChannel.Channels {
-			if !c.h.CheckShouldDropChannel(ch.Name, ch.CollectionID) {
-				continue
-			}
-			err := c.remove(nodeChannel.NodeID, ch)
-			if err != nil {
-				log.Warn("unable to remove channel", zap.String("channel", ch.Name), zap.Error(err))
-				continue
-			}
-			err = c.h.FinishDropChannel(ch.Name)
-			if err != nil {
-				log.Warn("FinishDropChannel failed when unwatchDroppedChannels", zap.String("channel", ch.Name), zap.Error(err))
-			}
-		}
+// reassign reassigns a channel to another DataNode.
+func (m *ChannelManagerImpl) reassign(original *NodeChannelInfo) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	updates := m.assignPolicy(m.store.GetNodesChannels(), original, m.legacyNodes.Collect())
+	if updates != nil {
+		return m.execute(updates)
+	}
+
+	if original.NodeID != bufferID {
+		log.RatedWarn(5.0, "Failed to reassign channel to other nodes, assign to the original nodes",
+			zap.Any("original node", original.NodeID),
+			zap.Strings("channels", lo.Keys(original.Channels)),
+		)
+		updates := NewChannelOpSet(NewChannelOp(original.NodeID, Watch, lo.Values(original.Channels)...))
+		return m.execute(updates)
+	}
+
+	return nil
+}
+
+func (m *ChannelManagerImpl) Balance() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	watchedCluster := m.store.GetNodeChannelsBy(WithoutBufferNode(), WithChannelStates(Watched))
+	updates := m.balancePolicy(watchedCluster)
+	if updates == nil {
+		return
+	}
+
+	log.Info("Channel balancer got new reAllocations:", zap.Array("assignment", updates))
+	if err := m.execute(updates); err != nil {
+		log.Warn("Channel balancer fail to execute", zap.Array("assignment", updates), zap.Error(err))
 	}
 }
 
-func (c *ChannelManager) bgCheckChannelsWork(ctx context.Context) {
-	ticker := time.NewTicker(Params.DataCoordCfg.ChannelBalanceInterval.GetAsDuration(time.Second))
-	defer ticker.Stop()
+func (m *ChannelManagerImpl) Match(nodeID UniqueID, channel string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if streamingutil.IsStreamingServiceEnabled() {
+		// Skip the channel matching check since the
+		// channel manager no longer manages channels in streaming mode.
+		// Only check if the channel exists.
+		return m.store.HasChannel(channel)
+	}
+	info := m.store.GetNode(nodeID)
+	if info == nil {
+		return false
+	}
+	_, ok := info.Channels[channel]
+	return ok
+}
+
+func (m *ChannelManagerImpl) GetChannel(nodeID int64, channelName string) (RWChannel, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if nodeChannelInfo := m.store.GetNode(nodeID); nodeChannelInfo != nil {
+		if ch, ok := nodeChannelInfo.Channels[channelName]; ok {
+			return ch, true
+		}
+	}
+	return nil, false
+}
+
+func (m *ChannelManagerImpl) GetNodeChannelsByCollectionID(collectionID int64) map[int64][]string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.store.GetNodeChannelsByCollectionID(collectionID)
+}
+
+func (m *ChannelManagerImpl) GetChannelsByCollectionID(collectionID int64) []RWChannel {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	channels := []RWChannel{}
+
+	nodeChannels := m.store.GetNodeChannelsBy(
+		WithAllNodes(),
+		WithCollectionIDV2(collectionID))
+	lo.ForEach(nodeChannels, func(info *NodeChannelInfo, _ int) {
+		channels = append(channels, lo.Values(info.Channels)...)
+	})
+	return channels
+}
+
+func (m *ChannelManagerImpl) GetChannelNamesByCollectionID(collectionID int64) []string {
+	channels := m.GetChannelsByCollectionID(collectionID)
+	return lo.Map(channels, func(ch RWChannel, _ int) string {
+		return ch.GetName()
+	})
+}
+
+func (m *ChannelManagerImpl) FindWatcher(channel string) (UniqueID, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	infos := m.store.GetNodesChannels()
+	for _, info := range infos {
+		_, ok := info.Channels[channel]
+		if ok {
+			return info.NodeID, nil
+		}
+	}
+
+	// channel in buffer
+	bufferInfo := m.store.GetBufferChannelInfo()
+	_, ok := bufferInfo.Channels[channel]
+	if ok {
+		return bufferID, errChannelInBuffer
+	}
+
+	return 0, errChannelNotWatched
+}
+
+// unsafe innter func
+func (m *ChannelManagerImpl) removeChannel(nodeID int64, ch RWChannel) error {
+	op := NewChannelOpSet(NewChannelOp(nodeID, Delete, ch))
+	log.Info("remove channel assignment",
+		zap.Int64("nodeID", nodeID),
+		zap.String("channel", ch.GetName()),
+		zap.Int64("assignment", nodeID),
+		zap.Int64("collectionID", ch.GetCollectionID()))
+	return m.store.Update(op)
+}
+
+func (m *ChannelManagerImpl) CheckLoop(ctx context.Context) {
+	balanceTicker := time.NewTicker(Params.DataCoordCfg.ChannelBalanceInterval.GetAsDuration(time.Second))
+	defer balanceTicker.Stop()
+	checkTicker := time.NewTicker(Params.DataCoordCfg.ChannelCheckInterval.GetAsDuration(time.Second))
+	defer checkTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			log.Info("background checking channels loop quit")
 			return
-		case <-ticker.C:
-			c.mu.Lock()
-			if !c.isSilent() {
-				log.Info("ChannelManager is not silent, skip channel balance this round")
-			} else {
-				toReleases := c.balancePolicy(c.store, time.Now())
-				log.Info("channel manager bg check balance", zap.Array("toReleases", toReleases))
-				if err := c.updateWithTimer(toReleases, datapb.ChannelWatchState_ToRelease); err != nil {
-					log.Warn("channel store update error", zap.Error(err))
-				}
+		case <-balanceTicker.C:
+			// balance
+			if time.Since(m.lastActiveTimestamp) >= Params.DataCoordCfg.ChannelBalanceSilentDuration.GetAsDuration(time.Second) {
+				m.Balance()
 			}
-			c.mu.Unlock()
+		case <-checkTicker.C:
+			m.AdvanceChannelState(ctx)
 		}
 	}
 }
 
-// getOldOnlines returns a list of old online node ids in `old` and in `curr`.
-func (c *ChannelManager) getOldOnlines(curr []int64, old []int64) []int64 {
-	mcurr := make(map[int64]struct{})
-	ret := make([]int64, 0, len(old))
-	for _, n := range curr {
-		mcurr[n] = struct{}{}
+func (m *ChannelManagerImpl) AdvanceChannelState(ctx context.Context) {
+	m.mu.RLock()
+	standbys := m.store.GetNodeChannelsBy(WithAllNodes(), WithChannelStates(Standby))
+	toNotifies := m.store.GetNodeChannelsBy(WithoutBufferNode(), WithChannelStates(ToWatch, ToRelease))
+	toChecks := m.store.GetNodeChannelsBy(WithoutBufferNode(), WithChannelStates(Watching, Releasing))
+	m.mu.RUnlock()
+
+	// Processing standby channels
+	updatedStandbys := false
+	updatedStandbys = m.advanceStandbys(ctx, standbys)
+	updatedToCheckes := m.advanceToChecks(ctx, toChecks)
+	updatedToNotifies := m.advanceToNotifies(ctx, toNotifies)
+
+	if updatedStandbys || updatedToCheckes || updatedToNotifies {
+		m.lastActiveTimestamp = time.Now()
 	}
-	for _, n := range old {
-		if _, found := mcurr[n]; found {
-			ret = append(ret, n)
-		}
-	}
-	return ret
 }
 
-// getNewOnLines returns a list of new online node ids in `curr` but not in `old`.
-func (c *ChannelManager) getNewOnLines(curr []int64, old []int64) []int64 {
-	mold := make(map[int64]struct{})
-	ret := make([]int64, 0, len(curr))
-	for _, n := range old {
-		mold[n] = struct{}{}
-	}
-	for _, n := range curr {
-		if _, found := mold[n]; !found {
-			ret = append(ret, n)
-		}
-	}
-	return ret
-}
-
-// getOffLines returns a list of new offline node ids in `old` but not in `curr`.
-func (c *ChannelManager) getOffLines(curr []int64, old []int64) []int64 {
-	mcurr := make(map[int64]struct{})
-	ret := make([]int64, 0, len(old))
-	for _, n := range curr {
-		mcurr[n] = struct{}{}
-	}
-	for _, n := range old {
-		if _, found := mcurr[n]; !found {
-			ret = append(ret, n)
-		}
-	}
-	return ret
-}
-
-// AddNode adds a new node to cluster and reassigns the node - channel mapping.
-func (c *ChannelManager) AddNode(nodeID int64) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.store.Add(nodeID)
-
-	updates := c.registerPolicy(c.store, nodeID)
-	if len(updates) <= 0 {
-		log.Info("register node with no reassignment", zap.Int64("registered node", nodeID))
-		return nil
-	}
-
-	log.Info("register node",
-		zap.Int64("registered node", nodeID),
-		zap.Array("updates", updates))
-
-	state := datapb.ChannelWatchState_ToRelease
-
-	for _, u := range updates {
-		if u.Type == Delete && u.NodeID == bufferID {
-			state = datapb.ChannelWatchState_ToWatch
-			break
-		}
-	}
-
-	return c.updateWithTimer(updates, state)
-}
-
-// DeleteNode deletes the node from the cluster.
-// DeleteNode deletes the nodeID's watchInfos in Etcd and reassign the channels to other Nodes
-func (c *ChannelManager) DeleteNode(nodeID int64) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	nodeChannelInfo := c.store.GetNode(nodeID)
-	if nodeChannelInfo == nil {
-		return nil
-	}
-
-	c.unsubAttempt(nodeChannelInfo)
-
-	updates := c.deregisterPolicy(c.store, nodeID)
-	log.Warn("deregister node",
-		zap.Int64("unregistered node", nodeID),
-		zap.Array("updates", updates))
-	if len(updates) <= 0 {
-		return nil
-	}
-
-	var channels []*channel
-	for _, op := range updates {
-		if op.Type == Delete {
-			channels = op.Channels
-		}
-	}
-
-	chNames := make([]string, 0, len(channels))
+func (m *ChannelManagerImpl) finishRemoveChannel(nodeID int64, channels ...RWChannel) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for _, ch := range channels {
-		chNames = append(chNames, ch.Name)
-	}
-	log.Info("remove timers for channel of the deregistered node",
-		zap.Any("channels", chNames), zap.Int64("nodeID", nodeID))
-	c.stateTimer.removeTimers(chNames)
+		if err := m.removeChannel(nodeID, ch); err != nil {
+			log.Warn("Failed to remove channel", zap.Any("channel", ch), zap.Error(err))
+			continue
+		}
 
-	if err := c.updateWithTimer(updates, datapb.ChannelWatchState_ToWatch); err != nil {
+		if err := m.h.FinishDropChannel(ch.GetName(), ch.GetCollectionID()); err != nil {
+			log.Warn("Failed to finish drop channel", zap.Any("channel", ch), zap.Error(err))
+			continue
+		}
+	}
+}
+
+func (m *ChannelManagerImpl) advanceStandbys(ctx context.Context, standbys []*NodeChannelInfo) bool {
+	var advanced bool = false
+	for _, nodeAssign := range standbys {
+		validChannels := make(map[string]RWChannel)
+		for chName, ch := range nodeAssign.Channels {
+			// drop marked-drop channels
+			if m.h.CheckShouldDropChannel(chName) {
+				m.finishRemoveChannel(nodeAssign.NodeID, ch)
+				continue
+			}
+			validChannels[chName] = ch
+		}
+		// If streaming service is enabled, the channel manager no longer manages channels.
+		// So the standby channels shouldn't be processed by channel manager,
+		// but the remove channel operation should be executed.
+		// TODO: ChannelManager can be removed in future at 3.0.0.
+		if streamingutil.IsStreamingServiceEnabled() {
+			continue
+		}
+
+		nodeAssign.Channels = validChannels
+		if len(nodeAssign.Channels) == 0 {
+			continue
+		}
+
+		chNames := lo.Keys(validChannels)
+		if err := m.reassign(nodeAssign); err != nil {
+			log.Ctx(ctx).Warn("Reassign channels fail",
+				zap.Int64("nodeID", nodeAssign.NodeID),
+				zap.Strings("channels", chNames),
+				zap.Error(err),
+			)
+			continue
+		}
+
+		log.Ctx(ctx).Info("Reassign standby channels to node",
+			zap.Int64("nodeID", nodeAssign.NodeID),
+			zap.Strings("channels", chNames),
+		)
+		advanced = true
+	}
+
+	return advanced
+}
+
+func (m *ChannelManagerImpl) advanceToNotifies(ctx context.Context, toNotifies []*NodeChannelInfo) bool {
+	var advanced bool = false
+	for _, nodeAssign := range toNotifies {
+		channelCount := len(nodeAssign.Channels)
+		if channelCount == 0 {
+			continue
+		}
+		nodeID := nodeAssign.NodeID
+
+		var (
+			succeededChannels = 0
+			failedChannels    = 0
+			futures           = make([]*conc.Future[any], 0, channelCount)
+		)
+
+		chNames := lo.Keys(nodeAssign.Channels)
+		log.Ctx(ctx).Info("Notify channel operations to datanode",
+			zap.Int64("assignment", nodeAssign.NodeID),
+			zap.Int("total operation count", len(nodeAssign.Channels)),
+			zap.Strings("channel names", chNames),
+		)
+		for _, ch := range nodeAssign.Channels {
+			innerCh := ch
+			tmpWatchInfo := typeutil.Clone(innerCh.GetWatchInfo())
+			tmpWatchInfo.Vchan = m.h.GetDataVChanPositions(innerCh, allPartitionID)
+
+			future := getOrCreateIOPool().Submit(func() (any, error) {
+				err := m.Notify(ctx, nodeID, tmpWatchInfo)
+				return poolResult{
+					ch:   innerCh,
+					opID: tmpWatchInfo.GetOpID(),
+				}, err
+			})
+			futures = append(futures, future)
+		}
+
+		for _, f := range futures {
+			got, err := f.Await()
+			res := got.(poolResult)
+
+			if err != nil {
+				log.Ctx(ctx).Warn("Failed to notify channel operations to datanode",
+					zap.Int64("assignment", nodeAssign.NodeID),
+					zap.Int("operation count", channelCount),
+					zap.String("channel name", res.ch.GetName()),
+					zap.Error(err),
+				)
+				failedChannels++
+			} else {
+				succeededChannels++
+				advanced = true
+			}
+
+			m.mu.Lock()
+			m.store.UpdateState(err == nil, nodeID, res.ch, res.opID)
+			m.mu.Unlock()
+		}
+
+		log.Ctx(ctx).Info("Finish to notify channel operations to datanode",
+			zap.Int64("assignment", nodeAssign.NodeID),
+			zap.Int("operation count", channelCount),
+			zap.Int("success count", succeededChannels),
+			zap.Int("failure count", failedChannels),
+		)
+	}
+
+	return advanced
+}
+
+type poolResult struct {
+	successful bool
+	ch         RWChannel
+	opID       int64
+}
+
+func (m *ChannelManagerImpl) advanceToChecks(ctx context.Context, toChecks []*NodeChannelInfo) bool {
+	var advanced bool = false
+	for _, nodeAssign := range toChecks {
+		if len(nodeAssign.Channels) == 0 {
+			continue
+		}
+
+		nodeID := nodeAssign.NodeID
+		futures := make([]*conc.Future[any], 0, len(nodeAssign.Channels))
+
+		chNames := lo.Keys(nodeAssign.Channels)
+		log.Ctx(ctx).Info("Check ToWatch/ToRelease channel operations progress",
+			zap.Int("channel count", len(nodeAssign.Channels)),
+			zap.Strings("channel names", chNames),
+		)
+
+		for _, ch := range nodeAssign.Channels {
+			innerCh := ch
+			tmpWatchInfo := typeutil.Clone(innerCh.GetWatchInfo())
+
+			future := getOrCreateIOPool().Submit(func() (any, error) {
+				successful, got := m.Check(ctx, nodeID, tmpWatchInfo)
+				if got {
+					return poolResult{
+						successful: successful,
+						ch:         innerCh,
+						opID:       tmpWatchInfo.GetOpID(),
+					}, nil
+				}
+				return nil, errors.New("Got results with no progress")
+			})
+			futures = append(futures, future)
+		}
+
+		for _, f := range futures {
+			got, err := f.Await()
+			if err == nil {
+				m.mu.Lock()
+				result := got.(poolResult)
+				m.store.UpdateState(result.successful, nodeID, result.ch, result.opID)
+				m.mu.Unlock()
+
+				advanced = true
+			}
+		}
+
+		log.Ctx(ctx).Info("Finish to Check ToWatch/ToRelease channel operations progress",
+			zap.Int("channel count", len(nodeAssign.Channels)),
+			zap.Strings("channel names", chNames),
+		)
+	}
+	return advanced
+}
+
+func (m *ChannelManagerImpl) Notify(ctx context.Context, nodeID int64, info *datapb.ChannelWatchInfo) error {
+	log := log.Ctx(ctx).With(
+		zap.String("channel", info.GetVchan().GetChannelName()),
+		zap.Int64("assignment", nodeID),
+		zap.String("operation", info.GetState().String()),
+		zap.Int64("opID", info.GetOpID()),
+	)
+	log.Info("Notify channel operation")
+	err := m.subCluster.NotifyChannelOperation(ctx, nodeID, &datapb.ChannelOperationsRequest{Infos: []*datapb.ChannelWatchInfo{info}})
+	if err != nil {
+		log.Warn("Fail to notify channel operations", zap.Error(err))
 		return err
 	}
-
-	// No channels will be return
-	_, err := c.store.Delete(nodeID)
-	return err
+	log.Debug("Success to notify channel operations")
+	return nil
 }
 
-// unsubAttempt attempts to unsubscribe node-channel info from the channel.
-func (c *ChannelManager) unsubAttempt(ncInfo *NodeChannelInfo) {
-	if ncInfo == nil {
-		return
-	}
-
-	if c.msgstreamFactory == nil {
-		log.Warn("msgstream factory is not set")
-		return
-	}
-
-	nodeID := ncInfo.NodeID
-	for _, ch := range ncInfo.Channels {
-		// align to datanode subname, using vchannel name
-		subName := fmt.Sprintf("%s-%d-%s", Params.CommonCfg.DataNodeSubName.GetValue(), nodeID, ch.Name)
-		pchannelName := funcutil.ToPhysicalChannel(ch.Name)
-		msgstream.UnsubscribeChannels(c.ctx, c.msgstreamFactory, subName, []string{pchannelName})
-	}
-}
-
-// Watch tries to add the channel to cluster. Watch is a no op if the channel already exists.
-func (c *ChannelManager) Watch(ch *channel) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	updates := c.assignPolicy(c.store, []*channel{ch})
-	if len(updates) == 0 {
-		return nil
-	}
-	log.Info("try to update channel watch info with ToWatch state",
-		zap.String("channel", ch.String()),
-		zap.Array("updates", updates))
-
-	err := c.updateWithTimer(updates, datapb.ChannelWatchState_ToWatch)
+func (m *ChannelManagerImpl) Check(ctx context.Context, nodeID int64, info *datapb.ChannelWatchInfo) (successful bool, got bool) {
+	log := log.Ctx(ctx).With(
+		zap.Int64("opID", info.GetOpID()),
+		zap.Int64("nodeID", nodeID),
+		zap.String("check operation", info.GetState().String()),
+		zap.String("channel", info.GetVchan().GetChannelName()),
+	)
+	resp, err := m.subCluster.CheckChannelOperationProgress(ctx, nodeID, info)
 	if err != nil {
-		log.Warn("fail to update channel watch info with ToWatch state",
-			zap.Any("channel", ch), zap.Array("updates", updates), zap.Error(err))
+		log.Warn("Fail to check channel operation progress", zap.Error(err))
+		if errors.Is(err, merr.ErrNodeNotFound) {
+			return false, true
+		}
+		return false, false
 	}
-	return err
+	log.Info("Got channel operation progress",
+		zap.String("got state", resp.GetState().String()),
+		zap.Int32("progress", resp.GetProgress()))
+	switch info.GetState() {
+	case datapb.ChannelWatchState_ToWatch:
+		if resp.GetState() == datapb.ChannelWatchState_ToWatch {
+			return false, false
+		}
+		if resp.GetState() == datapb.ChannelWatchState_WatchSuccess {
+			return true, true
+		}
+		if resp.GetState() == datapb.ChannelWatchState_WatchFailure {
+			return false, true
+		}
+	case datapb.ChannelWatchState_ToRelease:
+		if resp.GetState() == datapb.ChannelWatchState_ToRelease {
+			return false, false
+		}
+		if resp.GetState() == datapb.ChannelWatchState_ReleaseSuccess {
+			return true, true
+		}
+		if resp.GetState() == datapb.ChannelWatchState_ReleaseFailure {
+			return false, true
+		}
+
+	}
+	return false, false
 }
 
-// fillChannelWatchInfo updates the channel op by filling in channel watch info.
-func (c *ChannelManager) fillChannelWatchInfo(op *ChannelOp) {
-	for _, ch := range op.Channels {
-		vcInfo := c.h.GetDataVChanPositions(ch, allPartitionID)
-		info := &datapb.ChannelWatchInfo{
-			Vchan:   vcInfo,
-			StartTs: time.Now().Unix(),
-			State:   datapb.ChannelWatchState_Uncomplete,
-			Schema:  ch.Schema,
+func (m *ChannelManagerImpl) execute(updates *ChannelOpSet) error {
+	for _, op := range updates.ops {
+		if op.Type != Delete {
+			if err := m.fillChannelWatchInfo(op); err != nil {
+				log.Warn("fail to fill channel watch info", zap.Error(err))
+				return err
+			}
 		}
-		op.ChannelWatchInfos = append(op.ChannelWatchInfos, info)
 	}
+
+	return m.store.Update(updates)
 }
 
 // fillChannelWatchInfoWithState updates the channel op by filling in channel watch info.
-func (c *ChannelManager) fillChannelWatchInfoWithState(op *ChannelOp, state datapb.ChannelWatchState) []string {
-	var channelsWithTimer = []string{}
+func (m *ChannelManagerImpl) fillChannelWatchInfo(op *ChannelOp) error {
 	startTs := time.Now().Unix()
-	checkInterval := Params.DataCoordCfg.WatchTimeoutInterval.GetAsDuration(time.Second)
 	for _, ch := range op.Channels {
-		vcInfo := c.h.GetDataVChanPositions(ch, allPartitionID)
-		info := &datapb.ChannelWatchInfo{
-			Vchan:   vcInfo,
-			StartTs: startTs,
-			State:   state,
-			Schema:  ch.Schema,
+		vcInfo := m.h.GetDataVChanPositions(ch, allPartitionID)
+		opID, err := m.allocator.AllocOne()
+		if err != nil {
+			return err
 		}
 
-		// Only set timer for watchInfo not from bufferID
-		if op.NodeID != bufferID {
-			c.stateTimer.startOne(state, ch.Name, op.NodeID, checkInterval)
-			channelsWithTimer = append(channelsWithTimer, ch.Name)
-		}
-
-		op.ChannelWatchInfos = append(op.ChannelWatchInfos, info)
-	}
-	return channelsWithTimer
-}
-
-// GetChannels gets channels info of registered nodes.
-func (c *ChannelManager) GetChannels() []*NodeChannelInfo {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	return c.store.GetNodesChannels()
-}
-
-// GetBufferChannels gets buffer channels.
-func (c *ChannelManager) GetBufferChannels() *NodeChannelInfo {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	return c.store.GetBufferChannelInfo()
-}
-
-// Match checks and returns whether the node ID and channel match.
-func (c *ChannelManager) Match(nodeID int64, channel string) bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	info := c.store.GetNode(nodeID)
-	if info == nil {
-		return false
-	}
-
-	for _, ch := range info.Channels {
-		if ch.Name == channel {
-			return true
-		}
-	}
-	return false
-}
-
-// FindWatcher finds the datanode watching the provided channel.
-func (c *ChannelManager) FindWatcher(channel string) (int64, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	infos := c.store.GetNodesChannels()
-	for _, info := range infos {
-		for _, channelInfo := range info.Channels {
-			if channelInfo.Name == channel {
-				return info.NodeID, nil
+		schema := ch.GetSchema()
+		if schema == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			collInfo, err := m.h.GetCollection(ctx, ch.GetCollectionID())
+			if err != nil {
+				cancel()
+				return err
 			}
+			cancel()
+			schema = collInfo.Schema
 		}
-	}
 
-	// channel in buffer
-	bufferInfo := c.store.GetBufferChannelInfo()
-	for _, channelInfo := range bufferInfo.Channels {
-		if channelInfo.Name == channel {
-			return bufferID, errChannelInBuffer
+		info := &datapb.ChannelWatchInfo{
+			Vchan:        reduceVChanSize(vcInfo),
+			StartTs:      startTs,
+			State:        inferStateByOpType(op.Type),
+			Schema:       schema,
+			OpID:         opID,
+			DbProperties: ch.GetDBProperties(),
 		}
-	}
-	return 0, errChannelNotWatched
-}
-
-// RemoveChannel removes the channel from channel manager.
-func (c *ChannelManager) RemoveChannel(channelName string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	nodeID, ch := c.findChannel(channelName)
-	if ch == nil {
-		return nil
-	}
-
-	return c.remove(nodeID, ch)
-}
-
-// remove deletes the nodeID-channel pair from data store.
-func (c *ChannelManager) remove(nodeID int64, ch *channel) error {
-	var op ChannelOpSet
-	op.Delete(nodeID, []*channel{ch})
-	log.Info("remove channel assignment",
-		zap.Int64("nodeID to be removed", nodeID),
-		zap.String("channelID", ch.Name),
-		zap.Int64("collectionID", ch.CollectionID))
-	if err := c.store.Update(op); err != nil {
-		return err
+		ch.UpdateWatchInfo(info)
 	}
 	return nil
 }
 
-func (c *ChannelManager) findChannel(channelName string) (int64, *channel) {
-	infos := c.store.GetNodesChannels()
-	for _, info := range infos {
-		for _, channelInfo := range info.Channels {
-			if channelInfo.Name == channelName {
-				return info.NodeID, channelInfo
+func (m *ChannelManagerImpl) GetChannelWatchInfos() map[int64]map[string]*datapb.ChannelWatchInfo {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	infos := make(map[int64]map[string]*datapb.ChannelWatchInfo)
+	for _, nc := range m.store.GetNodesChannels() {
+		for _, ch := range nc.Channels {
+			watchInfo := proto.Clone(ch.GetWatchInfo()).(*datapb.ChannelWatchInfo)
+			if _, ok := infos[nc.NodeID]; !ok {
+				infos[nc.NodeID] = make(map[string]*datapb.ChannelWatchInfo)
 			}
+			infos[nc.NodeID][watchInfo.Vchan.ChannelName] = watchInfo
 		}
 	}
-	return 0, nil
+	return infos
 }
 
-type ackType = int
-
-const (
-	invalidAck = iota
-	watchSuccessAck
-	watchFailAck
-	watchTimeoutAck
-	releaseSuccessAck
-	releaseFailAck
-	releaseTimeoutAck
-)
-
-type ackEvent struct {
-	ackType     ackType
-	channelName string
-	nodeID      UniqueID
-}
-
-func (c *ChannelManager) updateWithTimer(updates ChannelOpSet, state datapb.ChannelWatchState) error {
-	var channelsWithTimer = []string{}
-	for _, op := range updates {
-		if op.Type == Add {
-			channelsWithTimer = append(channelsWithTimer, c.fillChannelWatchInfoWithState(op, state)...)
-		}
-	}
-
-	err := c.store.Update(updates)
-	if err != nil {
-		log.Warn("fail to update", zap.Array("updates", updates), zap.Error(err))
-		c.stateTimer.removeTimers(channelsWithTimer)
-	}
-	c.lastActiveTimestamp = time.Now()
-	return err
-}
-
-func (c *ChannelManager) processAck(e *ackEvent) {
-	c.stateTimer.stopIfExist(e)
-
-	switch e.ackType {
-	case invalidAck:
-		log.Warn("detected invalid Ack", zap.String("channel name", e.channelName))
-
-	case watchSuccessAck:
-		log.Info("datanode successfully watched channel", zap.Int64("nodeID", e.nodeID), zap.String("channel name", e.channelName))
-	case watchFailAck, watchTimeoutAck: // failure acks from toWatch
-		log.Warn("datanode watch channel failed or timeout, will release", zap.Int64("nodeID", e.nodeID),
-			zap.String("channel", e.channelName))
-		err := c.Release(e.nodeID, e.channelName)
-		if err != nil {
-			log.Warn("fail to set channels to release for watch failure ACKs",
-				zap.Int64("nodeID", e.nodeID), zap.String("channel name", e.channelName), zap.Error(err))
-		}
-	case releaseFailAck, releaseTimeoutAck: // failure acks from toRelease
-		// Cleanup, Delete and Reassign
-		log.Warn("datanode release channel failed or timeout, will cleanup and reassign", zap.Int64("nodeID", e.nodeID),
-			zap.String("channel", e.channelName))
-		err := c.CleanupAndReassign(e.nodeID, e.channelName)
-		if err != nil {
-			log.Warn("fail to clean and reassign channels for release failure ACKs",
-				zap.Int64("nodeID", e.nodeID), zap.String("channel name", e.channelName), zap.Error(err))
-		}
-
-	case releaseSuccessAck:
-		// Delete and Reassign
-		log.Info("datanode release channel successfully, will reassign", zap.Int64("nodeID", e.nodeID),
-			zap.String("channel", e.channelName))
-		err := c.Reassign(e.nodeID, e.channelName)
-		if err != nil {
-			log.Warn("fail to response to release success ACK",
-				zap.Int64("nodeID", e.nodeID), zap.String("channel name", e.channelName), zap.Error(err))
-		}
+func inferStateByOpType(opType ChannelOpType) datapb.ChannelWatchState {
+	switch opType {
+	case Watch:
+		return datapb.ChannelWatchState_ToWatch
+	case Release:
+		return datapb.ChannelWatchState_ToRelease
+	default:
+		return datapb.ChannelWatchState_ToWatch
 	}
 }
 
-type channelStateChecker func(context.Context, int64)
-
-func (c *ChannelManager) watchChannelStatesLoop(ctx context.Context, revision int64) {
-	defer logutil.LogPanic()
-
-	// REF MEP#7 watchInfo paths are orgnized as: [prefix]/channel/{node_id}/{channel_name}
-	watchPrefix := Params.CommonCfg.DataCoordWatchSubPath.GetValue()
-	// TODO, this is risky, we'd better watch etcd with revision rather simply a path
-	var etcdWatcher clientv3.WatchChan
-	var timeoutWatcher chan *ackEvent
-	if revision == common.LatestRevision {
-		etcdWatcher, timeoutWatcher = c.stateTimer.getWatchers(watchPrefix)
-	} else {
-		etcdWatcher, timeoutWatcher = c.stateTimer.getWatchersWithRevision(watchPrefix, revision)
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			log.Info("watch etcd loop quit")
-			return
-		case ackEvent := <-timeoutWatcher:
-			log.Info("receive timeout acks from state watcher",
-				zap.Any("state", ackEvent.ackType),
-				zap.Int64("nodeID", ackEvent.nodeID), zap.String("channel name", ackEvent.channelName))
-			c.processAck(ackEvent)
-		case event, ok := <-etcdWatcher:
-			if !ok {
-				log.Warn("datacoord failed to watch channel, return")
-				// rewatch for transient network error, session handles process quiting if connect is not recoverable
-				go c.watchChannelStatesLoop(ctx, revision)
-				return
-			}
-
-			if err := event.Err(); err != nil {
-				log.Warn("datacoord watch channel hit error", zap.Error(event.Err()))
-				// https://github.com/etcd-io/etcd/issues/8980
-				// TODO add list and wathc with revision
-				if event.Err() == v3rpc.ErrCompacted {
-					go c.watchChannelStatesLoop(ctx, event.CompactRevision)
-					return
-				}
-				// if watch loop return due to event canceled, the datacoord is not functional anymore
-				log.Panic("datacoord is not functional for event canceled", zap.Error(err))
-				return
-			}
-
-			revision = event.Header.GetRevision() + 1
-			for _, evt := range event.Events {
-				if evt.Type == clientv3.EventTypeDelete {
-					continue
-				}
-				key := string(evt.Kv.Key)
-				watchInfo, err := parseWatchInfo(key, evt.Kv.Value)
-				if err != nil {
-					log.Warn("fail to parse watch info", zap.Error(err))
-					continue
-				}
-
-				// runnging states
-				state := watchInfo.GetState()
-				if state == datapb.ChannelWatchState_ToWatch ||
-					state == datapb.ChannelWatchState_ToRelease ||
-					state == datapb.ChannelWatchState_Uncomplete {
-					c.stateTimer.resetIfExist(watchInfo.GetVchan().ChannelName, Params.DataCoordCfg.WatchTimeoutInterval.GetAsDuration(time.Second))
-					log.Info("tickle update, timer delay", zap.String("channel", watchInfo.GetVchan().ChannelName), zap.Int32("progress", watchInfo.Progress))
-					continue
-				}
-
-				nodeID, err := parseNodeKey(key)
-				if err != nil {
-					log.Warn("fail to parse node from key", zap.String("key", key), zap.Error(err))
-					continue
-				}
-
-				ackEvent := parseAckEvent(nodeID, watchInfo)
-				c.processAck(ackEvent)
-			}
-		}
-	}
-}
-
-// Release writes ToRelease channel watch states for a channel
-func (c *ChannelManager) Release(nodeID UniqueID, channelName string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	toReleaseChannel := c.getChannelByNodeAndName(nodeID, channelName)
-	if toReleaseChannel == nil {
-		return fmt.Errorf("fail to find matching nodeID: %d with channelName: %s", nodeID, channelName)
-	}
-
-	toReleaseUpdates := getReleaseOp(nodeID, toReleaseChannel)
-	err := c.updateWithTimer(toReleaseUpdates, datapb.ChannelWatchState_ToRelease)
-	if err != nil {
-		log.Warn("fail to update to release with timer", zap.Array("to release updates", toReleaseUpdates))
-	}
-
-	return err
-}
-
-// Reassign reassigns a channel to another DataNode.
-func (c *ChannelManager) Reassign(originNodeID UniqueID, channelName string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	ch := c.getChannelByNodeAndName(originNodeID, channelName)
-	if ch == nil {
-		return fmt.Errorf("fail to find matching nodeID: %d with channelName: %s", originNodeID, channelName)
-	}
-
-	reallocates := &NodeChannelInfo{originNodeID, []*channel{ch}}
-
-	if c.isMarkedDrop(channelName, ch.CollectionID) {
-		if err := c.remove(originNodeID, ch); err != nil {
-			return fmt.Errorf("failed to remove watch info: %v,%s", ch, err.Error())
-		}
-		if err := c.h.FinishDropChannel(channelName); err != nil {
-			return fmt.Errorf("FinishDropChannel failed, err=%w", err)
-		}
-		log.Info("removed channel assignment", zap.String("channel name", channelName))
-		return nil
-	}
-
-	// Reassign policy won't choose the original node when a reassigning a channel.
-	updates := c.reassignPolicy(c.store, []*NodeChannelInfo{reallocates})
-	if len(updates) <= 0 {
-		// Skip the remove if reassign to the original node.
-		log.Warn("failed to reassign channel to other nodes, assigning to the original DataNode",
-			zap.Int64("nodeID", originNodeID),
-			zap.String("channel name", channelName))
-		updates.Add(originNodeID, []*channel{ch})
-	}
-
-	log.Info("channel manager reassigning channels",
-		zap.Int64("old node ID", originNodeID),
-		zap.Array("updates", updates))
-	return c.updateWithTimer(updates, datapb.ChannelWatchState_ToWatch)
-}
-
-// CleanupAndReassign tries to clean up datanode's subscription, and then reassigns the channel to another DataNode.
-func (c *ChannelManager) CleanupAndReassign(nodeID UniqueID, channelName string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	chToCleanUp := c.getChannelByNodeAndName(nodeID, channelName)
-	if chToCleanUp == nil {
-		return fmt.Errorf("failed to find matching channel: %s and node: %d", channelName, nodeID)
-	}
-
-	if c.msgstreamFactory == nil {
-		log.Warn("msgstream factory is not set, unable to clean up topics")
-	} else {
-		subName := fmt.Sprintf("%s-%d-%d", Params.CommonCfg.DataNodeSubName.GetValue(), nodeID, chToCleanUp.CollectionID)
-		pchannelName := funcutil.ToPhysicalChannel(channelName)
-		msgstream.UnsubscribeChannels(c.ctx, c.msgstreamFactory, subName, []string{pchannelName})
-	}
-
-	reallocates := &NodeChannelInfo{nodeID, []*channel{chToCleanUp}}
-
-	if c.isMarkedDrop(channelName, chToCleanUp.CollectionID) {
-		if err := c.remove(nodeID, chToCleanUp); err != nil {
-			return fmt.Errorf("failed to remove watch info: %v,%s", chToCleanUp, err.Error())
-		}
-
-		log.Info("try to cleanup removal flag ", zap.String("channel name", channelName))
-		if err := c.h.FinishDropChannel(channelName); err != nil {
-			return fmt.Errorf("FinishDropChannel failed, err=%w", err)
-		}
-
-		log.Info("removed channel assignment", zap.Any("channel", chToCleanUp))
-		return nil
-	}
-
-	// Reassign policy won't choose the original node when a reassigning a channel.
-	updates := c.reassignPolicy(c.store, []*NodeChannelInfo{reallocates})
-	if len(updates) <= 0 {
-		// Skip the remove if reassign to the original node.
-		log.Warn("failed to reassign channel to other nodes, add channel to the original node",
-			zap.Int64("node ID", nodeID),
-			zap.String("channel name", channelName))
-		updates.Add(nodeID, []*channel{chToCleanUp})
-	}
-
-	log.Info("channel manager reassigning channels",
-		zap.Int64("old nodeID", nodeID),
-		zap.Array("updates", updates))
-	return c.updateWithTimer(updates, datapb.ChannelWatchState_ToWatch)
-}
-
-func (c *ChannelManager) getChannelByNodeAndName(nodeID UniqueID, channelName string) *channel {
-	var ret *channel
-
-	nodeChannelInfo := c.store.GetNode(nodeID)
-	if nodeChannelInfo == nil {
-		return nil
-	}
-
-	for _, channel := range nodeChannelInfo.Channels {
-		if channel.Name == channelName {
-			ret = channel
-			break
-		}
-	}
-	return ret
-}
-
-func (c *ChannelManager) getNodeIDByChannelName(chName string) (bool, UniqueID) {
-	for _, nodeChannel := range c.GetChannels() {
-		for _, ch := range nodeChannel.Channels {
-			if ch.Name == chName {
-				return true, nodeChannel.NodeID
-			}
-		}
-	}
-	return false, 0
-}
-
-func (c *ChannelManager) isMarkedDrop(channelName string, collectionID UniqueID) bool {
-	return c.h.CheckShouldDropChannel(channelName, collectionID)
-}
-
-func getReleaseOp(nodeID UniqueID, ch *channel) ChannelOpSet {
-	var op ChannelOpSet
-	op.Add(nodeID, []*channel{ch})
-	return op
-}
-
-func (c *ChannelManager) isSilent() bool {
-	if c.stateTimer.hasRunningTimers() {
-		return false
-	}
-	return time.Since(c.lastActiveTimestamp) >= Params.DataCoordCfg.ChannelBalanceSilentDuration.GetAsDuration(time.Second)
+// Clear segmentID in vChannelInfo to reduce meta size.
+// About 200k segments will exceed default meta size limit,
+// clear it would make meta size way smaller and support infinite segments count
+//
+// NOTE: all the meta and in-mem watchInfo contains partial VChanInfo that dones't include segmentIDs
+// Need to recalulate and fill-in segmentIDs before notify to DataNode
+func reduceVChanSize(vChan *datapb.VchannelInfo) *datapb.VchannelInfo {
+	vChan.DroppedSegmentIds = nil
+	vChan.FlushedSegmentIds = nil
+	vChan.UnflushedSegmentIds = nil
+	return vChan
 }

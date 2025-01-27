@@ -18,1141 +18,882 @@ package datacoord
 
 import (
 	"context"
-	"path"
-	"strconv"
-	"sync"
+	"errors"
+	"fmt"
 	"testing"
-	"time"
 
-	"github.com/golang/protobuf/proto"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
+	"github.com/samber/lo"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/suite"
+	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/milvus-io/milvus/internal/kv"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/util/dependency"
-	"github.com/milvus-io/milvus/pkg/common"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	globalIDAllocator "github.com/milvus-io/milvus/internal/allocator"
+	kvmock "github.com/milvus-io/milvus/internal/kv/mocks"
+	"github.com/milvus-io/milvus/pkg/kv/predicates"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/util/merr"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
-// waitAndStore simulates DataNode's action
-func waitAndStore(t *testing.T, metakv kv.MetaKv, key string, waitState, storeState datapb.ChannelWatchState) {
-	for {
-		v, err := metakv.Load(key)
-		if err == nil && len(v) > 0 {
-			watchInfo, err := parseWatchInfo(key, []byte(v))
-			require.NoError(t, err)
-			require.Equal(t, waitState, watchInfo.GetState())
+func TestChannelManagerSuite(t *testing.T) {
+	suite.Run(t, new(ChannelManagerSuite))
+}
 
-			watchInfo.State = storeState
-			data, err := proto.Marshal(watchInfo)
-			require.NoError(t, err)
+type ChannelManagerSuite struct {
+	suite.Suite
 
-			metakv.Save(key, string(data))
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
+	mockKv      *kvmock.MetaKv
+	mockCluster *MockSubCluster
+	mockAlloc   *globalIDAllocator.MockGlobalIDAllocator
+	mockHandler *NMockHandler
+}
+
+func (s *ChannelManagerSuite) prepareMeta(chNodes map[string]int64, state datapb.ChannelWatchState) {
+	s.SetupTest()
+	if chNodes == nil {
+		s.mockKv.EXPECT().LoadWithPrefix(mock.Anything, mock.Anything).Return(nil, nil, nil).Once()
+		return
+	}
+	var keys, values []string
+	for channel, nodeID := range chNodes {
+		keys = append(keys, fmt.Sprintf("channel_store/%d/%s", nodeID, channel))
+		info := generateWatchInfo(channel, state)
+		bs, err := proto.Marshal(info)
+		s.Require().NoError(err)
+		values = append(values, string(bs))
+	}
+	s.mockKv.EXPECT().LoadWithPrefix(mock.Anything, mock.Anything).Return(keys, values, nil).Once()
+}
+
+func (s *ChannelManagerSuite) checkAssignment(m *ChannelManagerImpl, nodeID int64, channel string, state ChannelState) {
+	rwChannel, found := m.GetChannel(nodeID, channel)
+	s.True(found)
+	s.NotNil(rwChannel)
+	s.Equal(channel, rwChannel.GetName())
+	sChannel, ok := rwChannel.(*StateChannel)
+	s.True(ok)
+	s.Equal(state, sChannel.currentState)
+	s.EqualValues(nodeID, sChannel.assignedNode)
+	s.True(m.Match(nodeID, channel))
+
+	if nodeID != bufferID {
+		gotNode, err := m.FindWatcher(channel)
+		s.NoError(err)
+		s.EqualValues(gotNode, nodeID)
 	}
 }
 
-// waitAndCheckState checks if the DataCoord writes expected state into Etcd
-func waitAndCheckState(t *testing.T, kv kv.MetaKv, expectedState datapb.ChannelWatchState, nodeID UniqueID, channelName string, collectionID UniqueID) {
-	for {
-		prefix := Params.CommonCfg.DataCoordWatchSubPath.GetValue()
-		v, err := kv.Load(path.Join(prefix, strconv.FormatInt(nodeID, 10), channelName))
-		if err == nil && len(v) > 0 {
-			watchInfo, err := parseWatchInfo("fake", []byte(v))
-			require.NoError(t, err)
+func (s *ChannelManagerSuite) checkNoAssignment(m *ChannelManagerImpl, nodeID int64, channel string) {
+	rwChannel, found := m.GetChannel(nodeID, channel)
+	s.False(found)
+	s.Nil(rwChannel)
+	s.False(m.Match(nodeID, channel))
+}
 
-			if watchInfo.GetState() == expectedState {
-				assert.Equal(t, watchInfo.Vchan.GetChannelName(), channelName)
-				assert.Equal(t, watchInfo.Vchan.GetCollectionID(), collectionID)
-				break
+func (s *ChannelManagerSuite) SetupTest() {
+	s.mockKv = kvmock.NewMetaKv(s.T())
+	s.mockCluster = NewMockSubCluster(s.T())
+	s.mockHandler = NewNMockHandler(s.T())
+	s.mockHandler.EXPECT().GetDataVChanPositions(mock.Anything, mock.Anything).
+		RunAndReturn(func(ch RWChannel, partitionID UniqueID) *datapb.VchannelInfo {
+			return &datapb.VchannelInfo{
+				CollectionID: ch.GetCollectionID(),
+				ChannelName:  ch.GetName(),
 			}
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
+		}).Maybe()
+	s.mockKv.EXPECT().MultiSaveAndRemove(mock.Anything, mock.Anything, mock.Anything).RunAndReturn(
+		func(ctx context.Context, save map[string]string, removals []string, preds ...predicates.Predicate) error {
+			log.Info("test save and remove", zap.Any("save", save), zap.Any("removals", removals))
+			return nil
+		}).Maybe()
+	s.mockAlloc = globalIDAllocator.NewMockGlobalIDAllocator(s.T())
+	s.mockAlloc.EXPECT().AllocOne().Return(1, nil).Maybe()
 }
 
-func getOpsWithWatchInfo(nodeID UniqueID, ch *channel) ChannelOpSet {
-	var ops ChannelOpSet
-	ops.Add(nodeID, []*channel{ch})
+func (s *ChannelManagerSuite) TearDownTest() {}
 
-	for _, op := range ops {
-		op.ChannelWatchInfos = []*datapb.ChannelWatchInfo{{}}
-	}
-	return ops
-}
+func (s *ChannelManagerSuite) TestAddNode() {
+	s.Run("AddNode with empty store", func() {
+		s.prepareMeta(nil, 0)
+		m, err := NewChannelManager(s.mockKv, s.mockHandler, s.mockCluster, s.mockAlloc)
+		s.Require().NoError(err)
 
-func TestChannelManager_StateTransfer(t *testing.T) {
-	metakv := getMetaKv(t)
-	defer func() {
-		metakv.RemoveWithPrefix("")
-		metakv.Close()
-	}()
+		var testNode int64 = 1
+		err = m.AddNode(testNode)
+		s.NoError(err)
 
-	p := "/tmp/milvus_ut/rdb_data"
-	t.Setenv("ROCKSMQ_PATH", p)
-
-	prefix := Params.CommonCfg.DataCoordWatchSubPath.GetValue()
-
-	var (
-		collectionID      = UniqueID(9)
-		nodeID            = UniqueID(119)
-		channelNamePrefix = t.Name()
-
-		waitFor = time.Second
-		tick    = time.Millisecond * 10
-	)
-
-	t.Run("ToWatch-WatchSuccess", func(t *testing.T) {
-		metakv.RemoveWithPrefix("")
-		cName := channelNamePrefix + "ToWatch-WatchSuccess"
-
-		ctx, cancel := context.WithCancel(context.TODO())
-		chManager, err := NewChannelManager(metakv, newMockHandler())
-		require.NoError(t, err)
-
-		wg := sync.WaitGroup{}
-		wg.Add(1)
-		go func() {
-			chManager.watchChannelStatesLoop(ctx, common.LatestRevision)
-			wg.Done()
-		}()
-
-		chManager.AddNode(nodeID)
-		chManager.Watch(&channel{Name: cName, CollectionID: collectionID})
-
-		key := path.Join(prefix, strconv.FormatInt(nodeID, 10), cName)
-		waitAndStore(t, metakv, key, datapb.ChannelWatchState_ToWatch, datapb.ChannelWatchState_WatchSuccess)
-		waitAndCheckState(t, metakv, datapb.ChannelWatchState_WatchSuccess, nodeID, cName, collectionID)
-
-		assert.Eventually(t, func() bool {
-			_, loaded := chManager.stateTimer.runningTimerStops.Load(cName)
-			return !loaded
-		}, waitFor, tick)
-
-		cancel()
-		wg.Wait()
+		info := m.store.GetNode(testNode)
+		s.NotNil(info)
+		s.Empty(info.Channels)
+		s.Equal(info.NodeID, testNode)
 	})
-
-	t.Run("ToWatch-WatchFail-ToRelease", func(t *testing.T) {
-		metakv.RemoveWithPrefix("")
-		cName := channelNamePrefix + "ToWatch-WatchFail-ToRelase"
-		ctx, cancel := context.WithCancel(context.TODO())
-		chManager, err := NewChannelManager(metakv, newMockHandler())
-		require.NoError(t, err)
-
-		wg := sync.WaitGroup{}
-		wg.Add(1)
-		go func() {
-			chManager.watchChannelStatesLoop(ctx, common.LatestRevision)
-			wg.Done()
-		}()
-
-		chManager.AddNode(nodeID)
-		chManager.Watch(&channel{Name: cName, CollectionID: collectionID})
-
-		key := path.Join(prefix, strconv.FormatInt(nodeID, 10), cName)
-		waitAndStore(t, metakv, key, datapb.ChannelWatchState_ToWatch, datapb.ChannelWatchState_WatchFailure)
-		waitAndCheckState(t, metakv, datapb.ChannelWatchState_ToRelease, nodeID, cName, collectionID)
-
-		assert.Eventually(t, func() bool {
-			_, loaded := chManager.stateTimer.runningTimerStops.Load(cName)
-			return loaded
-		}, waitFor, tick)
-
-		cancel()
-		wg.Wait()
-		chManager.stateTimer.removeTimers([]string{cName})
-	})
-
-	t.Run("ToWatch-Timeout", func(t *testing.T) {
-		metakv.RemoveWithPrefix("")
-		cName := channelNamePrefix + "ToWatch-Timeout"
-		ctx, cancel := context.WithCancel(context.TODO())
-		chManager, err := NewChannelManager(metakv, newMockHandler())
-		require.NoError(t, err)
-
-		wg := sync.WaitGroup{}
-		wg.Add(1)
-		go func() {
-			chManager.watchChannelStatesLoop(ctx, common.LatestRevision)
-			wg.Done()
-		}()
-
-		chManager.AddNode(nodeID)
-		chManager.Watch(&channel{Name: cName, CollectionID: collectionID})
-
-		// simulating timeout behavior of startOne, cuz 20s is a long wait
-		e := &ackEvent{
-			ackType:     watchTimeoutAck,
-			channelName: cName,
-			nodeID:      nodeID,
+	s.Run("AddNode with channel in bufferID", func() {
+		chNodes := map[string]int64{
+			"ch1": bufferID,
+			"ch2": bufferID,
 		}
-		chManager.stateTimer.notifyTimeoutWatcher(e)
-
-		waitAndCheckState(t, metakv, datapb.ChannelWatchState_ToRelease, nodeID, cName, collectionID)
-		assert.Eventually(t, func() bool {
-			_, loaded := chManager.stateTimer.runningTimerStops.Load(cName)
-			return loaded
-		}, waitFor, tick)
-
-		cancel()
-		wg.Wait()
-		chManager.stateTimer.removeTimers([]string{cName})
-	})
-
-	t.Run("ToRelease-ReleaseSuccess-Reassign-ToWatch-2-DN", func(t *testing.T) {
-		var oldNode = UniqueID(120)
-		cName := channelNamePrefix + "ToRelease-ReleaseSuccess-Reassign-ToWatch-2-DN"
-
-		metakv.RemoveWithPrefix("")
-		ctx, cancel := context.WithCancel(context.TODO())
-		chManager, err := NewChannelManager(metakv, newMockHandler())
-		require.NoError(t, err)
-
-		wg := sync.WaitGroup{}
-		wg.Add(1)
-		go func() {
-			chManager.watchChannelStatesLoop(ctx, common.LatestRevision)
-			wg.Done()
-		}()
-
-		chManager.store = &ChannelStore{
-			store: metakv,
-			channelsInfo: map[int64]*NodeChannelInfo{
-				nodeID: {nodeID, []*channel{
-					{Name: cName, CollectionID: collectionID},
-				}},
-				oldNode: {oldNode, []*channel{}},
-			},
-		}
-
-		err = chManager.Release(nodeID, cName)
-		assert.NoError(t, err)
-
-		key := path.Join(prefix, strconv.FormatInt(nodeID, 10), cName)
-		waitAndStore(t, metakv, key, datapb.ChannelWatchState_ToRelease, datapb.ChannelWatchState_ReleaseSuccess)
-		waitAndCheckState(t, metakv, datapb.ChannelWatchState_ToWatch, oldNode, cName, collectionID)
-
-		cancel()
-		wg.Wait()
-
-		w, err := metakv.Load(path.Join(prefix, strconv.FormatInt(nodeID, 10)))
-		assert.Error(t, err)
-		assert.Empty(t, w)
-
-		_, loaded := chManager.stateTimer.runningTimerStops.Load(cName)
-		assert.True(t, loaded)
-		chManager.stateTimer.removeTimers([]string{cName})
-	})
-
-	t.Run("ToRelease-ReleaseSuccess-Reassign-ToWatch-1-DN", func(t *testing.T) {
-		metakv.RemoveWithPrefix("")
-		ctx, cancel := context.WithCancel(context.TODO())
-		cName := channelNamePrefix + "ToRelease-ReleaseSuccess-Reassign-ToWatch-1-DN"
-		chManager, err := NewChannelManager(metakv, newMockHandler())
-		require.NoError(t, err)
-
-		wg := sync.WaitGroup{}
-		wg.Add(1)
-		go func() {
-			chManager.watchChannelStatesLoop(ctx, common.LatestRevision)
-			wg.Done()
-		}()
-
-		chManager.store = &ChannelStore{
-			store: metakv,
-			channelsInfo: map[int64]*NodeChannelInfo{
-				nodeID: {nodeID, []*channel{
-					{Name: cName, CollectionID: collectionID},
-				}},
-			},
-		}
-
-		err = chManager.Release(nodeID, cName)
-		assert.NoError(t, err)
-
-		key := path.Join(prefix, strconv.FormatInt(nodeID, 10), cName)
-		waitAndStore(t, metakv, key, datapb.ChannelWatchState_ToRelease, datapb.ChannelWatchState_ReleaseSuccess)
-
-		waitAndCheckState(t, metakv, datapb.ChannelWatchState_ToWatch, nodeID, cName, collectionID)
-
-		assert.Eventually(t, func() bool {
-			_, loaded := chManager.stateTimer.runningTimerStops.Load(cName)
-			return loaded
-		}, waitFor, tick)
-		cancel()
-		wg.Wait()
-
-		chManager.stateTimer.removeTimers([]string{cName})
-	})
-
-	t.Run("ToRelease-ReleaseFail-CleanUpAndDelete-Reassign-ToWatch-2-DN", func(t *testing.T) {
-		var oldNode = UniqueID(121)
-
-		cName := channelNamePrefix + "ToRelease-ReleaseFail-CleanUpAndDelete-Reassign-ToWatch-2-DN"
-		metakv.RemoveWithPrefix("")
-		ctx, cancel := context.WithCancel(context.TODO())
-		factory := dependency.NewDefaultFactory(true)
-		_, err := factory.NewMsgStream(context.TODO())
-		require.NoError(t, err)
-		chManager, err := NewChannelManager(metakv, newMockHandler(), withMsgstreamFactory(factory))
-		require.NoError(t, err)
-
-		wg := sync.WaitGroup{}
-		wg.Add(1)
-		go func() {
-			chManager.watchChannelStatesLoop(ctx, common.LatestRevision)
-			wg.Done()
-		}()
-
-		chManager.store = &ChannelStore{
-			store: metakv,
-			channelsInfo: map[int64]*NodeChannelInfo{
-				nodeID: {nodeID, []*channel{
-					{Name: cName, CollectionID: collectionID},
-				}},
-				oldNode: {oldNode, []*channel{}},
-			},
-		}
-
-		err = chManager.Release(nodeID, cName)
-		assert.NoError(t, err)
-
-		key := path.Join(prefix, strconv.FormatInt(nodeID, 10), cName)
-		waitAndStore(t, metakv, key, datapb.ChannelWatchState_ToRelease, datapb.ChannelWatchState_ReleaseFailure)
-		waitAndCheckState(t, metakv, datapb.ChannelWatchState_ToWatch, oldNode, cName, collectionID)
-
-		cancel()
-		wg.Wait()
-
-		w, err := metakv.Load(path.Join(prefix, strconv.FormatInt(nodeID, 10)))
-		assert.Error(t, err)
-		assert.Empty(t, w)
-
-		_, loaded := chManager.stateTimer.runningTimerStops.Load(cName)
-		assert.True(t, loaded)
-		chManager.stateTimer.removeTimers([]string{cName})
-	})
-
-	t.Run("ToRelease-ReleaseFail-CleanUpAndDelete-Reassign-ToWatch-1-DN", func(t *testing.T) {
-		metakv.RemoveWithPrefix("")
-		cName := channelNamePrefix + "ToRelease-ReleaseFail-CleanUpAndDelete-Reassign-ToWatch-1-DN"
-		ctx, cancel := context.WithCancel(context.TODO())
-		factory := dependency.NewDefaultFactory(true)
-		_, err := factory.NewMsgStream(context.TODO())
-		require.NoError(t, err)
-		chManager, err := NewChannelManager(metakv, newMockHandler(), withMsgstreamFactory(factory))
-		require.NoError(t, err)
-
-		wg := sync.WaitGroup{}
-		wg.Add(1)
-		go func() {
-			chManager.watchChannelStatesLoop(ctx, common.LatestRevision)
-			wg.Done()
-		}()
-
-		chManager.store = &ChannelStore{
-			store: metakv,
-			channelsInfo: map[int64]*NodeChannelInfo{
-				nodeID: {nodeID, []*channel{
-					{Name: cName, CollectionID: collectionID},
-				}},
-			},
-		}
-
-		err = chManager.Release(nodeID, cName)
-		assert.NoError(t, err)
-
-		key := path.Join(prefix, strconv.FormatInt(nodeID, 10), cName)
-		waitAndStore(t, metakv, key, datapb.ChannelWatchState_ToRelease, datapb.ChannelWatchState_ReleaseFailure)
-
-		waitAndCheckState(t, metakv, datapb.ChannelWatchState_ToWatch, nodeID, cName, collectionID)
-		assert.Eventually(t, func() bool {
-			_, loaded := chManager.stateTimer.runningTimerStops.Load(cName)
-			return loaded
-		}, waitFor, tick)
-
-		cancel()
-		wg.Wait()
-		chManager.stateTimer.removeTimers([]string{cName})
-	})
-}
-
-func TestChannelManager(t *testing.T) {
-	metakv := getMetaKv(t)
-	defer func() {
-		metakv.RemoveWithPrefix("")
-		metakv.Close()
-	}()
-
-	prefix := Params.CommonCfg.DataCoordWatchSubPath.GetValue()
-	t.Run("test AddNode with avalible node", func(t *testing.T) {
-		// Note: this test is based on the default registerPolicy
-		defer metakv.RemoveWithPrefix("")
-		var (
-			collectionID       = UniqueID(8)
-			nodeID, nodeToAdd  = UniqueID(118), UniqueID(811)
-			channel1, channel2 = "channel1", "channel2"
-		)
-
-		chManager, err := NewChannelManager(metakv, newMockHandler())
-		require.NoError(t, err)
-		chManager.store = &ChannelStore{
-			store: metakv,
-			channelsInfo: map[int64]*NodeChannelInfo{
-				nodeID: {nodeID, []*channel{
-					{Name: channel1, CollectionID: collectionID},
-					{Name: channel2, CollectionID: collectionID},
-				}},
-			},
-		}
-
-		err = chManager.AddNode(nodeToAdd)
-		assert.NoError(t, err)
-
-		assert.True(t, chManager.Match(nodeID, channel1))
-		assert.True(t, chManager.Match(nodeID, channel2))
-		assert.False(t, chManager.Match(nodeToAdd, channel1))
-		assert.False(t, chManager.Match(nodeToAdd, channel2))
-
-		err = chManager.Watch(&channel{Name: "channel-3", CollectionID: collectionID})
-		assert.NoError(t, err)
-
-		assert.True(t, chManager.Match(nodeToAdd, "channel-3"))
-
-		waitAndCheckState(t, metakv, datapb.ChannelWatchState_ToWatch, nodeToAdd, "channel-3", collectionID)
-		chManager.stateTimer.removeTimers([]string{"channel-3"})
-	})
-
-	t.Run("test AddNode with no available node", func(t *testing.T) {
-		// Note: this test is based on the default registerPolicy
-		defer metakv.RemoveWithPrefix("")
-		var (
-			collectionID       = UniqueID(8)
-			nodeID             = UniqueID(119)
-			channel1, channel2 = "channel1", "channel2"
-		)
-
-		chManager, err := NewChannelManager(metakv, newMockHandler())
-		require.NoError(t, err)
-		chManager.store = &ChannelStore{
-			store: metakv,
-			channelsInfo: map[int64]*NodeChannelInfo{
-				bufferID: {bufferID, []*channel{
-					{Name: channel1, CollectionID: collectionID},
-					{Name: channel2, CollectionID: collectionID},
-				}},
-			},
-		}
-
-		err = chManager.AddNode(nodeID)
-		assert.NoError(t, err)
-
-		key := path.Join(prefix, strconv.FormatInt(nodeID, 10), channel1)
-		waitAndStore(t, metakv, key, datapb.ChannelWatchState_ToWatch, datapb.ChannelWatchState_WatchSuccess)
-
-		key = path.Join(prefix, strconv.FormatInt(nodeID, 10), channel2)
-		waitAndStore(t, metakv, key, datapb.ChannelWatchState_ToWatch, datapb.ChannelWatchState_WatchSuccess)
-
-		assert.True(t, chManager.Match(nodeID, channel1))
-		assert.True(t, chManager.Match(nodeID, channel2))
-
-		err = chManager.Watch(&channel{Name: "channel-3", CollectionID: collectionID})
-		assert.NoError(t, err)
-
-		waitAndCheckState(t, metakv, datapb.ChannelWatchState_ToWatch, nodeID, "channel-3", collectionID)
-		chManager.stateTimer.removeTimers([]string{"channel-3"})
-	})
-
-	t.Run("test Watch", func(t *testing.T) {
-		defer metakv.RemoveWithPrefix("")
-		var (
-			collectionID = UniqueID(7)
-			nodeID       = UniqueID(117)
-			bufferCh     = "bufferID"
-			chanToAdd    = "new-channel-watch"
-		)
-
-		chManager, err := NewChannelManager(metakv, newMockHandler())
-		require.NoError(t, err)
-
-		err = chManager.Watch(&channel{Name: bufferCh, CollectionID: collectionID})
-		assert.NoError(t, err)
-
-		waitAndCheckState(t, metakv, datapb.ChannelWatchState_ToWatch, bufferID, bufferCh, collectionID)
-
-		chManager.store.Add(nodeID)
-		err = chManager.Watch(&channel{Name: chanToAdd, CollectionID: collectionID})
-		assert.NoError(t, err)
-		waitAndCheckState(t, metakv, datapb.ChannelWatchState_ToWatch, nodeID, chanToAdd, collectionID)
-
-		chManager.stateTimer.removeTimers([]string{chanToAdd})
-	})
-
-	t.Run("test Release", func(t *testing.T) {
-		defer metakv.RemoveWithPrefix("")
-		var (
-			collectionID               = UniqueID(4)
-			nodeID, invalidNodeID      = UniqueID(114), UniqueID(999)
-			channelName, invalidChName = "to-release", "invalid-to-release"
-		)
-
-		chManager, err := NewChannelManager(metakv, newMockHandler())
-		require.NoError(t, err)
-		chManager.store = &ChannelStore{
-			store: metakv,
-			channelsInfo: map[int64]*NodeChannelInfo{
-				nodeID: {nodeID, []*channel{{Name: channelName, CollectionID: collectionID}}},
-			},
-		}
-
-		err = chManager.Release(invalidNodeID, invalidChName)
-		assert.Error(t, err)
-
-		err = chManager.Release(nodeID, channelName)
-		assert.NoError(t, err)
-		chManager.stateTimer.removeTimers([]string{channelName})
-
-		waitAndCheckState(t, metakv, datapb.ChannelWatchState_ToRelease, nodeID, channelName, collectionID)
-	})
-
-	t.Run("test Reassign", func(t *testing.T) {
-		defer metakv.RemoveWithPrefix("")
-		var collectionID = UniqueID(5)
-
-		tests := []struct {
-			nodeID UniqueID
-			chName string
-		}{
-			{UniqueID(125), "normal-chan"},
-			{UniqueID(115), "to-delete-chan"},
-		}
-
-		chManager, err := NewChannelManager(metakv, newMockHandler())
-		require.NoError(t, err)
-
-		// prepare tests
-		for _, test := range tests {
-			chManager.store.Add(test.nodeID)
-			ops := getOpsWithWatchInfo(test.nodeID, &channel{Name: test.chName, CollectionID: collectionID})
-			err = chManager.store.Update(ops)
-			require.NoError(t, err)
-
-			info, err := metakv.Load(path.Join(prefix, strconv.FormatInt(test.nodeID, 10), test.chName))
-			require.NoError(t, err)
-			require.NotNil(t, info)
-		}
-
-		remainTest, reassignTest := tests[0], tests[1]
-		err = chManager.Reassign(reassignTest.nodeID, reassignTest.chName)
-		assert.NoError(t, err)
-		chManager.stateTimer.stopIfExist(&ackEvent{releaseSuccessAck, reassignTest.chName, reassignTest.nodeID})
-
-		// test nodes of reassignTest contains no channel
-		// test all channels are assgined to node of remainTest
-		assert.False(t, chManager.Match(reassignTest.nodeID, reassignTest.chName))
-		assert.True(t, chManager.Match(remainTest.nodeID, reassignTest.chName))
-		assert.True(t, chManager.Match(remainTest.nodeID, remainTest.chName))
-
-		// Delete node of reassginTest and try to Reassign node in remainTest
-		err = chManager.DeleteNode(reassignTest.nodeID)
-		require.NoError(t, err)
-
-		err = chManager.Reassign(remainTest.nodeID, remainTest.chName)
-		assert.NoError(t, err)
-		chManager.stateTimer.stopIfExist(&ackEvent{releaseSuccessAck, reassignTest.chName, reassignTest.nodeID})
-
-		// channel is added to remainTest because there's only one node left
-		waitAndCheckState(t, metakv, datapb.ChannelWatchState_ToWatch, remainTest.nodeID, remainTest.chName, collectionID)
-	})
-
-	t.Run("test DeleteNode", func(t *testing.T) {
-		defer metakv.RemoveWithPrefix("")
+		s.prepareMeta(chNodes, datapb.ChannelWatchState_ToWatch)
+		m, err := NewChannelManager(s.mockKv, s.mockHandler, s.mockCluster, s.mockAlloc)
+		s.Require().NoError(err)
 
 		var (
-			collectionID = UniqueID(999)
+			testNodeID   int64 = 1
+			testChannels       = []string{"ch1", "ch2"}
 		)
-		chManager, err := NewChannelManager(metakv, newMockHandler(), withStateChecker())
-		require.NoError(t, err)
-		chManager.store = &ChannelStore{
-			store: metakv,
-			channelsInfo: map[int64]*NodeChannelInfo{
-				1: {1, []*channel{
-					{Name: "channel-1", CollectionID: collectionID},
-					{Name: "channel-2", CollectionID: collectionID}}},
-				bufferID: {bufferID, []*channel{}},
-			},
-		}
-		chManager.stateTimer.startOne(datapb.ChannelWatchState_ToRelease, "channel-1", 1, Params.DataCoordCfg.WatchTimeoutInterval.GetAsDuration(time.Second))
-
-		err = chManager.DeleteNode(1)
-		assert.NoError(t, err)
-
-		chs := chManager.store.GetBufferChannelInfo()
-		assert.Equal(t, 2, len(chs.Channels))
-	})
-
-	t.Run("test CleanupAndReassign", func(t *testing.T) {
-		defer metakv.RemoveWithPrefix("")
-		var collectionID = UniqueID(6)
-
-		tests := []struct {
-			nodeID UniqueID
-			chName string
-		}{
-			{UniqueID(126), "normal-chan"},
-			{UniqueID(116), "to-delete-chan"},
-		}
-
-		factory := dependency.NewDefaultFactory(true)
-		_, err := factory.NewMsgStream(context.TODO())
-		require.NoError(t, err)
-		chManager, err := NewChannelManager(metakv, newMockHandler(), withMsgstreamFactory(factory))
-
-		require.NoError(t, err)
-
-		// prepare tests
-		for _, test := range tests {
-			chManager.store.Add(test.nodeID)
-			ops := getOpsWithWatchInfo(test.nodeID, &channel{Name: test.chName, CollectionID: collectionID})
-			err = chManager.store.Update(ops)
-			require.NoError(t, err)
-
-			info, err := metakv.Load(path.Join(prefix, strconv.FormatInt(test.nodeID, 10), test.chName))
-			require.NoError(t, err)
-			require.NotNil(t, info)
-		}
-
-		remainTest, reassignTest := tests[0], tests[1]
-		err = chManager.CleanupAndReassign(reassignTest.nodeID, reassignTest.chName)
-		assert.NoError(t, err)
-		chManager.stateTimer.stopIfExist(&ackEvent{releaseSuccessAck, reassignTest.chName, reassignTest.nodeID})
-
-		// test nodes of reassignTest contains no channel
-		assert.False(t, chManager.Match(reassignTest.nodeID, reassignTest.chName))
-
-		// test all channels are assgined to node of remainTest
-		assert.True(t, chManager.Match(remainTest.nodeID, reassignTest.chName))
-		assert.True(t, chManager.Match(remainTest.nodeID, remainTest.chName))
-
-		// Delete node of reassginTest and try to CleanupAndReassign node in remainTest
-		err = chManager.DeleteNode(reassignTest.nodeID)
-		require.NoError(t, err)
-
-		err = chManager.CleanupAndReassign(remainTest.nodeID, remainTest.chName)
-		assert.NoError(t, err)
-		chManager.stateTimer.stopIfExist(&ackEvent{releaseSuccessAck, reassignTest.chName, reassignTest.nodeID})
-
-		// channel is added to remainTest because there's only one node left
-		waitAndCheckState(t, metakv, datapb.ChannelWatchState_ToWatch, remainTest.nodeID, remainTest.chName, collectionID)
-	})
-
-	t.Run("test getChannelByNodeAndName", func(t *testing.T) {
-		defer metakv.RemoveWithPrefix("")
-		var (
-			nodeID       = UniqueID(113)
-			collectionID = UniqueID(3)
-			channelName  = "get-channel-by-node-and-name"
-		)
-
-		chManager, err := NewChannelManager(metakv, newMockHandler())
-		require.NoError(t, err)
-
-		ch := chManager.getChannelByNodeAndName(nodeID, channelName)
-		assert.Nil(t, ch)
-
-		chManager.store.Add(nodeID)
-		ch = chManager.getChannelByNodeAndName(nodeID, channelName)
-		assert.Nil(t, ch)
-
-		chManager.store = &ChannelStore{
-			store: metakv,
-			channelsInfo: map[int64]*NodeChannelInfo{
-				nodeID: {nodeID, []*channel{{Name: channelName, CollectionID: collectionID}}},
-			},
-		}
-		ch = chManager.getChannelByNodeAndName(nodeID, channelName)
-		assert.NotNil(t, ch)
-		assert.Equal(t, collectionID, ch.CollectionID)
-		assert.Equal(t, channelName, ch.Name)
-	})
-
-	t.Run("test fillChannelWatchInfoWithState", func(t *testing.T) {
-		defer metakv.RemoveWithPrefix("")
-		var (
-			nodeID       = UniqueID(111)
-			collectionID = UniqueID(1)
-			channelName  = "fill-channel-watchInfo-with-state"
-		)
-
-		chManager, err := NewChannelManager(metakv, newMockHandler())
-		require.NoError(t, err)
-
-		tests := []struct {
-			inState datapb.ChannelWatchState
-
-			description string
-		}{
-			{datapb.ChannelWatchState_ToWatch, "fill toWatch state"},
-			{datapb.ChannelWatchState_ToRelease, "fill toRelase state"},
-		}
-
-		for _, test := range tests {
-			t.Run(test.description, func(t *testing.T) {
-				ops := getReleaseOp(nodeID, &channel{Name: channelName, CollectionID: collectionID})
-				for _, op := range ops {
-					chs := chManager.fillChannelWatchInfoWithState(op, test.inState)
-					assert.Equal(t, 1, len(chs))
-					assert.Equal(t, channelName, chs[0])
-					assert.Equal(t, 1, len(op.ChannelWatchInfos))
-					assert.Equal(t, test.inState, op.ChannelWatchInfos[0].GetState())
-
-					chManager.stateTimer.removeTimers(chs)
-				}
-			})
-		}
-	})
-
-	t.Run("test updateWithTimer", func(t *testing.T) {
-		var (
-			nodeID       = UniqueID(112)
-			collectionID = UniqueID(2)
-			channelName  = "update-with-timer"
-		)
-
-		chManager, err := NewChannelManager(metakv, newMockHandler())
-		require.NoError(t, err)
-		chManager.store.Add(nodeID)
-
-		opSet := getReleaseOp(nodeID, &channel{Name: channelName, CollectionID: collectionID})
-
-		chManager.updateWithTimer(opSet, datapb.ChannelWatchState_ToWatch)
-		chManager.stateTimer.removeTimers([]string{channelName})
-
-		waitAndCheckState(t, metakv, datapb.ChannelWatchState_ToWatch, nodeID, channelName, collectionID)
-	})
-
-	t.Run("test background check silent", func(t *testing.T) {
-		metakv.RemoveWithPrefix("")
-		defer metakv.RemoveWithPrefix("")
-		prefix := Params.CommonCfg.DataCoordWatchSubPath.GetValue()
-		var (
-			collectionID      = UniqueID(9)
-			channelNamePrefix = t.Name()
-			nodeID            = UniqueID(111)
-		)
-		cName := channelNamePrefix + "TestBgChecker"
-
-		//1. set up channel_manager
-		ctx, cancel := context.WithCancel(context.TODO())
-		defer cancel()
-		chManager, err := NewChannelManager(metakv, newMockHandler(), withBgChecker())
-		require.NoError(t, err)
-		assert.NotNil(t, chManager.bgChecker)
-		chManager.Startup(ctx, []int64{nodeID})
-
-		//2. test isSilent function running correctly
-		Params.Save(Params.DataCoordCfg.ChannelBalanceSilentDuration.Key, "3")
-		assert.False(t, chManager.isSilent())
-		assert.False(t, chManager.stateTimer.hasRunningTimers())
-
-		//3. watch one channel
-		chManager.Watch(&channel{Name: cName, CollectionID: collectionID})
-		assert.False(t, chManager.isSilent())
-		assert.True(t, chManager.stateTimer.hasRunningTimers())
-		key := path.Join(prefix, strconv.FormatInt(nodeID, 10), cName)
-		waitAndStore(t, metakv, key, datapb.ChannelWatchState_ToWatch, datapb.ChannelWatchState_WatchSuccess)
-		waitAndCheckState(t, metakv, datapb.ChannelWatchState_WatchSuccess, nodeID, cName, collectionID)
-
-		//4. wait for duration and check silent again
-		time.Sleep(Params.DataCoordCfg.ChannelBalanceSilentDuration.GetAsDuration(time.Second))
-		chManager.stateTimer.removeTimers([]string{cName})
-		assert.True(t, chManager.isSilent())
-		assert.False(t, chManager.stateTimer.hasRunningTimers())
-	})
-}
-
-func TestChannelManager_Reload(t *testing.T) {
-	metakv := getMetaKv(t)
-	defer func() {
-		metakv.RemoveWithPrefix("")
-		metakv.Close()
-	}()
-
-	var (
-		nodeID       = UniqueID(200)
-		collectionID = UniqueID(2)
-		channelName  = "channel-checkOldNodes"
-	)
-	prefix := Params.CommonCfg.DataCoordWatchSubPath.GetValue()
-
-	getWatchInfoWithState := func(state datapb.ChannelWatchState, collectionID UniqueID, channelName string) *datapb.ChannelWatchInfo {
-		return &datapb.ChannelWatchInfo{
-			Vchan: &datapb.VchannelInfo{
-				CollectionID: collectionID,
-				ChannelName:  channelName,
-			},
-			State: state,
-		}
-	}
-
-	t.Run("test checkOldNodes", func(t *testing.T) {
-		metakv.RemoveWithPrefix("")
-
-		t.Run("ToWatch", func(t *testing.T) {
-			defer metakv.RemoveWithPrefix("")
-			data, err := proto.Marshal(getWatchInfoWithState(datapb.ChannelWatchState_ToWatch, collectionID, channelName))
-			require.NoError(t, err)
-			chManager, err := NewChannelManager(metakv, newMockHandler())
-			require.NoError(t, err)
-			err = metakv.Save(path.Join(prefix, strconv.FormatInt(nodeID, 10), channelName), string(data))
-			require.NoError(t, err)
-
-			chManager.checkOldNodes([]UniqueID{nodeID})
-			_, ok := chManager.stateTimer.runningTimerStops.Load(channelName)
-			assert.True(t, ok)
-			chManager.stateTimer.removeTimers([]string{channelName})
+		lo.ForEach(testChannels, func(ch string, _ int) {
+			s.checkAssignment(m, bufferID, ch, Standby)
 		})
 
-		t.Run("ToRelease", func(t *testing.T) {
-			defer metakv.RemoveWithPrefix("")
-			data, err := proto.Marshal(getWatchInfoWithState(datapb.ChannelWatchState_ToRelease, collectionID, channelName))
-			require.NoError(t, err)
-			chManager, err := NewChannelManager(metakv, newMockHandler())
-			require.NoError(t, err)
-			err = metakv.Save(path.Join(prefix, strconv.FormatInt(nodeID, 10), channelName), string(data))
-			require.NoError(t, err)
-			err = chManager.checkOldNodes([]UniqueID{nodeID})
-			assert.NoError(t, err)
+		err = m.AddNode(testNodeID)
+		s.NoError(err)
 
-			_, ok := chManager.stateTimer.runningTimerStops.Load(channelName)
-			assert.True(t, ok)
-			chManager.stateTimer.removeTimers([]string{channelName})
-		})
-
-		t.Run("WatchFail", func(t *testing.T) {
-			defer metakv.RemoveWithPrefix("")
-			chManager, err := NewChannelManager(metakv, newMockHandler())
-			require.NoError(t, err)
-			chManager.store = &ChannelStore{
-				store: metakv,
-				channelsInfo: map[int64]*NodeChannelInfo{
-					nodeID: {nodeID, []*channel{{Name: channelName, CollectionID: collectionID}}}},
-			}
-
-			data, err := proto.Marshal(getWatchInfoWithState(datapb.ChannelWatchState_WatchFailure, collectionID, channelName))
-			require.NoError(t, err)
-			err = metakv.Save(path.Join(prefix, strconv.FormatInt(nodeID, 10), channelName), string(data))
-			require.NoError(t, err)
-			err = chManager.checkOldNodes([]UniqueID{nodeID})
-			assert.NoError(t, err)
-
-			waitAndCheckState(t, metakv, datapb.ChannelWatchState_ToRelease, nodeID, channelName, collectionID)
-			chManager.stateTimer.removeTimers([]string{channelName})
-		})
-
-		t.Run("ReleaseSuccess", func(t *testing.T) {
-			defer metakv.RemoveWithPrefix("")
-			chManager, err := NewChannelManager(metakv, newMockHandler())
-			require.NoError(t, err)
-			data, err := proto.Marshal(getWatchInfoWithState(datapb.ChannelWatchState_ReleaseSuccess, collectionID, channelName))
-			chManager.store = &ChannelStore{
-				store: metakv,
-				channelsInfo: map[int64]*NodeChannelInfo{
-					nodeID: {nodeID, []*channel{{Name: channelName, CollectionID: collectionID}}}},
-			}
-
-			require.NoError(t, err)
-			chManager.AddNode(UniqueID(111))
-			err = metakv.Save(path.Join(prefix, strconv.FormatInt(nodeID, 10), channelName), string(data))
-			require.NoError(t, err)
-			err = chManager.checkOldNodes([]UniqueID{nodeID})
-			assert.NoError(t, err)
-
-			waitAndCheckState(t, metakv, datapb.ChannelWatchState_ToWatch, 111, channelName, collectionID)
-			chManager.stateTimer.removeTimers([]string{channelName})
-
-			v, err := metakv.Load(path.Join(prefix, strconv.FormatInt(nodeID, 10)))
-			assert.Error(t, err)
-			assert.Empty(t, v)
-		})
-
-		t.Run("ReleaseFail", func(t *testing.T) {
-			defer metakv.RemoveWithPrefix("")
-			chManager, err := NewChannelManager(metakv, newMockHandler())
-			require.NoError(t, err)
-			data, err := proto.Marshal(getWatchInfoWithState(datapb.ChannelWatchState_ReleaseFailure, collectionID, channelName))
-			chManager.store = &ChannelStore{
-				store: metakv,
-				channelsInfo: map[int64]*NodeChannelInfo{
-					nodeID: {nodeID, []*channel{{Name: channelName, CollectionID: collectionID}}},
-					999:    {999, []*channel{}},
-				},
-			}
-			require.NoError(t, err)
-			err = metakv.Save(path.Join(prefix, strconv.FormatInt(nodeID, 10), channelName), string(data))
-			require.NoError(t, err)
-			err = chManager.checkOldNodes([]UniqueID{nodeID})
-			assert.NoError(t, err)
-
-			waitAndCheckState(t, metakv, datapb.ChannelWatchState_ToWatch, 999, channelName, collectionID)
-
-			v, err := metakv.Load(path.Join(prefix, strconv.FormatInt(nodeID, 10), channelName))
-			assert.Error(t, err)
-			assert.Empty(t, v)
-
+		lo.ForEach(testChannels, func(ch string, _ int) {
+			s.checkAssignment(m, testNodeID, ch, ToWatch)
 		})
 	})
+	s.Run("AddNode with channels evenly in other node", func() {
+		var (
+			testNodeID   int64 = 100
+			storedNodeID int64 = 1
+			testChannel        = "ch1"
+		)
 
-	t.Run("test reload with data", func(t *testing.T) {
-		defer metakv.RemoveWithPrefix("")
+		chNodes := map[string]int64{testChannel: storedNodeID}
+		s.prepareMeta(chNodes, datapb.ChannelWatchState_WatchSuccess)
 
-		ctx, cancel := context.WithCancel(context.TODO())
-		defer cancel()
+		m, err := NewChannelManager(s.mockKv, s.mockHandler, s.mockCluster, s.mockAlloc)
+		s.Require().NoError(err)
 
-		cm, err := NewChannelManager(metakv, newMockHandler())
-		assert.Nil(t, err)
-		assert.Nil(t, cm.AddNode(1))
-		assert.Nil(t, cm.AddNode(2))
-		cm.store = &ChannelStore{
-			store: metakv,
-			channelsInfo: map[int64]*NodeChannelInfo{
-				1: {1, []*channel{{Name: "channel1", CollectionID: 1}}},
-				2: {2, []*channel{{Name: "channel2", CollectionID: 1}}},
-			},
+		s.checkAssignment(m, storedNodeID, testChannel, Watched)
+
+		err = m.AddNode(testNodeID)
+		s.NoError(err)
+		s.ElementsMatch([]int64{100, 1}, m.store.GetNodes())
+		s.checkNoAssignment(m, testNodeID, testChannel)
+
+		testNodeID = 101
+		paramtable.Get().Save(paramtable.Get().DataCoordCfg.AutoBalance.Key, "true")
+		defer paramtable.Get().Reset(paramtable.Get().DataCoordCfg.AutoBalance.Key)
+
+		err = m.AddNode(testNodeID)
+		s.NoError(err)
+		s.ElementsMatch([]int64{100, 101, 1}, m.store.GetNodes())
+		s.checkNoAssignment(m, testNodeID, testChannel)
+	})
+	s.Run("AddNode with channels unevenly in other node", func() {
+		chNodes := map[string]int64{
+			"ch1": 1,
+			"ch2": 1,
+			"ch3": 1,
 		}
+		s.prepareMeta(chNodes, datapb.ChannelWatchState_WatchSuccess)
 
-		data, err := proto.Marshal(getWatchInfoWithState(datapb.ChannelWatchState_WatchSuccess, 1, "channel1"))
-		require.NoError(t, err)
-		err = metakv.Save(path.Join(prefix, strconv.FormatInt(1, 10), "channel1"), string(data))
-		require.NoError(t, err)
-		data, err = proto.Marshal(getWatchInfoWithState(datapb.ChannelWatchState_WatchSuccess, 1, "channel2"))
-		require.NoError(t, err)
-		err = metakv.Save(path.Join(prefix, strconv.FormatInt(2, 10), "channel2"), string(data))
-		require.NoError(t, err)
+		m, err := NewChannelManager(s.mockKv, s.mockHandler, s.mockCluster, s.mockAlloc)
+		s.Require().NoError(err)
 
-		cm2, err := NewChannelManager(metakv, newMockHandler())
-		assert.Nil(t, err)
-		assert.Nil(t, cm2.Startup(ctx, []int64{3}))
+		var testNodeID int64 = 100
+		paramtable.Get().Save(paramtable.Get().DataCoordCfg.AutoBalance.Key, "true")
+		defer paramtable.Get().Reset(paramtable.Get().DataCoordCfg.AutoBalance.Key)
 
-		waitAndCheckState(t, metakv, datapb.ChannelWatchState_ToWatch, 3, "channel1", 1)
-		waitAndCheckState(t, metakv, datapb.ChannelWatchState_ToWatch, 3, "channel2", 1)
-		assert.True(t, cm2.Match(3, "channel1"))
-		assert.True(t, cm2.Match(3, "channel2"))
-
-		cm2.stateTimer.removeTimers([]string{"channel1", "channel2"})
+		err = m.AddNode(testNodeID)
+		s.NoError(err)
+		s.ElementsMatch([]int64{testNodeID, 1}, m.store.GetNodes())
 	})
 }
 
-func TestChannelManager_BalanceBehaviour(t *testing.T) {
-	metakv := getMetaKv(t)
-	defer func() {
-		metakv.RemoveWithPrefix("")
-		metakv.Close()
-	}()
+func (s *ChannelManagerSuite) TestWatch() {
+	s.Run("test Watch with empty store", func() {
+		s.prepareMeta(nil, 0)
+		m, err := NewChannelManager(s.mockKv, s.mockHandler, s.mockCluster, s.mockAlloc)
+		s.Require().NoError(err)
 
-	prefix := Params.CommonCfg.DataCoordWatchSubPath.GetValue()
+		var testCh string = "ch1"
 
-	t.Run("one node with three channels add a new node", func(t *testing.T) {
-		defer metakv.RemoveWithPrefix("")
+		err = m.Watch(context.TODO(), getChannel(testCh, 1))
+		s.NoError(err)
 
-		var (
-			collectionID = UniqueID(999)
-		)
-
-		chManager, err := NewChannelManager(metakv, newMockHandler(), withStateChecker())
-		require.NoError(t, err)
-
-		ctx, cancel := context.WithCancel(context.TODO())
-		chManager.stopChecker = cancel
-		defer cancel()
-		go chManager.stateChecker(ctx, common.LatestRevision)
-
-		chManager.store = &ChannelStore{
-			store: metakv,
-			channelsInfo: map[int64]*NodeChannelInfo{
-				1: {1, []*channel{
-					{Name: "channel-1", CollectionID: collectionID},
-					{Name: "channel-2", CollectionID: collectionID},
-					{Name: "channel-3", CollectionID: collectionID}}}},
-		}
-
-		var (
-			channelBalanced string
-		)
-
-		chManager.AddNode(2)
-		channelBalanced = "channel-1"
-
-		// waitAndStore := func(waitState, storeState datapb.ChannelWatchState, nodeID UniqueID, channelName string) {
-		//     for {
-		//         key := path.Join(prefix, strconv.FormatInt(nodeID, 10), channelName)
-		//         v, err := metakv.Load(key)
-		//         if err == nil && len(v) > 0 {
-		//             watchInfo, err := parseWatchInfo(key, []byte(v))
-		//             require.NoError(t, err)
-		//             require.Equal(t, waitState, watchInfo.GetState())
-		//
-		//             watchInfo.State = storeState
-		//             data, err := proto.Marshal(watchInfo)
-		//             require.NoError(t, err)
-		//
-		//             metakv.Save(key, string(data))
-		//             break
-		//         }
-		//         time.Sleep(100 * time.Millisecond)
-		//     }
-		// }
-
-		key := path.Join(prefix, "1", channelBalanced)
-		waitAndStore(t, metakv, key, datapb.ChannelWatchState_ToRelease, datapb.ChannelWatchState_ReleaseSuccess)
-
-		key = path.Join(prefix, "2", channelBalanced)
-		waitAndStore(t, metakv, key, datapb.ChannelWatchState_ToWatch, datapb.ChannelWatchState_WatchSuccess)
-
-		assert.True(t, chManager.Match(1, "channel-2"))
-		assert.True(t, chManager.Match(1, "channel-3"))
-
-		assert.True(t, chManager.Match(2, "channel-1"))
-
-		chManager.AddNode(3)
-		chManager.Watch(&channel{Name: "channel-4", CollectionID: collectionID})
-		key = path.Join(prefix, "3", "channel-4")
-		waitAndStore(t, metakv, key, datapb.ChannelWatchState_ToWatch, datapb.ChannelWatchState_WatchSuccess)
-
-		assert.True(t, chManager.Match(1, "channel-2"))
-		assert.True(t, chManager.Match(1, "channel-3"))
-		assert.True(t, chManager.Match(2, "channel-1"))
-		assert.True(t, chManager.Match(3, "channel-4"))
-
-		chManager.DeleteNode(3)
-		key = path.Join(prefix, "2", "channel-4")
-		waitAndStore(t, metakv, key, datapb.ChannelWatchState_ToWatch, datapb.ChannelWatchState_WatchSuccess)
-
-		assert.True(t, chManager.Match(1, "channel-2"))
-		assert.True(t, chManager.Match(1, "channel-3"))
-		assert.True(t, chManager.Match(2, "channel-1"))
-		assert.True(t, chManager.Match(2, "channel-4"))
-
-		chManager.DeleteNode(2)
-		key = path.Join(prefix, "1", "channel-4")
-		waitAndStore(t, metakv, key, datapb.ChannelWatchState_ToWatch, datapb.ChannelWatchState_WatchSuccess)
-		key = path.Join(prefix, "1", "channel-1")
-		waitAndStore(t, metakv, key, datapb.ChannelWatchState_ToWatch, datapb.ChannelWatchState_WatchSuccess)
-
-		assert.True(t, chManager.Match(1, "channel-2"))
-		assert.True(t, chManager.Match(1, "channel-3"))
-		assert.True(t, chManager.Match(1, "channel-1"))
-		assert.True(t, chManager.Match(1, "channel-4"))
+		s.checkAssignment(m, bufferID, testCh, Standby)
 	})
+	s.Run("test Watch with nodeID in store", func() {
+		s.prepareMeta(nil, 0)
+		m, err := NewChannelManager(s.mockKv, s.mockHandler, s.mockCluster, s.mockAlloc)
+		s.Require().NoError(err)
 
+		var (
+			testCh     string = "ch1"
+			testNodeID int64  = 1
+		)
+		err = m.AddNode(testNodeID)
+		s.NoError(err)
+		s.checkNoAssignment(m, testNodeID, testCh)
+
+		err = m.Watch(context.TODO(), getChannel(testCh, 1))
+		s.NoError(err)
+
+		s.checkAssignment(m, testNodeID, testCh, ToWatch)
+	})
 }
 
-func TestChannelManager_RemoveChannel(t *testing.T) {
-	metakv := getMetaKv(t)
-	defer func() {
-		metakv.RemoveWithPrefix("")
-		metakv.Close()
-	}()
+func (s *ChannelManagerSuite) TestRelease() {
+	s.Run("release not exist nodeID and channel", func() {
+		s.prepareMeta(nil, 0)
+		m, err := NewChannelManager(s.mockKv, s.mockHandler, s.mockCluster, s.mockAlloc)
+		s.Require().NoError(err)
 
-	type fields struct {
-		store RWChannelStore
+		err = m.Release(1, "ch1")
+		s.Error(err)
+		log.Info("error", zap.String("msg", err.Error()))
+
+		m.AddNode(1)
+		err = m.Release(1, "ch1")
+		s.Error(err)
+		log.Info("error", zap.String("msg", err.Error()))
+	})
+
+	s.Run("release channel in bufferID", func() {
+		s.prepareMeta(nil, 0)
+		m, err := NewChannelManager(s.mockKv, s.mockHandler, s.mockCluster, s.mockAlloc)
+		s.Require().NoError(err)
+
+		m.Watch(context.TODO(), getChannel("ch1", 1))
+		s.checkAssignment(m, bufferID, "ch1", Standby)
+
+		err = m.Release(bufferID, "ch1")
+		s.NoError(err)
+		s.checkAssignment(m, bufferID, "ch1", Standby)
+	})
+}
+
+func (s *ChannelManagerSuite) TestDeleteNode() {
+	s.Run("delete not exsit node", func() {
+		s.prepareMeta(nil, 0)
+		m, err := NewChannelManager(s.mockKv, s.mockHandler, s.mockCluster, s.mockAlloc)
+		s.Require().NoError(err)
+		info := m.store.GetNode(1)
+		s.Require().Nil(info)
+
+		err = m.DeleteNode(1)
+		s.NoError(err)
+	})
+	s.Run("delete bufferID", func() {
+		s.prepareMeta(nil, 0)
+		m, err := NewChannelManager(s.mockKv, s.mockHandler, s.mockCluster, s.mockAlloc)
+		s.Require().NoError(err)
+		info := m.store.GetNode(bufferID)
+		s.Require().NotNil(info)
+
+		err = m.DeleteNode(bufferID)
+		s.NoError(err)
+	})
+
+	s.Run("delete node without assigment", func() {
+		s.prepareMeta(nil, 0)
+		m, err := NewChannelManager(s.mockKv, s.mockHandler, s.mockCluster, s.mockAlloc)
+		s.Require().NoError(err)
+
+		err = m.AddNode(1)
+		s.NoError(err)
+		info := m.store.GetNode(bufferID)
+		s.Require().NotNil(info)
+
+		err = m.DeleteNode(1)
+		s.NoError(err)
+		info = m.store.GetNode(1)
+		s.Nil(info)
+	})
+	s.Run("delete node with channel", func() {
+		chNodes := map[string]int64{
+			"ch1": 1,
+			"ch2": 1,
+			"ch3": 1,
+		}
+		s.prepareMeta(chNodes, datapb.ChannelWatchState_WatchSuccess)
+		m, err := NewChannelManager(s.mockKv, s.mockHandler, s.mockCluster, s.mockAlloc)
+		s.Require().NoError(err)
+		s.checkAssignment(m, 1, "ch1", Watched)
+		s.checkAssignment(m, 1, "ch2", Watched)
+		s.checkAssignment(m, 1, "ch3", Watched)
+
+		err = m.AddNode(2)
+		s.NoError(err)
+
+		err = m.DeleteNode(1)
+		s.NoError(err)
+		info := m.store.GetNode(bufferID)
+		s.NotNil(info)
+
+		s.Equal(3, len(info.Channels))
+		s.EqualValues(bufferID, info.NodeID)
+		s.checkAssignment(m, bufferID, "ch1", Standby)
+		s.checkAssignment(m, bufferID, "ch2", Standby)
+		s.checkAssignment(m, bufferID, "ch3", Standby)
+
+		info = m.store.GetNode(1)
+		s.Nil(info)
+	})
+}
+
+func (s *ChannelManagerSuite) TestFindWatcher() {
+	chNodes := map[string]int64{
+		"ch1": bufferID,
+		"ch2": bufferID,
+		"ch3": 1,
+		"ch4": 1,
 	}
-	type args struct {
-		channelName string
-	}
+	s.prepareMeta(chNodes, datapb.ChannelWatchState_WatchSuccess)
+	m, err := NewChannelManager(s.mockKv, s.mockHandler, s.mockCluster, s.mockAlloc)
+	s.Require().NoError(err)
+
 	tests := []struct {
-		name    string
-		fields  fields
-		args    args
-		wantErr bool
+		description string
+		testCh      string
+
+		outNodeID int64
+		outError  bool
 	}{
+		{"channel not exist", "ch-notexist", 0, true},
+		{"channel in bufferID", "ch1", bufferID, true},
+		{"channel in bufferID", "ch2", bufferID, true},
+		{"channel in nodeID=1", "ch3", 1, false},
+		{"channel in nodeID=1", "ch4", 1, false},
+	}
+
+	for _, test := range tests {
+		s.Run(test.description, func() {
+			gotID, gotErr := m.FindWatcher(test.testCh)
+			s.EqualValues(test.outNodeID, gotID)
+			if test.outError {
+				s.Error(gotErr)
+			} else {
+				s.NoError(gotErr)
+			}
+		})
+	}
+}
+
+func (s *ChannelManagerSuite) TestAdvanceChannelState() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.Run("advance statndby with no available nodes", func() {
+		chNodes := map[string]int64{
+			"ch1": bufferID,
+			"ch2": bufferID,
+		}
+		s.prepareMeta(chNodes, datapb.ChannelWatchState_ToWatch)
+		s.mockHandler.EXPECT().CheckShouldDropChannel(mock.Anything).Return(false)
+		m, err := NewChannelManager(s.mockKv, s.mockHandler, s.mockCluster, s.mockAlloc)
+		s.Require().NoError(err)
+		s.checkAssignment(m, bufferID, "ch1", Standby)
+		s.checkAssignment(m, bufferID, "ch2", Standby)
+
+		m.AdvanceChannelState(ctx)
+		s.checkAssignment(m, bufferID, "ch1", Standby)
+		s.checkAssignment(m, bufferID, "ch2", Standby)
+	})
+
+	s.Run("advance statndby with node 1", func() {
+		chNodes := map[string]int64{
+			"ch1": bufferID,
+			"ch2": bufferID,
+			"ch3": 1,
+		}
+		s.prepareMeta(chNodes, datapb.ChannelWatchState_WatchSuccess)
+		s.mockHandler.EXPECT().CheckShouldDropChannel(mock.Anything).Return(false).Times(2)
+		m, err := NewChannelManager(s.mockKv, s.mockHandler, s.mockCluster, s.mockAlloc)
+		s.Require().NoError(err)
+		s.checkAssignment(m, bufferID, "ch1", Standby)
+		s.checkAssignment(m, bufferID, "ch2", Standby)
+		s.checkAssignment(m, 1, "ch3", Watched)
+
+		m.AdvanceChannelState(ctx)
+		s.checkAssignment(m, 1, "ch1", ToWatch)
+		s.checkAssignment(m, 1, "ch2", ToWatch)
+	})
+	s.Run("advance towatch channels notify success check success", func() {
+		chNodes := map[string]int64{
+			"ch1": 1,
+			"ch2": 1,
+		}
+		s.prepareMeta(chNodes, datapb.ChannelWatchState_ToWatch)
+		s.mockCluster.EXPECT().NotifyChannelOperation(mock.Anything, mock.Anything, mock.Anything).Return(nil).Twice()
+		m, err := NewChannelManager(s.mockKv, s.mockHandler, s.mockCluster, s.mockAlloc)
+		s.Require().NoError(err)
+		s.checkAssignment(m, 1, "ch1", ToWatch)
+		s.checkAssignment(m, 1, "ch2", ToWatch)
+
+		m.AdvanceChannelState(ctx)
+		s.checkAssignment(m, 1, "ch1", Watching)
+		s.checkAssignment(m, 1, "ch2", Watching)
+	})
+	s.Run("advance watching channels check no progress", func() {
+		chNodes := map[string]int64{
+			"ch1": 1,
+			"ch2": 1,
+		}
+		s.prepareMeta(chNodes, datapb.ChannelWatchState_ToWatch)
+		s.mockCluster.EXPECT().NotifyChannelOperation(mock.Anything, mock.Anything, mock.Anything).Return(nil).Twice()
+		m, err := NewChannelManager(s.mockKv, s.mockHandler, s.mockCluster, s.mockAlloc)
+		s.Require().NoError(err)
+		s.checkAssignment(m, 1, "ch1", ToWatch)
+		s.checkAssignment(m, 1, "ch2", ToWatch)
+
+		m.AdvanceChannelState(ctx)
+		s.checkAssignment(m, 1, "ch1", Watching)
+		s.checkAssignment(m, 1, "ch2", Watching)
+
+		s.mockCluster.EXPECT().CheckChannelOperationProgress(mock.Anything, mock.Anything, mock.Anything).
+			Return(&datapb.ChannelOperationProgressResponse{State: datapb.ChannelWatchState_ToWatch}, nil).Twice()
+		m.AdvanceChannelState(ctx)
+		s.checkAssignment(m, 1, "ch1", Watching)
+		s.checkAssignment(m, 1, "ch2", Watching)
+	})
+
+	s.Run("advance watching channels released during check", func() {
+		idx := int64(19530)
+		mockAlloc := globalIDAllocator.NewMockGlobalIDAllocator(s.T())
+		mockAlloc.EXPECT().AllocOne().
+			RunAndReturn(func() (int64, error) {
+				idx++
+				return idx, nil
+			})
+		chNodes := map[string]int64{
+			"ch1": 1,
+			"ch2": 1,
+		}
+		s.prepareMeta(chNodes, datapb.ChannelWatchState_ToWatch)
+		s.mockCluster.EXPECT().NotifyChannelOperation(mock.Anything, mock.Anything, mock.Anything).Return(nil).Twice()
+		m, err := NewChannelManager(s.mockKv, s.mockHandler, s.mockCluster, mockAlloc)
+		s.Require().NoError(err)
+		s.checkAssignment(m, 1, "ch1", ToWatch)
+		s.checkAssignment(m, 1, "ch2", ToWatch)
+
+		m.AdvanceChannelState(ctx)
+		s.checkAssignment(m, 1, "ch1", Watching)
+		s.checkAssignment(m, 1, "ch2", Watching)
+
+		// Release belfore check return
+		s.mockCluster.EXPECT().CheckChannelOperationProgress(mock.Anything, mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, nodeID int64, info *datapb.ChannelWatchInfo) (*datapb.ChannelOperationProgressResponse, error) {
+			if info.GetVchan().GetChannelName() == "ch1" {
+				m.Release(1, "ch1")
+				s.checkAssignment(m, 1, "ch1", ToRelease)
+				rwChannel, found := m.GetChannel(nodeID, "ch1")
+				s.True(found)
+				metaInfo := rwChannel.GetWatchInfo()
+				s.Require().EqualValues(metaInfo.GetOpID(), 19531)
+				log.Info("Trying to check this info", zap.Any("meta info", rwChannel.GetWatchInfo()))
+			}
+			log.Info("Trying to check this info", zap.Any("rpc info", info))
+			return &datapb.ChannelOperationProgressResponse{State: datapb.ChannelWatchState_WatchSuccess, Progress: 100}, nil
+		}).Twice()
+		m.AdvanceChannelState(ctx)
+
+		s.checkAssignment(m, 1, "ch1", ToRelease)
+		s.checkAssignment(m, 1, "ch2", Watched)
+	})
+
+	s.Run("advance watching channels check ErrNodeNotFound", func() {
+		chNodes := map[string]int64{
+			"ch1": 1,
+			"ch2": 1,
+		}
+		s.prepareMeta(chNodes, datapb.ChannelWatchState_ToWatch)
+		s.mockCluster.EXPECT().NotifyChannelOperation(mock.Anything, mock.Anything, mock.Anything).Return(nil).Twice()
+		m, err := NewChannelManager(s.mockKv, s.mockHandler, s.mockCluster, s.mockAlloc)
+		s.Require().NoError(err)
+		s.checkAssignment(m, 1, "ch1", ToWatch)
+		s.checkAssignment(m, 1, "ch2", ToWatch)
+
+		m.AdvanceChannelState(ctx)
+		s.checkAssignment(m, 1, "ch1", Watching)
+		s.checkAssignment(m, 1, "ch2", Watching)
+
+		s.mockCluster.EXPECT().CheckChannelOperationProgress(mock.Anything, mock.Anything, mock.Anything).
+			Return(nil, merr.WrapErrNodeNotFound(1)).Twice()
+		m.AdvanceChannelState(ctx)
+		s.checkAssignment(m, 1, "ch1", Standby)
+		s.checkAssignment(m, 1, "ch2", Standby)
+	})
+
+	s.Run("advance watching channels check watch success", func() {
+		chNodes := map[string]int64{
+			"ch1": 1,
+			"ch2": 1,
+		}
+		s.prepareMeta(chNodes, datapb.ChannelWatchState_ToWatch)
+		s.mockCluster.EXPECT().NotifyChannelOperation(mock.Anything, mock.Anything, mock.Anything).Return(nil).Twice()
+		m, err := NewChannelManager(s.mockKv, s.mockHandler, s.mockCluster, s.mockAlloc)
+		s.Require().NoError(err)
+		s.checkAssignment(m, 1, "ch1", ToWatch)
+		s.checkAssignment(m, 1, "ch2", ToWatch)
+
+		m.AdvanceChannelState(ctx)
+		s.checkAssignment(m, 1, "ch1", Watching)
+		s.checkAssignment(m, 1, "ch2", Watching)
+
+		s.mockCluster.EXPECT().CheckChannelOperationProgress(mock.Anything, mock.Anything, mock.Anything).
+			Return(&datapb.ChannelOperationProgressResponse{State: datapb.ChannelWatchState_WatchSuccess}, nil).Twice()
+		m.AdvanceChannelState(ctx)
+		s.checkAssignment(m, 1, "ch1", Watched)
+		s.checkAssignment(m, 1, "ch2", Watched)
+	})
+	s.Run("advance watching channels check watch fail", func() {
+		chNodes := map[string]int64{
+			"ch1": 1,
+			"ch2": 1,
+		}
+		s.prepareMeta(chNodes, datapb.ChannelWatchState_ToWatch)
+		s.mockCluster.EXPECT().NotifyChannelOperation(mock.Anything, mock.Anything, mock.Anything).Return(nil).Times(2)
+		m, err := NewChannelManager(s.mockKv, s.mockHandler, s.mockCluster, s.mockAlloc)
+		s.Require().NoError(err)
+		s.checkAssignment(m, 1, "ch1", ToWatch)
+		s.checkAssignment(m, 1, "ch2", ToWatch)
+
+		m.AdvanceChannelState(ctx)
+		s.checkAssignment(m, 1, "ch1", Watching)
+		s.checkAssignment(m, 1, "ch2", Watching)
+
+		s.mockCluster.EXPECT().CheckChannelOperationProgress(mock.Anything, mock.Anything, mock.Anything).
+			Return(&datapb.ChannelOperationProgressResponse{State: datapb.ChannelWatchState_WatchFailure}, nil).Twice()
+		m.AdvanceChannelState(ctx)
+		s.checkAssignment(m, 1, "ch1", Standby)
+		s.checkAssignment(m, 1, "ch2", Standby)
+
+		s.mockHandler.EXPECT().CheckShouldDropChannel(mock.Anything).Return(false)
+		m.AdvanceChannelState(ctx)
+		s.checkAssignment(m, 1, "ch1", ToWatch)
+		s.checkAssignment(m, 1, "ch2", ToWatch)
+	})
+	s.Run("advance releasing channels check release no progress", func() {
+		chNodes := map[string]int64{
+			"ch1": 1,
+			"ch2": 1,
+		}
+		s.prepareMeta(chNodes, datapb.ChannelWatchState_ToRelease)
+		s.mockCluster.EXPECT().NotifyChannelOperation(mock.Anything, mock.Anything, mock.Anything).Return(nil).Twice()
+		m, err := NewChannelManager(s.mockKv, s.mockHandler, s.mockCluster, s.mockAlloc)
+		s.Require().NoError(err)
+		s.checkAssignment(m, 1, "ch1", ToRelease)
+		s.checkAssignment(m, 1, "ch2", ToRelease)
+
+		m.AdvanceChannelState(ctx)
+		s.checkAssignment(m, 1, "ch1", Releasing)
+		s.checkAssignment(m, 1, "ch2", Releasing)
+
+		s.mockCluster.EXPECT().CheckChannelOperationProgress(mock.Anything, mock.Anything, mock.Anything).
+			Return(&datapb.ChannelOperationProgressResponse{State: datapb.ChannelWatchState_ToRelease}, nil).Twice()
+		m.AdvanceChannelState(ctx)
+		s.checkAssignment(m, 1, "ch1", Releasing)
+		s.checkAssignment(m, 1, "ch2", Releasing)
+	})
+	s.Run("advance releasing channels check ErrNodeNotFound", func() {
+		chNodes := map[string]int64{
+			"ch1": 1,
+			"ch2": 1,
+		}
+		s.prepareMeta(chNodes, datapb.ChannelWatchState_ToRelease)
+		s.mockCluster.EXPECT().NotifyChannelOperation(mock.Anything, mock.Anything, mock.Anything).Return(nil).Twice()
+		m, err := NewChannelManager(s.mockKv, s.mockHandler, s.mockCluster, s.mockAlloc)
+		s.Require().NoError(err)
+		s.checkAssignment(m, 1, "ch1", ToRelease)
+		s.checkAssignment(m, 1, "ch2", ToRelease)
+
+		m.AdvanceChannelState(ctx)
+		s.checkAssignment(m, 1, "ch1", Releasing)
+		s.checkAssignment(m, 1, "ch2", Releasing)
+
+		s.mockCluster.EXPECT().CheckChannelOperationProgress(mock.Anything, mock.Anything, mock.Anything).
+			Return(nil, merr.WrapErrNodeNotFound(1)).Twice()
+		m.AdvanceChannelState(ctx)
+		s.checkAssignment(m, 1, "ch1", Standby)
+		s.checkAssignment(m, 1, "ch2", Standby)
+	})
+	s.Run("advance releasing channels check release success", func() {
+		chNodes := map[string]int64{
+			"ch1": 1,
+			"ch2": 1,
+		}
+		s.prepareMeta(chNodes, datapb.ChannelWatchState_ToRelease)
+		s.mockCluster.EXPECT().NotifyChannelOperation(mock.Anything, mock.Anything, mock.Anything).Return(nil).Twice()
+		m, err := NewChannelManager(s.mockKv, s.mockHandler, s.mockCluster, s.mockAlloc)
+		s.Require().NoError(err)
+		s.checkAssignment(m, 1, "ch1", ToRelease)
+		s.checkAssignment(m, 1, "ch2", ToRelease)
+
+		m.AdvanceChannelState(ctx)
+		s.checkAssignment(m, 1, "ch1", Releasing)
+		s.checkAssignment(m, 1, "ch2", Releasing)
+
+		s.mockCluster.EXPECT().CheckChannelOperationProgress(mock.Anything, mock.Anything, mock.Anything).
+			Return(&datapb.ChannelOperationProgressResponse{State: datapb.ChannelWatchState_ReleaseSuccess}, nil).Twice()
+		m.AdvanceChannelState(ctx)
+		s.checkAssignment(m, 1, "ch1", Standby)
+		s.checkAssignment(m, 1, "ch2", Standby)
+
+		s.mockHandler.EXPECT().CheckShouldDropChannel(mock.Anything).Return(false)
+		m.AdvanceChannelState(ctx)
+		s.checkAssignment(m, 1, "ch1", ToWatch)
+		s.checkAssignment(m, 1, "ch2", ToWatch)
+	})
+	s.Run("advance releasing channels check release fail", func() {
+		chNodes := map[string]int64{
+			"ch1": 1,
+			"ch2": 1,
+		}
+		s.prepareMeta(chNodes, datapb.ChannelWatchState_ToRelease)
+		s.mockCluster.EXPECT().NotifyChannelOperation(mock.Anything, mock.Anything, mock.Anything).Return(nil).Twice()
+		m, err := NewChannelManager(s.mockKv, s.mockHandler, s.mockCluster, s.mockAlloc)
+		s.Require().NoError(err)
+		s.checkAssignment(m, 1, "ch1", ToRelease)
+		s.checkAssignment(m, 1, "ch2", ToRelease)
+
+		m.AdvanceChannelState(ctx)
+		s.checkAssignment(m, 1, "ch1", Releasing)
+		s.checkAssignment(m, 1, "ch2", Releasing)
+
+		s.mockCluster.EXPECT().CheckChannelOperationProgress(mock.Anything, mock.Anything, mock.Anything).
+			Return(&datapb.ChannelOperationProgressResponse{State: datapb.ChannelWatchState_ReleaseFailure}, nil).Twice()
+		m.AdvanceChannelState(ctx)
+		s.checkAssignment(m, 1, "ch1", Standby)
+		s.checkAssignment(m, 1, "ch2", Standby)
+
+		s.mockHandler.EXPECT().CheckShouldDropChannel(mock.Anything).Return(false)
+		m.AdvanceChannelState(ctx)
+		// TODO, donot assign to abnormal nodes
+		s.checkAssignment(m, 1, "ch1", ToWatch)
+		s.checkAssignment(m, 1, "ch2", ToWatch)
+	})
+	s.Run("advance towatch channels notify fail", func() {
+		chNodes := map[string]int64{
+			"ch1": 1,
+			"ch2": 1,
+		}
+		s.prepareMeta(chNodes, datapb.ChannelWatchState_ToWatch)
+		s.mockCluster.EXPECT().NotifyChannelOperation(mock.Anything, mock.Anything, mock.Anything).
+			Return(fmt.Errorf("mock error")).Twice()
+		m, err := NewChannelManager(s.mockKv, s.mockHandler, s.mockCluster, s.mockAlloc)
+		s.Require().NoError(err)
+		s.checkAssignment(m, 1, "ch1", ToWatch)
+		s.checkAssignment(m, 1, "ch2", ToWatch)
+
+		m.AdvanceChannelState(ctx)
+		s.checkAssignment(m, 1, "ch1", ToWatch)
+		s.checkAssignment(m, 1, "ch2", ToWatch)
+	})
+	s.Run("advance to release channels notify success", func() {
+		chNodes := map[string]int64{
+			"ch1": 1,
+			"ch2": 1,
+		}
+		s.prepareMeta(chNodes, datapb.ChannelWatchState_ToRelease)
+		s.mockCluster.EXPECT().NotifyChannelOperation(mock.Anything, mock.Anything, mock.Anything).Return(nil).Twice()
+		m, err := NewChannelManager(s.mockKv, s.mockHandler, s.mockCluster, s.mockAlloc)
+		s.Require().NoError(err)
+		s.checkAssignment(m, 1, "ch1", ToRelease)
+		s.checkAssignment(m, 1, "ch2", ToRelease)
+
+		m.AdvanceChannelState(ctx)
+		s.checkAssignment(m, 1, "ch1", Releasing)
+		s.checkAssignment(m, 1, "ch2", Releasing)
+	})
+	s.Run("advance to release channels notify fail", func() {
+		chNodes := map[string]int64{
+			"ch1": 1,
+			"ch2": 1,
+		}
+		s.prepareMeta(chNodes, datapb.ChannelWatchState_ToRelease)
+		s.mockCluster.EXPECT().NotifyChannelOperation(mock.Anything, mock.Anything, mock.Anything).
+			Return(fmt.Errorf("mock error")).Twice()
+		m, err := NewChannelManager(s.mockKv, s.mockHandler, s.mockCluster, s.mockAlloc)
+		s.Require().NoError(err)
+		s.checkAssignment(m, 1, "ch1", ToRelease)
+		s.checkAssignment(m, 1, "ch2", ToRelease)
+
+		m.AdvanceChannelState(ctx)
+		s.checkAssignment(m, 1, "ch1", ToRelease)
+		s.checkAssignment(m, 1, "ch2", ToRelease)
+	})
+}
+
+func (s *ChannelManagerSuite) TestStartup() {
+	chNodes := map[string]int64{
+		"ch1": 1,
+		"ch2": 1,
+		"ch3": 3,
+	}
+	s.prepareMeta(chNodes, datapb.ChannelWatchState_ToRelease)
+	s.mockHandler.EXPECT().CheckShouldDropChannel(mock.Anything).Return(false)
+	m, err := NewChannelManager(s.mockKv, s.mockHandler, s.mockCluster, s.mockAlloc)
+	s.Require().NoError(err)
+
+	var (
+		legacyNodes = []int64{1}
+		allNodes    = []int64{1}
+	)
+	err = m.Startup(context.TODO(), legacyNodes, allNodes)
+	s.NoError(err)
+
+	s.checkAssignment(m, 1, "ch1", Legacy)
+	s.checkAssignment(m, 1, "ch2", Legacy)
+	s.checkAssignment(m, bufferID, "ch3", Standby)
+
+	err = m.DeleteNode(1)
+	s.NoError(err)
+
+	s.checkAssignment(m, bufferID, "ch1", Standby)
+	s.checkAssignment(m, bufferID, "ch2", Standby)
+
+	err = m.AddNode(2)
+	s.NoError(err)
+	s.checkAssignment(m, 2, "ch1", ToWatch)
+	s.checkAssignment(m, 2, "ch2", ToWatch)
+	s.checkAssignment(m, 2, "ch3", ToWatch)
+}
+
+func (s *ChannelManagerSuite) TestStartupNilSchema() {
+	chNodes := map[string]int64{
+		"ch1": 1,
+		"ch2": 1,
+		"ch3": 3,
+	}
+	var keys, values []string
+	for channel, nodeID := range chNodes {
+		keys = append(keys, fmt.Sprintf("channel_store/%d/%s", nodeID, channel))
+		info := generateWatchInfo(channel, datapb.ChannelWatchState_ToRelease)
+		info.Schema = nil
+		bs, err := proto.Marshal(info)
+		s.Require().NoError(err)
+		values = append(values, string(bs))
+	}
+	s.mockKv.EXPECT().LoadWithPrefix(mock.Anything, mock.Anything).Return(keys, values, nil).Once()
+	s.mockHandler.EXPECT().CheckShouldDropChannel(mock.Anything).Return(false)
+	m, err := NewChannelManager(s.mockKv, s.mockHandler, s.mockCluster, s.mockAlloc)
+	s.Require().NoError(err)
+	err = m.Startup(context.TODO(), nil, []int64{1, 3})
+	s.Require().NoError(err)
+
+	for ch, node := range chNodes {
+		channel, got := m.GetChannel(node, ch)
+		s.Require().True(got)
+		s.Nil(channel.GetSchema())
+		s.Equal(ch, channel.GetName())
+		log.Info("Recovered nil schema channel", zap.Any("channel", channel))
+	}
+
+	s.mockHandler.EXPECT().GetCollection(mock.Anything, mock.Anything).Return(
+		&collectionInfo{ID: 111, Schema: &schemapb.CollectionSchema{Name: "coll111"}},
+		nil,
+	)
+
+	err = m.DeleteNode(1)
+	s.Require().NoError(err)
+
+	err = m.DeleteNode(3)
+	s.Require().NoError(err)
+
+	s.checkAssignment(m, bufferID, "ch1", Standby)
+	s.checkAssignment(m, bufferID, "ch2", Standby)
+	s.checkAssignment(m, bufferID, "ch3", Standby)
+
+	for ch := range chNodes {
+		channel, got := m.GetChannel(bufferID, ch)
+		s.Require().True(got)
+		s.NotNil(channel.GetSchema())
+		s.Equal(ch, channel.GetName())
+
+		s.NotNil(channel.GetWatchInfo())
+		s.NotNil(channel.GetWatchInfo().Schema)
+		log.Info("Recovered non-nil schema channel", zap.Any("channel", channel))
+	}
+
+	err = m.AddNode(7)
+	s.Require().NoError(err)
+	s.checkAssignment(m, 7, "ch1", ToWatch)
+	s.checkAssignment(m, 7, "ch2", ToWatch)
+	s.checkAssignment(m, 7, "ch3", ToWatch)
+
+	for ch := range chNodes {
+		channel, got := m.GetChannel(7, ch)
+		s.Require().True(got)
+		s.NotNil(channel.GetSchema())
+		s.Equal(ch, channel.GetName())
+
+		s.NotNil(channel.GetWatchInfo())
+		s.NotNil(channel.GetWatchInfo().Schema)
+		log.Info("non-nil schema channel", zap.Any("channel", channel))
+	}
+}
+
+func (s *ChannelManagerSuite) TestStartupRootCoordFailed() {
+	chNodes := map[string]int64{
+		"ch1": 1,
+		"ch2": 1,
+		"ch3": 1,
+		"ch4": bufferID,
+	}
+	s.prepareMeta(chNodes, datapb.ChannelWatchState_ToWatch)
+
+	s.mockAlloc = globalIDAllocator.NewMockGlobalIDAllocator(s.T())
+	s.mockAlloc.EXPECT().AllocOne().Return(0, errors.New("mock error")).Maybe()
+	m, err := NewChannelManager(s.mockKv, s.mockHandler, s.mockCluster, s.mockAlloc)
+	s.Require().NoError(err)
+
+	err = m.Startup(context.TODO(), nil, []int64{2})
+	s.Error(err)
+
+	err = m.Startup(context.TODO(), nil, []int64{1, 2})
+	s.Error(err)
+}
+
+func (s *ChannelManagerSuite) TestCheckLoop() {}
+func (s *ChannelManagerSuite) TestGet()       {}
+
+func (s *ChannelManagerSuite) TestGetChannelWatchInfos() {
+	store := NewMockRWChannelStore(s.T())
+	store.EXPECT().GetNodesChannels().Return([]*NodeChannelInfo{
 		{
-			"test remove existed channel",
-			fields{
-				store: &ChannelStore{
-					store: metakv,
-					channelsInfo: map[int64]*NodeChannelInfo{
-						1: {
-							NodeID: 1,
-							Channels: []*channel{
-								{Name: "ch1", CollectionID: 1},
-							},
+			NodeID: 1,
+			Channels: map[string]RWChannel{
+				"ch1": &channelMeta{
+					WatchInfo: &datapb.ChannelWatchInfo{
+						Vchan: &datapb.VchannelInfo{
+							ChannelName: "ch1",
 						},
+						StartTs: 100,
+						State:   datapb.ChannelWatchState_ToWatch,
+						OpID:    1,
 					},
 				},
 			},
-			args{
-				"ch1",
-			},
-			false,
 		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			c := &ChannelManager{
-				store: tt.fields.store,
-			}
-			err := c.RemoveChannel(tt.args.channelName)
-			assert.Equal(t, tt.wantErr, err != nil)
-			_, ch := c.findChannel(tt.args.channelName)
-			assert.Nil(t, ch)
-		})
-	}
-}
-
-func TestChannelManager_HelperFunc(t *testing.T) {
-	c := &ChannelManager{}
-	t.Run("test getOldOnlines", func(t *testing.T) {
-		tests := []struct {
-			nodes  []int64
-			oNodes []int64
-
-			expectedOut []int64
-			desription  string
-		}{
-			{[]int64{}, []int64{}, []int64{}, "empty both"},
-			{[]int64{1}, []int64{}, []int64{}, "empty oNodes"},
-			{[]int64{}, []int64{1}, []int64{}, "empty nodes"},
-			{[]int64{1}, []int64{1}, []int64{1}, "same one"},
-			{[]int64{1, 2}, []int64{1}, []int64{1}, "same one 2"},
-			{[]int64{1}, []int64{1, 2}, []int64{1}, "same one 3"},
-			{[]int64{1, 2}, []int64{1, 2}, []int64{1, 2}, "same two"},
-		}
-
-		for _, test := range tests {
-			t.Run(test.desription, func(t *testing.T) {
-				nodes := c.getOldOnlines(test.nodes, test.oNodes)
-				assert.ElementsMatch(t, test.expectedOut, nodes)
-			})
-		}
+		{
+			NodeID: 2,
+			Channels: map[string]RWChannel{
+				"ch2": &channelMeta{
+					WatchInfo: &datapb.ChannelWatchInfo{
+						Vchan: &datapb.VchannelInfo{
+							ChannelName: "ch2",
+						},
+						StartTs: 10,
+						State:   datapb.ChannelWatchState_WatchSuccess,
+						OpID:    1,
+					},
+				},
+			},
+		},
 	})
 
-	t.Run("test getNewOnLines", func(t *testing.T) {
-		tests := []struct {
-			nodes  []int64
-			oNodes []int64
+	cm := &ChannelManagerImpl{store: store}
+	infos := cm.GetChannelWatchInfos()
+	s.Equal(2, len(infos))
+	s.Equal("ch1", infos[1]["ch1"].GetVchan().ChannelName)
+	s.Equal("ch2", infos[2]["ch2"].GetVchan().ChannelName)
 
-			expectedOut []int64
-			desription  string
-		}{
-			{[]int64{}, []int64{}, []int64{}, "empty both"},
-			{[]int64{1}, []int64{}, []int64{1}, "empty oNodes"},
-			{[]int64{}, []int64{1}, []int64{}, "empty nodes"},
-			{[]int64{1}, []int64{1}, []int64{}, "same one"},
-			{[]int64{1, 2}, []int64{1}, []int64{2}, "same one 2"},
-			{[]int64{1}, []int64{1, 2}, []int64{}, "same one 3"},
-			{[]int64{1, 2}, []int64{1, 2}, []int64{}, "same two"},
-		}
-
-		for _, test := range tests {
-			t.Run(test.desription, func(t *testing.T) {
-				nodes := c.getNewOnLines(test.nodes, test.oNodes)
-				assert.ElementsMatch(t, test.expectedOut, nodes)
-			})
-		}
-
-	})
+	// test empty value
+	store.EXPECT().GetNodesChannels().Unset()
+	store.EXPECT().GetNodesChannels().Return([]*NodeChannelInfo{})
+	infos = cm.GetChannelWatchInfos()
+	s.Equal(0, len(infos))
 }

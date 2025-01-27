@@ -18,54 +18,82 @@ package grpcrootcoord
 
 import (
 	"context"
-	"net"
-	"strconv"
 	"sync"
 	"time"
 
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
-	"github.com/milvus-io/milvus/internal/util/dependency"
-	"github.com/milvus-io/milvus/pkg/tracer"
+	"github.com/tikv/client-go/v2/txnkv"
 	clientv3 "go.etcd.io/etcd/client/v3"
-	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/proxypb"
-	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus/internal/coordinator/coordclient"
+	"github.com/milvus-io/milvus/internal/distributed/utils"
 	"github.com/milvus-io/milvus/internal/rootcoord"
 	"github.com/milvus-io/milvus/internal/types"
+	"github.com/milvus-io/milvus/internal/util/dependency"
+	_ "github.com/milvus-io/milvus/internal/util/grpcclient"
+	streamingserviceinterceptor "github.com/milvus-io/milvus/internal/util/streamingutil/service/interceptor"
 	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/proto/proxypb"
+	"github.com/milvus-io/milvus/pkg/proto/rootcoordpb"
+	"github.com/milvus-io/milvus/pkg/tracer"
+	"github.com/milvus-io/milvus/pkg/util"
 	"github.com/milvus-io/milvus/pkg/util/etcd"
 	"github.com/milvus-io/milvus/pkg/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/util/interceptor"
 	"github.com/milvus-io/milvus/pkg/util/logutil"
+	"github.com/milvus-io/milvus/pkg/util/netutil"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
-
-	dcc "github.com/milvus-io/milvus/internal/distributed/datacoord/client"
-	qcc "github.com/milvus-io/milvus/internal/distributed/querycoord/client"
+	"github.com/milvus-io/milvus/pkg/util/tikv"
 )
 
 // Server grpc wrapper
 type Server struct {
 	rootCoord   types.RootCoordComponent
 	grpcServer  *grpc.Server
+	listener    *netutil.NetListener
 	grpcErrChan chan error
 
-	wg sync.WaitGroup
+	grpcWG sync.WaitGroup
 
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	etcdCli    *clientv3.Client
-	dataCoord  types.DataCoord
-	queryCoord types.QueryCoord
+	serverID atomic.Int64
 
-	newDataCoordClient  func(string, *clientv3.Client) types.DataCoord
-	newQueryCoordClient func(string, *clientv3.Client) types.QueryCoord
+	etcdCli    *clientv3.Client
+	tikvCli    *txnkv.Client
+	dataCoord  types.DataCoordClient
+	queryCoord types.QueryCoordClient
+
+	newDataCoordClient  func(ctx context.Context) types.DataCoordClient
+	newQueryCoordClient func(ctx context.Context) types.QueryCoordClient
+}
+
+func (s *Server) DescribeDatabase(ctx context.Context, request *rootcoordpb.DescribeDatabaseRequest) (*rootcoordpb.DescribeDatabaseResponse, error) {
+	return s.rootCoord.DescribeDatabase(ctx, request)
+}
+
+func (s *Server) CreateDatabase(ctx context.Context, request *milvuspb.CreateDatabaseRequest) (*commonpb.Status, error) {
+	return s.rootCoord.CreateDatabase(ctx, request)
+}
+
+func (s *Server) DropDatabase(ctx context.Context, request *milvuspb.DropDatabaseRequest) (*commonpb.Status, error) {
+	return s.rootCoord.DropDatabase(ctx, request)
+}
+
+func (s *Server) ListDatabases(ctx context.Context, request *milvuspb.ListDatabasesRequest) (*milvuspb.ListDatabasesResponse, error) {
+	return s.rootCoord.ListDatabases(ctx, request)
+}
+
+func (s *Server) AlterDatabase(ctx context.Context, request *rootcoordpb.AlterDatabaseRequest) (*commonpb.Status, error) {
+	return s.rootCoord.AlterDatabase(ctx, request)
 }
 
 func (s *Server) CheckHealth(ctx context.Context, request *milvuspb.CheckHealthRequest) (*milvuspb.CheckHealthResponse, error) {
@@ -87,6 +115,16 @@ func (s *Server) AlterAlias(ctx context.Context, request *milvuspb.AlterAliasReq
 	return s.rootCoord.AlterAlias(ctx, request)
 }
 
+// DescribeAlias show the alias-collection relation for the specified alias.
+func (s *Server) DescribeAlias(ctx context.Context, request *milvuspb.DescribeAliasRequest) (*milvuspb.DescribeAliasResponse, error) {
+	return s.rootCoord.DescribeAlias(ctx, request)
+}
+
+// ListAliases show all alias in db.
+func (s *Server) ListAliases(ctx context.Context, request *milvuspb.ListAliasesRequest) (*milvuspb.ListAliasesResponse, error) {
+	return s.rootCoord.ListAliases(ctx, request)
+}
+
 // NewServer create a new RootCoord grpc server.
 func NewServer(ctx context.Context, factory dependency.Factory) (*Server, error) {
 	ctx1, cancel := context.WithCancel(ctx)
@@ -104,22 +142,24 @@ func NewServer(ctx context.Context, factory dependency.Factory) (*Server, error)
 	return s, err
 }
 
-func (s *Server) setClient() {
-	s.newDataCoordClient = func(etcdMetaRoot string, etcdCli *clientv3.Client) types.DataCoord {
-		dsClient, err := dcc.NewClient(s.ctx, etcdMetaRoot, etcdCli)
-		if err != nil {
-			panic(err)
-		}
-		return dsClient
+func (s *Server) Prepare() error {
+	log := log.Ctx(s.ctx)
+	listener, err := netutil.NewListener(
+		netutil.OptIP(paramtable.Get().RootCoordGrpcServerCfg.IP),
+		netutil.OptPort(paramtable.Get().RootCoordGrpcServerCfg.Port.GetAsInt()),
+	)
+	if err != nil {
+		log.Warn("RootCoord fail to create net listener", zap.Error(err))
+		return err
 	}
+	log.Info("RootCoord listen on", zap.String("address", listener.Addr().String()), zap.Int("port", listener.Port()))
+	s.listener = listener
+	return nil
+}
 
-	s.newQueryCoordClient = func(metaRootPath string, etcdCli *clientv3.Client) types.QueryCoord {
-		qsClient, err := qcc.NewClient(s.ctx, metaRootPath, etcdCli)
-		if err != nil {
-			panic(err)
-		}
-		return qsClient
-	}
+func (s *Server) setClient() {
+	s.newDataCoordClient = coordclient.GetDataCoordClient
+	s.newQueryCoordClient = coordclient.GetQueryCoordClient
 }
 
 // Run initializes and starts RootCoord's grpc service.
@@ -127,22 +167,28 @@ func (s *Server) Run() error {
 	if err := s.init(); err != nil {
 		return err
 	}
-	log.Debug("RootCoord init done ...")
+	log.Ctx(s.ctx).Info("RootCoord init done ...")
 
 	if err := s.start(); err != nil {
 		return err
 	}
-	log.Debug("RootCoord start done ...")
+	log.Ctx(s.ctx).Info("RootCoord start done ...")
 	return nil
 }
 
-func (s *Server) init() error {
-	etcdConfig := &paramtable.Get().EtcdCfg
-	Params := &paramtable.Get().RootCoordGrpcServerCfg
-	log.Debug("init params done..")
+var getTiKVClient = tikv.GetTiKVClient
 
-	etcdCli, err := etcd.GetEtcdClient(
+func (s *Server) init() error {
+	params := paramtable.Get()
+	etcdConfig := &params.EtcdCfg
+	log := log.Ctx(s.ctx)
+	log.Info("init params done..")
+
+	etcdCli, err := etcd.CreateEtcdClient(
 		etcdConfig.UseEmbedEtcd.GetAsBool(),
+		etcdConfig.EtcdEnableAuth.GetAsBool(),
+		etcdConfig.EtcdAuthUserName.GetValue(),
+		etcdConfig.EtcdAuthPassword.GetValue(),
 		etcdConfig.EtcdUseSSL.GetAsBool(),
 		etcdConfig.Endpoints.GetAsStrings(),
 		etcdConfig.EtcdTLSCert.GetValue(),
@@ -150,109 +196,126 @@ func (s *Server) init() error {
 		etcdConfig.EtcdTLSCACert.GetValue(),
 		etcdConfig.EtcdTLSMinVersion.GetValue())
 	if err != nil {
-		log.Debug("RootCoord connect to etcd failed", zap.Error(err))
+		log.Warn("RootCoord connect to etcd failed", zap.Error(err))
 		return err
 	}
 	s.etcdCli = etcdCli
 	s.rootCoord.SetEtcdClient(s.etcdCli)
-	s.rootCoord.SetAddress(Params.GetAddress())
-	log.Debug("etcd connect done ...")
+	s.rootCoord.SetAddress(s.listener.Address())
+	log.Info("etcd connect done ...")
 
-	err = s.startGrpc(Params.Port.GetAsInt())
-	if err != nil {
-		return err
+	if params.MetaStoreCfg.MetaStoreType.GetValue() == util.MetaStoreTypeTiKV {
+		log.Info("Connecting to tikv metadata storage.")
+		s.tikvCli, err = getTiKVClient(&paramtable.Get().TiKVCfg)
+		if err != nil {
+			log.Warn("RootCoord failed to connect to tikv", zap.Error(err))
+			return err
+		}
+		s.rootCoord.SetTiKVClient(s.tikvCli)
+		log.Info("Connected to tikv. Using tikv as metadata storage.")
 	}
-	log.Debug("grpc init done ...")
 
 	if s.newDataCoordClient != nil {
-		log.Debug("RootCoord start to create DataCoord client")
-		dataCoord := s.newDataCoordClient(rootcoord.Params.EtcdCfg.MetaRootPath.GetValue(), s.etcdCli)
+		log.Info("RootCoord start to create DataCoord client")
+		dataCoord := s.newDataCoordClient(s.ctx)
 		s.dataCoord = dataCoord
-		if err = s.dataCoord.Init(); err != nil {
-			log.Error("RootCoord DataCoordClient Init failed", zap.Error(err))
-			panic(err)
-		}
-		if err = s.dataCoord.Start(); err != nil {
-			log.Error("RootCoord DataCoordClient Start failed", zap.Error(err))
-			panic(err)
-		}
-		if err := s.rootCoord.SetDataCoord(dataCoord); err != nil {
+		if err := s.rootCoord.SetDataCoordClient(dataCoord); err != nil {
 			panic(err)
 		}
 	}
 
 	if s.newQueryCoordClient != nil {
-		log.Debug("RootCoord start to create QueryCoord client")
-		queryCoord := s.newQueryCoordClient(rootcoord.Params.EtcdCfg.MetaRootPath.GetValue(), s.etcdCli)
+		log.Info("RootCoord start to create QueryCoord client")
+		queryCoord := s.newQueryCoordClient(s.ctx)
 		s.queryCoord = queryCoord
-		if err := s.queryCoord.Init(); err != nil {
-			log.Error("RootCoord QueryCoordClient Init failed", zap.Error(err))
-			panic(err)
-		}
-		if err := s.queryCoord.Start(); err != nil {
-			log.Error("RootCoord QueryCoordClient Start failed", zap.Error(err))
-			panic(err)
-		}
-		if err := s.rootCoord.SetQueryCoord(queryCoord); err != nil {
+		if err := s.rootCoord.SetQueryCoordClient(queryCoord); err != nil {
 			panic(err)
 		}
 	}
 
-	return s.rootCoord.Init()
+	if err := s.rootCoord.Init(); err != nil {
+		return err
+	}
+	log.Info("RootCoord init done ...")
+
+	err = s.startGrpc()
+	if err != nil {
+		return err
+	}
+	log.Info("grpc init done ...")
+	return nil
 }
 
-func (s *Server) startGrpc(port int) error {
-	s.wg.Add(1)
-	go s.startGrpcLoop(port)
+func (s *Server) startGrpc() error {
+	s.grpcWG.Add(1)
+	go s.startGrpcLoop()
 	// wait for grpc server loop start
 	err := <-s.grpcErrChan
 	return err
 }
 
-func (s *Server) startGrpcLoop(port int) {
-	defer s.wg.Done()
+func (s *Server) startGrpcLoop() {
+	defer s.grpcWG.Done()
 	Params := &paramtable.Get().RootCoordGrpcServerCfg
-	var kaep = keepalive.EnforcementPolicy{
+	kaep := keepalive.EnforcementPolicy{
 		MinTime:             5 * time.Second, // If a client pings more than once every 5 seconds, terminate the connection
 		PermitWithoutStream: true,            // Allow pings even when there are no active streams
 	}
 
-	var kasp = keepalive.ServerParameters{
+	kasp := keepalive.ServerParameters{
 		Time:    60 * time.Second, // Ping the client if it is idle for 60 seconds to ensure the connection is still active
 		Timeout: 10 * time.Second, // Wait 10 second for the ping ack before assuming the connection is dead
 	}
-	log.Debug("start grpc ", zap.Int("port", port))
-	lis, err := net.Listen("tcp", ":"+strconv.Itoa(port))
-	if err != nil {
-		log.Error("GrpcServer:failed to listen", zap.String("error", err.Error()))
-		s.grpcErrChan <- err
-		return
-	}
+	log := log.Ctx(s.ctx)
+	log.Info("start grpc ", zap.Int("port", s.listener.Port()))
 
 	ctx, cancel := context.WithCancel(s.ctx)
 	defer cancel()
 
-	opts := tracer.GetInterceptorOpts()
-	s.grpcServer = grpc.NewServer(
+	grpcOpts := []grpc.ServerOption{
 		grpc.KeepaliveEnforcementPolicy(kaep),
 		grpc.KeepaliveParams(kasp),
 		grpc.MaxRecvMsgSize(Params.ServerMaxRecvSize.GetAsInt()),
 		grpc.MaxSendMsgSize(Params.ServerMaxSendSize.GetAsInt()),
 		grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
-			otelgrpc.UnaryServerInterceptor(opts...),
-			logutil.UnaryTraceLoggerInterceptor)),
+			logutil.UnaryTraceLoggerInterceptor,
+			interceptor.ClusterValidationUnaryServerInterceptor(),
+			interceptor.ServerIDValidationUnaryServerInterceptor(func() int64 {
+				if s.serverID.Load() == 0 {
+					s.serverID.Store(paramtable.GetNodeID())
+				}
+				return s.serverID.Load()
+			}),
+			streamingserviceinterceptor.NewStreamingServiceUnaryServerInterceptor(),
+		)),
 		grpc.StreamInterceptor(grpc_middleware.ChainStreamServer(
-			otelgrpc.StreamServerInterceptor(opts...),
-			logutil.StreamTraceLoggerInterceptor)))
+			logutil.StreamTraceLoggerInterceptor,
+			interceptor.ClusterValidationStreamServerInterceptor(),
+			interceptor.ServerIDValidationStreamServerInterceptor(func() int64 {
+				if s.serverID.Load() == 0 {
+					s.serverID.Store(paramtable.GetNodeID())
+				}
+				return s.serverID.Load()
+			}),
+			streamingserviceinterceptor.NewStreamingServiceStreamServerInterceptor(),
+		)),
+		grpc.StatsHandler(tracer.GetDynamicOtelGrpcServerStatsHandler()),
+	}
+
+	grpcOpts = append(grpcOpts, utils.EnableInternalTLS("RootCoord"))
+	s.grpcServer = grpc.NewServer(grpcOpts...)
 	rootcoordpb.RegisterRootCoordServer(s.grpcServer, s)
+	s.rootCoord.RegisterStreamingCoordGRPCService(s.grpcServer)
+	coordclient.RegisterRootCoordServer(s)
 
 	go funcutil.CheckGrpcReady(ctx, s.grpcErrChan)
-	if err := s.grpcServer.Serve(lis); err != nil {
+	if err := s.grpcServer.Serve(s.listener); err != nil {
 		s.grpcErrChan <- err
 	}
 }
 
 func (s *Server) start() error {
+	log := log.Ctx(s.ctx)
 	log.Info("RootCoord Core start ...")
 	if err := s.rootCoord.Register(); err != nil {
 		log.Error("RootCoord registers service failed", zap.Error(err))
@@ -267,50 +330,65 @@ func (s *Server) start() error {
 	return nil
 }
 
-func (s *Server) Stop() error {
-	Params := &paramtable.Get().RootCoordGrpcServerCfg
-	log.Debug("Rootcoord stop", zap.String("Address", Params.GetAddress()))
+func (s *Server) Stop() (err error) {
+	logger := log.Ctx(s.ctx)
+	if s.listener != nil {
+		logger = logger.With(zap.String("address", s.listener.Address()))
+	}
+	logger.Info("Rootcoord stopping")
+	defer func() {
+		logger.Info("Rootcoord stopped", zap.Error(err))
+	}()
+
 	if s.etcdCli != nil {
 		defer s.etcdCli.Close()
 	}
+	if s.tikvCli != nil {
+		defer s.tikvCli.Close()
+	}
+
+	if s.grpcServer != nil {
+		utils.GracefulStopGRPCServer(s.grpcServer)
+	}
+	s.grpcWG.Wait()
+
 	if s.dataCoord != nil {
-		if err := s.dataCoord.Stop(); err != nil {
+		if err := s.dataCoord.Close(); err != nil {
 			log.Error("Failed to close dataCoord client", zap.Error(err))
 		}
 	}
 	if s.queryCoord != nil {
-		if err := s.queryCoord.Stop(); err != nil {
+		if err := s.queryCoord.Close(); err != nil {
 			log.Error("Failed to close queryCoord client", zap.Error(err))
 		}
 	}
 	if s.rootCoord != nil {
+		logger.Info("internal server[rootCoord] start to stop")
 		if err := s.rootCoord.Stop(); err != nil {
-			log.Error("Failed to close close rootCoord", zap.Error(err))
+			log.Error("Failed to close rootCoord", zap.Error(err))
 		}
 	}
-	log.Debug("Rootcoord begin to stop grpc server")
+
 	s.cancel()
-	if s.grpcServer != nil {
-		log.Debug("Graceful stop grpc server...")
-		s.grpcServer.GracefulStop()
+	if s.listener != nil {
+		s.listener.Close()
 	}
-	s.wg.Wait()
 	return nil
 }
 
 // GetComponentStates gets the component states of RootCoord.
 func (s *Server) GetComponentStates(ctx context.Context, req *milvuspb.GetComponentStatesRequest) (*milvuspb.ComponentStates, error) {
-	return s.rootCoord.GetComponentStates(ctx)
+	return s.rootCoord.GetComponentStates(ctx, req)
 }
 
 // GetTimeTickChannel receiver time tick from proxy service, and put it into this channel
 func (s *Server) GetTimeTickChannel(ctx context.Context, req *internalpb.GetTimeTickChannelRequest) (*milvuspb.StringResponse, error) {
-	return s.rootCoord.GetTimeTickChannel(ctx)
+	return s.rootCoord.GetTimeTickChannel(ctx, req)
 }
 
 // GetStatisticsChannel just define a channel, not used currently
 func (s *Server) GetStatisticsChannel(ctx context.Context, req *internalpb.GetStatisticsChannelRequest) (*milvuspb.StringResponse, error) {
-	return s.rootCoord.GetStatisticsChannel(ctx)
+	return s.rootCoord.GetStatisticsChannel(ctx, req)
 }
 
 // CreateCollection creates a collection
@@ -341,6 +419,11 @@ func (s *Server) DescribeCollectionInternal(ctx context.Context, in *milvuspb.De
 // ShowCollections gets all collections
 func (s *Server) ShowCollections(ctx context.Context, in *milvuspb.ShowCollectionsRequest) (*milvuspb.ShowCollectionsResponse, error) {
 	return s.rootCoord.ShowCollections(ctx, in)
+}
+
+// ShowCollectionIDs returns all collection IDs.
+func (s *Server) ShowCollectionIDs(ctx context.Context, in *rootcoordpb.ShowCollectionIDsRequest) (*rootcoordpb.ShowCollectionIDsResponse, error) {
+	return s.rootCoord.ShowCollectionIDs(ctx, in)
 }
 
 // CreatePartition creates a partition in a collection
@@ -388,6 +471,11 @@ func (s *Server) ShowSegments(ctx context.Context, in *milvuspb.ShowSegmentsRequ
 	return s.rootCoord.ShowSegments(ctx, in)
 }
 
+// GetPChannelInfo gets the physical channel information
+func (s *Server) GetPChannelInfo(ctx context.Context, in *rootcoordpb.GetPChannelInfoRequest) (*rootcoordpb.GetPChannelInfoResponse, error) {
+	return s.rootCoord.GetPChannelInfo(ctx, in)
+}
+
 // InvalidateCollectionMetaCache notifies RootCoord to release the collection cache in Proxies.
 func (s *Server) InvalidateCollectionMetaCache(ctx context.Context, in *proxypb.InvalidateCollMetaCacheRequest) (*commonpb.Status, error) {
 	return s.rootCoord.InvalidateCollectionMetaCache(ctx, in)
@@ -401,26 +489,6 @@ func (s *Server) ShowConfigurations(ctx context.Context, req *internalpb.ShowCon
 // GetMetrics gets the metrics of RootCoord.
 func (s *Server) GetMetrics(ctx context.Context, in *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error) {
 	return s.rootCoord.GetMetrics(ctx, in)
-}
-
-// Import data files(json, numpy, etc.) on MinIO/S3 storage, read and parse them into sealed segments
-func (s *Server) Import(ctx context.Context, in *milvuspb.ImportRequest) (*milvuspb.ImportResponse, error) {
-	return s.rootCoord.Import(ctx, in)
-}
-
-// Check import task state from datanode
-func (s *Server) GetImportState(ctx context.Context, in *milvuspb.GetImportStateRequest) (*milvuspb.GetImportStateResponse, error) {
-	return s.rootCoord.GetImportState(ctx, in)
-}
-
-// Returns id array of all import tasks
-func (s *Server) ListImportTasks(ctx context.Context, in *milvuspb.ListImportTasksRequest) (*milvuspb.ListImportTasksResponse, error) {
-	return s.rootCoord.ListImportTasks(ctx, in)
-}
-
-// Report impot task state to datacoord
-func (s *Server) ReportImport(ctx context.Context, in *rootcoordpb.ImportResult) (*commonpb.Status, error) {
-	return s.rootCoord.ReportImport(ctx, in)
 }
 
 func (s *Server) CreateCredential(ctx context.Context, request *internalpb.CredentialInfo) (*commonpb.Status, error) {
@@ -479,6 +547,34 @@ func (s *Server) AlterCollection(ctx context.Context, request *milvuspb.AlterCol
 	return s.rootCoord.AlterCollection(ctx, request)
 }
 
+func (s *Server) AlterCollectionField(ctx context.Context, request *milvuspb.AlterCollectionFieldRequest) (*commonpb.Status, error) {
+	return s.rootCoord.AlterCollectionField(ctx, request)
+}
+
 func (s *Server) RenameCollection(ctx context.Context, request *milvuspb.RenameCollectionRequest) (*commonpb.Status, error) {
 	return s.rootCoord.RenameCollection(ctx, request)
+}
+
+func (s *Server) BackupRBAC(ctx context.Context, request *milvuspb.BackupRBACMetaRequest) (*milvuspb.BackupRBACMetaResponse, error) {
+	return s.rootCoord.BackupRBAC(ctx, request)
+}
+
+func (s *Server) RestoreRBAC(ctx context.Context, request *milvuspb.RestoreRBACMetaRequest) (*commonpb.Status, error) {
+	return s.rootCoord.RestoreRBAC(ctx, request)
+}
+
+func (s *Server) CreatePrivilegeGroup(ctx context.Context, request *milvuspb.CreatePrivilegeGroupRequest) (*commonpb.Status, error) {
+	return s.rootCoord.CreatePrivilegeGroup(ctx, request)
+}
+
+func (s *Server) DropPrivilegeGroup(ctx context.Context, request *milvuspb.DropPrivilegeGroupRequest) (*commonpb.Status, error) {
+	return s.rootCoord.DropPrivilegeGroup(ctx, request)
+}
+
+func (s *Server) ListPrivilegeGroups(ctx context.Context, request *milvuspb.ListPrivilegeGroupsRequest) (*milvuspb.ListPrivilegeGroupsResponse, error) {
+	return s.rootCoord.ListPrivilegeGroups(ctx, request)
+}
+
+func (s *Server) OperatePrivilegeGroup(ctx context.Context, request *milvuspb.OperatePrivilegeGroupRequest) (*commonpb.Status, error) {
+	return s.rootCoord.OperatePrivilegeGroup(ctx, request)
 }

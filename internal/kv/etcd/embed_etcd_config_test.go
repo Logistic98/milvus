@@ -17,6 +17,7 @@
 package etcdkv_test
 
 import (
+	"context"
 	"os"
 	"testing"
 
@@ -36,8 +37,8 @@ func TestEtcdConfigLoad(te *testing.T) {
 	te.Setenv("etcd.config.path", "../../../configs/advanced/etcd.yaml")
 	te.Setenv("etcd.data.dir", "etcd.test.data.dir")
 
-	param.Init()
-	//clean up data
+	param.Init(paramtable.NewBaseTable())
+	// clean up data
 	defer func() {
 		os.RemoveAll("etcd.test.data.dir")
 	}()
@@ -49,7 +50,7 @@ func TestEtcdConfigLoad(te *testing.T) {
 		require.NoError(t, err)
 
 		defer metaKv.Close()
-		defer metaKv.RemoveWithPrefix("")
+		defer metaKv.RemoveWithPrefix(context.TODO(), "")
 
 		kv := metaKv.(*embed_etcd_kv.EmbedEtcdKV)
 		assert.Equal(t, kv.GetConfig().SnapshotCount, uint64(1000))

@@ -19,17 +19,18 @@ package pipeline
 import (
 	"testing"
 
-	"github.com/milvus-io/milvus/internal/querynodev2/delegator"
-	"github.com/milvus-io/milvus/internal/querynodev2/segments"
-	"github.com/milvus-io/milvus/internal/querynodev2/tsafe"
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
+
+	"github.com/milvus-io/milvus/internal/querynodev2/delegator"
+	"github.com/milvus-io/milvus/internal/querynodev2/segments"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
 type DeleteNodeSuite struct {
 	suite.Suite
-	//datas
+	// datas
 	collectionID   int64
 	collectionName string
 	partitionIDs   []int64
@@ -37,19 +38,18 @@ type DeleteNodeSuite struct {
 	channel        string
 	timeRange      TimeRange
 
-	//dependency
-	tSafeManager TSafeManager
-	//mocks
+	// mocks
 	manager   *segments.Manager
 	delegator *delegator.MockShardDelegator
 }
 
 func (suite *DeleteNodeSuite) SetupSuite() {
+	paramtable.Init()
 	suite.collectionID = 111
 	suite.collectionName = "test-collection"
 	suite.partitionIDs = []int64{11, 22}
 	suite.channel = "test-channel"
-	//segment own data row which‘s pk same with segment‘s ID
+	// segment own data row which‘s pk same with segment‘s ID
 	suite.deletePKs = []int64{1, 2, 3, 4}
 	suite.timeRange = TimeRange{
 		timestampMin: 0,
@@ -72,7 +72,7 @@ func (suite *DeleteNodeSuite) buildDeleteNodeMsg() *deleteNodeMsg {
 }
 
 func (suite *DeleteNodeSuite) TestBasic() {
-	//mock
+	// mock
 	mockCollectionManager := segments.NewMockCollectionManager(suite.T())
 	mockSegmentManager := segments.NewMockSegmentManager(suite.T())
 	suite.manager = &segments.Manager{
@@ -88,19 +88,14 @@ func (suite *DeleteNodeSuite) TestBasic() {
 				}
 			}
 		})
-	//init dependency
-	suite.tSafeManager = tsafe.NewTSafeReplica()
-	suite.tSafeManager.Add(suite.channel, 0)
-	//build delete node and data
-	node := newDeleteNode(suite.collectionID, suite.channel, suite.manager, suite.tSafeManager, suite.delegator, 8)
+	// init dependency
+	// build delete node and data
+	node := newDeleteNode(suite.collectionID, suite.channel, suite.manager, suite.delegator, 8)
 	in := suite.buildDeleteNodeMsg()
-	//run
+	suite.delegator.EXPECT().UpdateTSafe(in.timeRange.timestampMax).Return()
+	// run
 	out := node.Operate(in)
 	suite.Nil(out)
-	//check tsafe
-	tt, err := suite.tSafeManager.Get(suite.channel)
-	suite.NoError(err)
-	suite.Equal(suite.timeRange.timestampMax, tt)
 }
 
 func TestDeleteNode(t *testing.T) {

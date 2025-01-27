@@ -24,16 +24,17 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
 	"github.com/milvus-io/milvus/internal/tso"
 	"github.com/milvus-io/milvus/internal/util/tsoutil"
 	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/proto/rootcoordpb"
 	"github.com/milvus-io/milvus/pkg/util/etcd"
 	"github.com/milvus-io/milvus/pkg/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
 func getTestEtcdCli() *clientv3.Client {
-	Params.Init()
+	paramtable.Init()
 	cli, err := etcd.GetEtcdClient(
 		Params.EtcdCfg.UseEmbedEtcd.GetAsBool(),
 		Params.EtcdCfg.EtcdUseSSL.GetAsBool(),
@@ -86,7 +87,6 @@ func Benchmark_RootCoord_AllocTimestamp(b *testing.B) {
 		}
 		_, err := c.AllocTimestamp(ctx, &req)
 		assert.Nil(b, err)
-
 	}
 	b.StopTimer()
 }

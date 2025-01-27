@@ -3,9 +3,10 @@ package funcutil
 import (
 	"testing"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 )
 
 func Test_GetPrivilegeExtObj(t *testing.T) {
@@ -14,14 +15,14 @@ func Test_GetPrivilegeExtObj(t *testing.T) {
 		CollectionName: "col1",
 	}
 	privilegeExt, err := GetPrivilegeExtObj(request)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.Equal(t, commonpb.ObjectType_Collection, privilegeExt.ObjectType)
 	assert.Equal(t, commonpb.ObjectPrivilege_PrivilegeLoad, privilegeExt.ObjectPrivilege)
 	assert.Equal(t, int32(3), privilegeExt.ObjectNameIndex)
 
-	request2 := &milvuspb.CreatePartitionRequest{}
+	request2 := &milvuspb.GetPersistentSegmentInfoRequest{}
 	_, err = GetPrivilegeExtObj(request2)
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 }
 
 func Test_GetResourceName(t *testing.T) {
@@ -43,7 +44,6 @@ func Test_GetResourceName(t *testing.T) {
 		request = &milvuspb.SelectUserRequest{}
 		assert.Equal(t, "*", GetObjectName(request, 2))
 	}
-
 }
 
 func Test_GetResourceNames(t *testing.T) {
@@ -59,12 +59,23 @@ func Test_GetResourceNames(t *testing.T) {
 
 func Test_PolicyForPrivilege(t *testing.T) {
 	assert.Equal(t,
-		`{"PType":"p","V0":"admin","V1":"COLLECTION-col1","V2":"ALL"}`,
-		PolicyForPrivilege("admin", "COLLECTION", "col1", "ALL"))
+		`{"PType":"p","V0":"admin","V1":"COLLECTION-default.col1","V2":"ALL"}`,
+		PolicyForPrivilege("admin", "COLLECTION", "col1", "ALL", "default"))
 }
 
 func Test_PolicyForResource(t *testing.T) {
 	assert.Equal(t,
-		`COLLECTION-col1`,
-		PolicyForResource("COLLECTION", "col1"))
+		`COLLECTION-default.col1`,
+		PolicyForResource("", "COLLECTION", "col1"))
+
+	assert.Equal(t,
+		`COLLECTION-db.col1`,
+		PolicyForResource("db", "COLLECTION", "col1"))
+}
+
+func Test_PolicyCheckerWithRole(t *testing.T) {
+	a := PolicyForPrivilege("admin", "COLLECTION", "col1", "ALL", "default")
+	b := PolicyForPrivilege("foo", "COLLECTION", "col1", "ALL", "default")
+	assert.True(t, PolicyCheckerWithRole(a, "admin"))
+	assert.False(t, PolicyCheckerWithRole(b, "admin"))
 }

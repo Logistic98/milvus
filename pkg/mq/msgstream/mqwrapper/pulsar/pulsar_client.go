@@ -17,8 +17,8 @@
 package pulsar
 
 import (
+	"context"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -29,8 +29,10 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/metrics"
+	mqcommon "github.com/milvus-io/milvus/pkg/mq/common"
 	"github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper"
-	"github.com/milvus-io/milvus/pkg/util/retry"
+	"github.com/milvus-io/milvus/pkg/util/timerecord"
 )
 
 type pulsarClient struct {
@@ -46,8 +48,10 @@ var once sync.Once
 // NewClient creates a pulsarClient object
 // according to the parameter opts of type pulsar.ClientOptions
 func NewClient(tenant string, namespace string, opts pulsar.ClientOptions) (*pulsarClient, error) {
+	var err error
 	once.Do(func() {
-		c, err := pulsar.NewClient(opts)
+		var c pulsar.Client
+		c, err = pulsar.NewClient(opts)
 		if err != nil {
 			log.Error("Failed to set pulsar client: ", zap.Error(err))
 			return
@@ -59,13 +63,17 @@ func NewClient(tenant string, namespace string, opts pulsar.ClientOptions) (*pul
 		}
 		sc = cli
 	})
-	return sc, nil
+	return sc, err
 }
 
 // CreateProducer create a pulsar producer from options
-func (pc *pulsarClient) CreateProducer(options mqwrapper.ProducerOptions) (mqwrapper.Producer, error) {
+func (pc *pulsarClient) CreateProducer(ctx context.Context, options mqcommon.ProducerOptions) (mqwrapper.Producer, error) {
+	start := timerecord.NewTimeRecorder("create producer")
+	metrics.MsgStreamOpCounter.WithLabelValues(metrics.CreateProducerLabel, metrics.TotalLabel).Inc()
+
 	fullTopicName, err := GetFullTopicName(pc.tenant, pc.namespace, options.Topic)
 	if err != nil {
+		metrics.MsgStreamOpCounter.WithLabelValues(metrics.CreateProducerLabel, metrics.FailLabel).Inc()
 		return nil, err
 	}
 	opts := pulsar.ProducerOptions{Topic: fullTopicName}
@@ -80,20 +88,29 @@ func (pc *pulsarClient) CreateProducer(options mqwrapper.ProducerOptions) (mqwra
 
 	pp, err := pc.client.CreateProducer(opts)
 	if err != nil {
+		metrics.MsgStreamOpCounter.WithLabelValues(metrics.CreateProducerLabel, metrics.FailLabel).Inc()
 		return nil, err
 	}
 	if pp == nil {
+		metrics.MsgStreamOpCounter.WithLabelValues(metrics.CreateProducerLabel, metrics.FailLabel).Inc()
 		return nil, errors.New("pulsar is not ready, producer is nil")
 	}
+	elapsed := start.ElapseSpan()
+	metrics.MsgStreamRequestLatency.WithLabelValues(metrics.CreateProducerLabel).Observe(float64(elapsed.Milliseconds()))
+	metrics.MsgStreamOpCounter.WithLabelValues(metrics.CreateProducerLabel, metrics.SuccessLabel).Inc()
 	producer := &pulsarProducer{p: pp}
 	return producer, nil
 }
 
 // Subscribe creates a pulsar consumer instance and subscribe a topic
-func (pc *pulsarClient) Subscribe(options mqwrapper.ConsumerOptions) (mqwrapper.Consumer, error) {
+func (pc *pulsarClient) Subscribe(ctx context.Context, options mqwrapper.ConsumerOptions) (mqwrapper.Consumer, error) {
+	start := timerecord.NewTimeRecorder("create consumer")
+	metrics.MsgStreamOpCounter.WithLabelValues(metrics.CreateConsumerLabel, metrics.TotalLabel).Inc()
+
 	receiveChannel := make(chan pulsar.ConsumerMessage, options.BufSize)
 	fullTopicName, err := GetFullTopicName(pc.tenant, pc.namespace, options.Topic)
 	if err != nil {
+		metrics.MsgStreamOpCounter.WithLabelValues(metrics.CreateConsumerLabel, metrics.FailLabel).Inc()
 		return nil, err
 	}
 	consumer, err := pc.client.Subscribe(pulsar.ConsumerOptions{
@@ -104,18 +121,19 @@ func (pc *pulsarClient) Subscribe(options mqwrapper.ConsumerOptions) (mqwrapper.
 		MessageChannel:              receiveChannel,
 	})
 	if err != nil {
-		if strings.Contains(err.Error(), "ConsumerBusy") {
-			return nil, retry.Unrecoverable(err)
-		}
+		metrics.MsgStreamOpCounter.WithLabelValues(metrics.CreateConsumerLabel, metrics.FailLabel).Inc()
 		return nil, err
 	}
 
 	pConsumer := &Consumer{c: consumer, closeCh: make(chan struct{})}
 	// prevent seek to earliest patch applied when using latest position options
-	if options.SubscriptionInitialPosition == mqwrapper.SubscriptionPositionLatest {
+	if options.SubscriptionInitialPosition == mqcommon.SubscriptionPositionLatest {
 		pConsumer.AtLatest = true
 	}
 
+	elapsed := start.ElapseSpan()
+	metrics.MsgStreamRequestLatency.WithLabelValues(metrics.CreateConsumerLabel).Observe(float64(elapsed.Milliseconds()))
+	metrics.MsgStreamOpCounter.WithLabelValues(metrics.CreateConsumerLabel, metrics.SuccessLabel).Inc()
 	return pConsumer, nil
 }
 
@@ -146,13 +164,13 @@ func NewAdminClient(address, authPlugin, authParams string) (pulsarctl.Client, e
 }
 
 // EarliestMessageID returns the earliest message id
-func (pc *pulsarClient) EarliestMessageID() mqwrapper.MessageID {
+func (pc *pulsarClient) EarliestMessageID() mqcommon.MessageID {
 	msgID := pulsar.EarliestMessageID()
 	return &pulsarID{messageID: msgID}
 }
 
 // StringToMsgID converts the string id to MessageID type
-func (pc *pulsarClient) StringToMsgID(id string) (mqwrapper.MessageID, error) {
+func (pc *pulsarClient) StringToMsgID(id string) (mqcommon.MessageID, error) {
 	pID, err := stringToMsgID(id)
 	if err != nil {
 		return nil, err
@@ -161,7 +179,7 @@ func (pc *pulsarClient) StringToMsgID(id string) (mqwrapper.MessageID, error) {
 }
 
 // BytesToMsgID converts []byte id to MessageID type
-func (pc *pulsarClient) BytesToMsgID(id []byte) (mqwrapper.MessageID, error) {
+func (pc *pulsarClient) BytesToMsgID(id []byte) (mqcommon.MessageID, error) {
 	pID, err := DeserializePulsarMsgID(id)
 	if err != nil {
 		return nil, err

@@ -42,27 +42,26 @@ func TestEtcd(t *testing.T) {
 	assert.False(t, resp.Count < 1)
 	assert.Equal(t, string(resp.Kvs[0].Value), "value")
 
-	etcdCli, err = GetEtcdClient(false, true, []string{},
+	_, err = GetEtcdClient(false, true, []string{},
 		"../../../configs/cert/client.pem",
 		"../../../configs/cert/client.key",
 		"../../../configs/cert/ca.pem",
 		"some not right word")
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 
-	etcdCli, err = GetEtcdClient(false, true, []string{},
+	_, err = GetEtcdClient(false, true, []string{},
 		"../../../configs/cert/client.pem",
 		"../../../configs/cert/client.key",
 		"wrong/file",
 		"1.2")
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 
-	etcdCli, err = GetEtcdClient(false, true, []string{},
+	_, err = GetEtcdClient(false, true, []string{},
 		"wrong/file",
 		"../../../configs/cert/client.key",
 		"../../../configs/cert/ca.pem",
 		"1.2")
-	assert.NotNil(t, err)
-
+	assert.Error(t, err)
 }
 
 func Test_buildKvGroup(t *testing.T) {
@@ -105,8 +104,8 @@ func Test_SaveByBatch(t *testing.T) {
 			return nil
 		}
 
-		maxTxnNum = 2
-		err := SaveByBatch(kvs, saveFn)
+		limit := 2
+		err := SaveByBatchWithLimit(kvs, limit, saveFn)
 		assert.NoError(t, err)
 		assert.Equal(t, 0, group)
 		assert.Equal(t, 0, count)
@@ -127,8 +126,8 @@ func Test_SaveByBatch(t *testing.T) {
 			return nil
 		}
 
-		maxTxnNum = 2
-		err := SaveByBatch(kvs, saveFn)
+		limit := 2
+		err := SaveByBatchWithLimit(kvs, limit, saveFn)
 		assert.NoError(t, err)
 		assert.Equal(t, 2, group)
 		assert.Equal(t, 3, count)
@@ -143,8 +142,8 @@ func Test_SaveByBatch(t *testing.T) {
 			"k2": "v2",
 			"k3": "v3",
 		}
-		maxTxnNum = 2
-		err := SaveByBatch(kvs, saveFn)
+		limit := 2
+		err := SaveByBatchWithLimit(kvs, limit, saveFn)
 		assert.Error(t, err)
 	})
 }
@@ -161,8 +160,8 @@ func Test_RemoveByBatch(t *testing.T) {
 			return nil
 		}
 
-		maxTxnNum = 2
-		err := RemoveByBatch(kvs, removeFn)
+		limit := 2
+		err := RemoveByBatchWithLimit(kvs, limit, removeFn)
 		assert.NoError(t, err)
 		assert.Equal(t, 0, group)
 		assert.Equal(t, 0, count)
@@ -179,8 +178,8 @@ func Test_RemoveByBatch(t *testing.T) {
 			return nil
 		}
 
-		maxTxnNum = 2
-		err := RemoveByBatch(kvs, removeFn)
+		limit := 2
+		err := RemoveByBatchWithLimit(kvs, limit, removeFn)
 		assert.NoError(t, err)
 		assert.Equal(t, 3, group)
 		assert.Equal(t, 5, count)
@@ -191,8 +190,8 @@ func Test_RemoveByBatch(t *testing.T) {
 			return errors.New("mock")
 		}
 		kvs := []string{"k1", "k2", "k3", "k4", "k5"}
-		maxTxnNum = 2
-		err := RemoveByBatch(kvs, removeFn)
+		limit := 2
+		err := RemoveByBatchWithLimit(kvs, limit, removeFn)
 		assert.Error(t, err)
 	})
 }

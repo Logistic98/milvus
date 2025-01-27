@@ -17,7 +17,6 @@
 package allocator
 
 import (
-	"io/ioutil"
 	"net/url"
 	"os"
 	"testing"
@@ -37,7 +36,7 @@ var Params paramtable.ComponentParam
 var embedEtcdServer *embed.Etcd
 
 func startEmbedEtcdServer() (*embed.Etcd, error) {
-	dir, err := ioutil.TempDir(os.TempDir(), "milvus_ut")
+	dir, err := os.MkdirTemp(os.TempDir(), "milvus_ut")
 	if err != nil {
 		return nil, err
 	}
@@ -83,32 +82,32 @@ func TestGlobalTSOAllocator_All(t *testing.T) {
 
 	t.Run("Initialize", func(t *testing.T) {
 		err := gTestIDAllocator.Initialize()
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 	})
 
 	t.Run("AllocOne", func(t *testing.T) {
 		one, err := gTestIDAllocator.AllocOne()
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		ano, err := gTestIDAllocator.AllocOne()
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		assert.NotEqual(t, one, ano)
 	})
 
 	t.Run("Alloc", func(t *testing.T) {
 		count := uint32(2 << 10)
 		idStart, idEnd, err := gTestIDAllocator.Alloc(count)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		assert.Equal(t, count, uint32(idEnd-idStart))
 	})
 
 	t.Run("Alloc2", func(t *testing.T) {
 		count1 := uint32(2 << 18)
 		id1, err := gTestIDAllocator.allocator.GenerateTSO(count1)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 
 		count2 := uint32(2 << 8)
 		id2, err := gTestIDAllocator.allocator.GenerateTSO(count2)
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		assert.Equal(t, id2-id1, uint64(count2))
 	})
 }

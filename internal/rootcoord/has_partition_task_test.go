@@ -20,10 +20,14 @@ import (
 	"context"
 	"testing"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-	"github.com/milvus-io/milvus/internal/metastore/model"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus/internal/metastore/model"
+	mockrootcoord "github.com/milvus-io/milvus/internal/rootcoord/mocks"
+	"github.com/milvus-io/milvus/pkg/util/merr"
 )
 
 func Test_hasPartitionTask_Prepare(t *testing.T) {
@@ -54,12 +58,11 @@ func Test_hasPartitionTask_Prepare(t *testing.T) {
 
 func Test_hasPartitionTask_Execute(t *testing.T) {
 	t.Run("fail to get collection", func(t *testing.T) {
-		core := newTestCore(withInvalidMeta())
+		metaTable := mockrootcoord.NewIMetaTable(t)
+		metaTable.EXPECT().GetCollectionByName(mock.Anything, mock.Anything, "test coll", mock.Anything).Return(nil, merr.WrapErrCollectionNotFound("test coll"))
+		core := newTestCore(withMeta(metaTable))
 		task := &hasPartitionTask{
-			baseTask: baseTask{
-				core: core,
-				done: make(chan error, 1),
-			},
+			baseTask: newBaseTask(context.Background(), core),
 			Req: &milvuspb.HasPartitionRequest{
 				Base: &commonpb.MsgBase{
 					MsgType: commonpb.MsgType_HasPartition,
@@ -70,27 +73,29 @@ func Test_hasPartitionTask_Execute(t *testing.T) {
 		}
 		err := task.Execute(context.Background())
 		assert.Error(t, err)
-		assert.Equal(t, task.Rsp.GetStatus().GetErrorCode(), commonpb.ErrorCode_CollectionNotExists)
+		assert.ErrorIs(t, err, merr.ErrCollectionNotFound)
+		assert.ErrorIs(t, merr.Error(task.Rsp.GetStatus()), merr.ErrCollectionNotFound)
 		assert.False(t, task.Rsp.GetValue())
 	})
 
 	t.Run("failed", func(t *testing.T) {
-		meta := newMockMetaTable()
-		meta.GetCollectionByNameFunc = func(ctx context.Context, collectionName string, ts Timestamp) (*model.Collection, error) {
-			return &model.Collection{
-				Partitions: []*model.Partition{
-					{
-						PartitionName: "invalid test partition",
-					},
+		meta := mockrootcoord.NewIMetaTable(t)
+		meta.On("GetCollectionByName",
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+		).Return(&model.Collection{
+			Partitions: []*model.Partition{
+				{
+					PartitionName: "invalid test partition",
 				},
-			}, nil
-		}
+			},
+		}, nil)
+
 		core := newTestCore(withMeta(meta))
 		task := &hasPartitionTask{
-			baseTask: baseTask{
-				core: core,
-				done: make(chan error, 1),
-			},
+			baseTask: newBaseTask(context.Background(), core),
 			Req: &milvuspb.HasPartitionRequest{
 				Base: &commonpb.MsgBase{
 					MsgType: commonpb.MsgType_HasCollection,
@@ -107,25 +112,26 @@ func Test_hasPartitionTask_Execute(t *testing.T) {
 	})
 
 	t.Run("success", func(t *testing.T) {
-		meta := newMockMetaTable()
-		meta.GetCollectionByNameFunc = func(ctx context.Context, collectionName string, ts Timestamp) (*model.Collection, error) {
-			return &model.Collection{
-				Partitions: []*model.Partition{
-					{
-						PartitionName: "invalid test partition",
-					},
-					{
-						PartitionName: "test partition",
-					},
+		meta := mockrootcoord.NewIMetaTable(t)
+		meta.On("GetCollectionByName",
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+		).Return(&model.Collection{
+			Partitions: []*model.Partition{
+				{
+					PartitionName: "invalid test partition",
 				},
-			}, nil
-		}
+				{
+					PartitionName: "test partition",
+				},
+			},
+		}, nil)
+
 		core := newTestCore(withMeta(meta))
 		task := &hasPartitionTask{
-			baseTask: baseTask{
-				core: core,
-				done: make(chan error, 1),
-			},
+			baseTask: newBaseTask(context.Background(), core),
 			Req: &milvuspb.HasPartitionRequest{
 				Base: &commonpb.MsgBase{
 					MsgType: commonpb.MsgType_HasCollection,

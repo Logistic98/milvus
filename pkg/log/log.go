@@ -64,7 +64,6 @@ func init() {
 
 	r := utils.NewRateLimiter(1.0, 60.0)
 	_globalR.Store(r)
-
 }
 
 // InitLogger initializes a zap logger.
@@ -97,7 +96,7 @@ func InitLogger(cfg *Config, opts ...zap.Option) (*zap.Logger, *ZapProperties, e
 		return nil, nil, err
 	}
 	r.Level.SetLevel(level)
-	return debugL.WithOptions(zap.IncreaseLevel(level), zap.AddCallerSkip(1)), r, nil
+	return debugL.WithOptions(zap.AddCallerSkip(1)), r, nil
 }
 
 // InitTestLogger initializes a logger for unit tests
@@ -153,8 +152,8 @@ func initFileLog(cfg *FileLogConfig) (*lumberjack.Logger, error) {
 }
 
 func newStdLogger() (*zap.Logger, *ZapProperties) {
-	conf := &Config{Level: "debug", Stdout: true}
-	lg, r, _ := InitLogger(conf)
+	conf := &Config{Level: "debug", Stdout: true, DisableErrorVerbose: true}
+	lg, r, _ := InitLogger(conf, zap.OnFatal(zapcore.WriteThenPanic))
 	return lg, r
 }
 
@@ -218,8 +217,10 @@ func ReplaceGlobals(logger *zap.Logger, props *ZapProperties) {
 }
 
 func replaceLeveledLoggers(debugLogger *zap.Logger) {
-	levels := []zapcore.Level{zapcore.DebugLevel, zapcore.InfoLevel, zapcore.WarnLevel, zapcore.ErrorLevel,
-		zapcore.DPanicLevel, zapcore.PanicLevel, zapcore.FatalLevel}
+	levels := []zapcore.Level{
+		zapcore.DebugLevel, zapcore.InfoLevel, zapcore.WarnLevel, zapcore.ErrorLevel,
+		zapcore.DPanicLevel, zapcore.PanicLevel, zapcore.FatalLevel,
+	}
 	for _, level := range levels {
 		levelL := debugLogger.WithOptions(zap.IncreaseLevel(level))
 		_globalLevelLogger.Store(level, levelL)

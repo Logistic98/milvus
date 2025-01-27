@@ -17,7 +17,7 @@
 package collector
 
 import (
-	"fmt"
+	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/util/metricsinfo"
@@ -32,49 +32,22 @@ var Counter *counter
 
 func RateMetrics() []string {
 	return []string{
-		metricsinfo.NQPerSecond,
-		metricsinfo.SearchThroughput,
 		metricsinfo.InsertConsumeThroughput,
 		metricsinfo.DeleteConsumeThroughput,
 	}
 }
 
-func AverageMetrics() []string {
-	return []string{
-		metricsinfo.QueryQueueMetric,
-		metricsinfo.SearchQueueMetric,
-	}
-}
-
-func ConstructLabel(subs ...string) string {
-	label := ""
-	for id, sub := range subs {
-		label += sub
-		if id != len(subs)-1 {
-			label += "-"
-		}
-	}
-	return label
-}
-
 func init() {
 	var err error
-	Rate, err = ratelimitutil.NewRateCollector(ratelimitutil.DefaultWindow, ratelimitutil.DefaultGranularity)
+	Rate, err = ratelimitutil.NewRateCollector(ratelimitutil.DefaultWindow, ratelimitutil.DefaultGranularity, false)
 	if err != nil {
-		err = fmt.Errorf("querynode collector init failed, err = %s", err)
-		log.Error(err.Error())
-		panic(err)
+		log.Fatal("failed to initialize querynode rate collector", zap.Error(err))
 	}
 	Average = newAverageCollector()
 	Counter = newCounter()
 
-	//init rate Metric
+	// init rate Metric
 	for _, label := range RateMetrics() {
 		Rate.Register(label)
-	}
-	//init average metric
-
-	for _, label := range AverageMetrics() {
-		Average.Register(label)
 	}
 }

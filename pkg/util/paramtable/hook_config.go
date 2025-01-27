@@ -3,39 +3,41 @@ package paramtable
 import (
 	"go.uber.org/zap"
 
+	"github.com/milvus-io/milvus/pkg/config"
 	"github.com/milvus-io/milvus/pkg/log"
 )
 
 const hookYamlFile = "hook.yaml"
 
 type hookConfig struct {
-	SoPath                ParamItem  `refreshable:"false"`
-	SoConfig              ParamGroup `refreshable:"false"`
-	QueryNodePluginConfig ParamItem  `refreshable:"true"`
+	hookBase *BaseTable
+
+	SoPath   ParamItem  `refreshable:"false"`
+	SoConfig ParamGroup `refreshable:"true"`
 }
 
 func (h *hookConfig) init(base *BaseTable) {
-	hookBase := &BaseTable{YamlFiles: []string{hookYamlFile}}
-	hookBase.init(0)
-
-	log.Info("hook config", zap.Any("hook", hookBase.FileConfigs()))
+	h.hookBase = base
+	log.Info("hook config", zap.Any("hook", base.FileConfigs()))
 
 	h.SoPath = ParamItem{
 		Key:          "soPath",
 		Version:      "2.0.0",
 		DefaultValue: "",
 	}
-	h.SoPath.Init(hookBase.mgr)
+	h.SoPath.Init(base.mgr)
 
 	h.SoConfig = ParamGroup{
 		KeyPrefix: "",
 		Version:   "2.2.0",
 	}
-	h.SoConfig.Init(hookBase.mgr)
+	h.SoConfig.Init(base.mgr)
+}
 
-	h.QueryNodePluginConfig = ParamItem{
-		Key:     "autoindex.params.search",
-		Version: "2.3.0",
-	}
-	h.QueryNodePluginConfig.Init(base.mgr)
+func (h *hookConfig) WatchHookWithPrefix(ident string, keyPrefix string, onEvent func(*config.Event)) {
+	h.hookBase.mgr.Dispatcher.RegisterForKeyPrefix(keyPrefix, config.NewHandler(ident, onEvent))
+}
+
+func (h *hookConfig) GetAll() map[string]string {
+	return h.hookBase.mgr.GetConfigs()
 }

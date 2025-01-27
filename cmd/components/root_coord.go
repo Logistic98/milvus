@@ -18,15 +18,17 @@ package components
 
 import (
 	"context"
+	"time"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
+	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	rc "github.com/milvus-io/milvus/internal/distributed/rootcoord"
 	"github.com/milvus-io/milvus/internal/util/dependency"
 	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
-
-	"go.uber.org/zap"
 )
 
 // RootCoord implements RoodCoord grpc server
@@ -47,22 +49,24 @@ func NewRootCoord(ctx context.Context, factory dependency.Factory) (*RootCoord, 
 	}, nil
 }
 
+func (rc *RootCoord) Prepare() error {
+	return rc.svr.Prepare()
+}
+
 // Run starts service
 func (rc *RootCoord) Run() error {
 	if err := rc.svr.Run(); err != nil {
-		log.Error("RootCoord starts error", zap.Error(err))
+		log.Ctx(rc.ctx).Error("RootCoord starts error", zap.Error(err))
 		return err
 	}
-	log.Info("RootCoord successfully started")
+	log.Ctx(rc.ctx).Info("RootCoord successfully started")
 	return nil
 }
 
 // Stop terminates service
 func (rc *RootCoord) Stop() error {
-	if err := rc.svr.Stop(); err != nil {
-		return err
-	}
-	return nil
+	timeout := paramtable.Get().RootCoordCfg.GracefulStopTimeout.GetAsDuration(time.Second)
+	return exitWhenStopTimeout(rc.svr.Stop, timeout)
 }
 
 // GetComponentStates returns RootCoord's states

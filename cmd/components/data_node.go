@@ -18,12 +18,16 @@ package components
 
 import (
 	"context"
+	"time"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
+	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	grpcdatanode "github.com/milvus-io/milvus/internal/distributed/datanode"
 	"github.com/milvus-io/milvus/internal/util/dependency"
 	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
@@ -46,21 +50,24 @@ func NewDataNode(ctx context.Context, factory dependency.Factory) (*DataNode, er
 	}, nil
 }
 
+func (d *DataNode) Prepare() error {
+	return d.svr.Prepare()
+}
+
 // Run starts service
 func (d *DataNode) Run() error {
 	if err := d.svr.Run(); err != nil {
-		panic(err)
+		log.Ctx(d.ctx).Error("DataNode starts error", zap.Error(err))
+		return err
 	}
-	log.Debug("Datanode successfully started")
+	log.Ctx(d.ctx).Info("Datanode successfully started")
 	return nil
 }
 
 // Stop terminates service
 func (d *DataNode) Stop() error {
-	if err := d.svr.Stop(); err != nil {
-		return err
-	}
-	return nil
+	timeout := paramtable.Get().DataNodeCfg.GracefulStopTimeout.GetAsDuration(time.Second)
+	return exitWhenStopTimeout(d.svr.Stop, timeout)
 }
 
 // GetComponentStates returns DataNode's states

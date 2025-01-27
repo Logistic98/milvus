@@ -17,6 +17,7 @@
 package funcutil
 
 import (
+	"context"
 	"reflect"
 	"runtime"
 	"sync"
@@ -51,7 +52,7 @@ func ProcessFuncParallel(total, maxParallel int, f ProcessFunc, fname string) er
 
 	t := time.Now()
 	defer func() {
-		log.Debug(fname, zap.Any("total", total), zap.Any("time cost", time.Since(t)))
+		log.Ctx(context.TODO()).Debug(fname, zap.Int("total", total), zap.Any("time cost", time.Since(t)))
 	}()
 
 	nPerBatch := (total + maxParallel - 1) / maxParallel
@@ -85,7 +86,7 @@ func ProcessFuncParallel(total, maxParallel int, f ProcessFunc, fname string) er
 			for idx := begin; idx < end; idx++ {
 				err = f(idx)
 				if err != nil {
-					log.Error(fname, zap.Error(err), zap.Any("idx", idx))
+					log.Error(fname, zap.Error(err), zap.Int("idx", idx))
 					break
 				}
 			}
@@ -134,6 +135,7 @@ func ProcessTaskParallel(maxParallel int, fname string, tasks ...TaskFunc) error
 	// for _, opt := range opts {
 	// 	opt(&option)
 	// }
+	log := log.Ctx(context.TODO())
 
 	if maxParallel <= 0 {
 		maxParallel = 1
@@ -146,8 +148,8 @@ func ProcessTaskParallel(maxParallel int, fname string, tasks ...TaskFunc) error
 
 	total := len(tasks)
 	nPerBatch := (total + maxParallel - 1) / maxParallel
-	log.Debug(fname, zap.Any("total", total))
-	log.Debug(fname, zap.Any("nPerBatch", nPerBatch))
+	log.Debug(fname, zap.Int("total", total))
+	log.Debug(fname, zap.Int("nPerBatch", nPerBatch))
 
 	quit := make(chan bool)
 	errc := make(chan error)
@@ -188,7 +190,7 @@ func ProcessTaskParallel(maxParallel int, fname string, tasks ...TaskFunc) error
 			for idx := begin; idx < end; idx++ {
 				err = tasks[idx]()
 				if err != nil {
-					log.Error(fname, zap.Error(err), zap.Any("idx", idx))
+					log.Error(fname, zap.Error(err), zap.Int("idx", idx))
 					break
 				}
 			}
@@ -212,7 +214,7 @@ func ProcessTaskParallel(maxParallel int, fname string, tasks ...TaskFunc) error
 		routineNum++
 	}
 
-	log.Debug(fname, zap.Any("NumOfGoRoutines", routineNum))
+	log.Debug(fname, zap.Int("NumOfGoRoutines", routineNum))
 
 	if routineNum <= 0 {
 		return nil

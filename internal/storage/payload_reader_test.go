@@ -4,9 +4,10 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/apache/arrow/go/v8/parquet/file"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
+	"github.com/apache/arrow/go/v12/parquet/file"
 	"github.com/stretchr/testify/suite"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 )
 
 type ReadDataFromAllRowGroupsSuite struct {
@@ -29,8 +30,8 @@ func (s *ReadDataFromAllRowGroupsSuite) SetupSuite() {
 
 	s.size = 1 << 10
 
-	data := make([]byte, s.size)
-	err = ew.AddByteToPayload(data)
+	data := make([]int8, s.size)
+	err = ew.AddInt8ToPayload(data, nil)
 	s.Require().NoError(err)
 
 	ew.SetEventTimestamp(1, 1)

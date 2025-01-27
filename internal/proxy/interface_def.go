@@ -19,7 +19,9 @@ package proxy
 import (
 	"context"
 
-	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
+	"google.golang.org/grpc"
+
+	"github.com/milvus-io/milvus/pkg/proto/rootcoordpb"
 )
 
 // use interface tsoAllocator to keep other components testable
@@ -29,6 +31,8 @@ type tsoAllocator interface {
 }
 
 // use timestampAllocatorInterface to keep other components testable
+//
+//go:generate mockery --name=timestampAllocatorInterface --filename=mock_tso_test.go --outpkg=proxy --output=. --inpackage --structname=mockTimestampAllocator --with-expecter
 type timestampAllocatorInterface interface {
-	AllocTimestamp(ctx context.Context, req *rootcoordpb.AllocTimestampRequest) (*rootcoordpb.AllocTimestampResponse, error)
+	AllocTimestamp(ctx context.Context, req *rootcoordpb.AllocTimestampRequest, opts ...grpc.CallOption) (*rootcoordpb.AllocTimestampResponse, error)
 }

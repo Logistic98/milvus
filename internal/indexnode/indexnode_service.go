@@ -21,137 +21,131 @@ import (
 	"fmt"
 	"strconv"
 
-	"github.com/golang/protobuf/proto"
+	"github.com/tidwall/gjson"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-	"github.com/milvus-io/milvus/internal/proto/indexpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus/internal/flushcommon/io"
 	"github.com/milvus-io/milvus/pkg/common"
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/metrics"
-	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/proto/workerpb"
+	"github.com/milvus-io/milvus/pkg/util/merr"
 	"github.com/milvus-io/milvus/pkg/util/metricsinfo"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/util/timerecord"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
-func (i *IndexNode) CreateJob(ctx context.Context, req *indexpb.CreateJobRequest) (*commonpb.Status, error) {
-	if !i.lifetime.Add(commonpbutil.IsHealthy) {
-		stateCode := i.lifetime.GetState()
-		log.Ctx(ctx).Warn("index node not ready", zap.String("state", stateCode.String()), zap.String("ClusterID", req.ClusterID), zap.Int64("IndexBuildID", req.BuildID))
-		return &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_UnexpectedError,
-			Reason:    "state code is not healthy",
-		}, nil
+func (i *IndexNode) CreateJob(ctx context.Context, req *workerpb.CreateJobRequest) (*commonpb.Status, error) {
+	log := log.Ctx(ctx).With(
+		zap.String("clusterID", req.GetClusterID()),
+		zap.Int64("indexBuildID", req.GetBuildID()),
+	)
+
+	if err := i.lifetime.Add(merr.IsHealthy); err != nil {
+		log.Warn("index node not ready",
+			zap.Error(err),
+		)
+		return merr.Status(err), nil
 	}
 	defer i.lifetime.Done()
-	log.Ctx(ctx).Info("IndexNode building index ...",
-		zap.String("ClusterID", req.ClusterID),
-		zap.Int64("IndexBuildID", req.BuildID),
-		zap.Int64("IndexID", req.IndexID),
-		zap.String("IndexName", req.IndexName),
-		zap.String("IndexFilePrefix", req.IndexFilePrefix),
-		zap.Int64("IndexVersion", req.IndexVersion),
-		zap.Strings("DataPaths", req.DataPaths),
-		zap.Any("TypeParams", req.TypeParams),
-		zap.Any("IndexParams", req.IndexParams),
-		zap.Int64("num_rows", req.GetNumRows()))
+	log.Info("IndexNode building index ...",
+		zap.Int64("collectionID", req.GetCollectionID()),
+		zap.Int64("partitionID", req.GetPartitionID()),
+		zap.Int64("segmentID", req.GetSegmentID()),
+		zap.Int64("indexID", req.GetIndexID()),
+		zap.String("indexName", req.GetIndexName()),
+		zap.String("indexFilePrefix", req.GetIndexFilePrefix()),
+		zap.Int64("indexVersion", req.GetIndexVersion()),
+		zap.Strings("dataPaths", req.GetDataPaths()),
+		zap.Any("typeParams", req.GetTypeParams()),
+		zap.Any("indexParams", req.GetIndexParams()),
+		zap.Int64("numRows", req.GetNumRows()),
+		zap.Int32("current_index_version", req.GetCurrentIndexVersion()),
+		zap.Any("storepath", req.GetStorePath()),
+		zap.Any("storeversion", req.GetStoreVersion()),
+		zap.Any("indexstorepath", req.GetIndexStorePath()),
+		zap.Any("dim", req.GetDim()),
+	)
 	ctx, sp := otel.Tracer(typeutil.IndexNodeRole).Start(ctx, "IndexNode-CreateIndex", trace.WithAttributes(
-		attribute.Int64("IndexBuildID", req.BuildID),
-		attribute.String("ClusterID", req.ClusterID),
+		attribute.Int64("indexBuildID", req.GetBuildID()),
+		attribute.String("clusterID", req.GetClusterID()),
 	))
 	defer sp.End()
 	metrics.IndexNodeBuildIndexTaskCounter.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), metrics.TotalLabel).Inc()
 
 	taskCtx, taskCancel := context.WithCancel(i.loopCtx)
-	if oldInfo := i.loadOrStoreTask(req.ClusterID, req.BuildID, &taskInfo{
+	if oldInfo := i.loadOrStoreIndexTask(req.GetClusterID(), req.GetBuildID(), &indexTaskInfo{
 		cancel: taskCancel,
-		state:  commonpb.IndexState_InProgress}); oldInfo != nil {
-		log.Ctx(ctx).Warn("duplicated index build task", zap.String("ClusterID", req.ClusterID), zap.Int64("BuildID", req.BuildID))
-		return &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_BuildIndexError,
-			Reason:    "duplicated index build task",
-		}, nil
+		state:  commonpb.IndexState_InProgress,
+	}); oldInfo != nil {
+		err := merr.WrapErrIndexDuplicate(req.GetIndexName(), "building index task existed")
+		log.Warn("duplicated index build task", zap.Error(err))
+		metrics.IndexNodeBuildIndexTaskCounter.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.FailLabel).Inc()
+		return merr.Status(err), nil
 	}
-	cm, err := i.storageFactory.NewChunkManager(i.loopCtx, req.StorageConfig)
+	cm, err := i.storageFactory.NewChunkManager(i.loopCtx, req.GetStorageConfig())
 	if err != nil {
-		log.Ctx(ctx).Error("create chunk manager failed", zap.String("Bucket", req.StorageConfig.BucketName),
-			zap.String("AccessKey", req.StorageConfig.AccessKeyID),
-			zap.String("ClusterID", req.ClusterID), zap.Int64("IndexBuildID", req.BuildID))
-		return &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_BuildIndexError,
-			Reason:    "create chunk manager failed",
-		}, nil
+		log.Error("create chunk manager failed", zap.String("bucket", req.GetStorageConfig().GetBucketName()),
+			zap.String("accessKey", req.GetStorageConfig().GetAccessKeyID()),
+			zap.Error(err),
+		)
+		i.deleteIndexTaskInfos(ctx, []taskKey{{ClusterID: req.GetClusterID(), TaskID: req.GetBuildID()}})
+		metrics.IndexNodeBuildIndexTaskCounter.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.FailLabel).Inc()
+		return merr.Status(err), nil
 	}
-	task := &indexBuildTask{
-		ident:          fmt.Sprintf("%s/%d", req.ClusterID, req.BuildID),
-		ctx:            taskCtx,
-		cancel:         taskCancel,
-		BuildID:        req.BuildID,
-		ClusterID:      req.ClusterID,
-		node:           i,
-		req:            req,
-		cm:             cm,
-		nodeID:         i.GetNodeID(),
-		tr:             timerecord.NewTimeRecorder(fmt.Sprintf("IndexBuildID: %d, ClusterID: %s", req.BuildID, req.ClusterID)),
-		serializedSize: 0,
-	}
-	ret := &commonpb.Status{
-		ErrorCode: commonpb.ErrorCode_Success,
-		Reason:    "",
-	}
-	if err := i.sched.IndexBuildQueue.Enqueue(task); err != nil {
-		log.Ctx(ctx).Warn("IndexNode failed to schedule", zap.Int64("IndexBuildID", req.BuildID), zap.String("ClusterID", req.ClusterID), zap.Error(err))
-		ret.ErrorCode = commonpb.ErrorCode_UnexpectedError
-		ret.Reason = err.Error()
+	task := newIndexBuildTask(taskCtx, taskCancel, req, cm, i)
+	ret := merr.Success()
+	if err := i.sched.TaskQueue.Enqueue(task); err != nil {
+		log.Warn("IndexNode failed to schedule",
+			zap.Error(err))
+		ret = merr.Status(err)
 		metrics.IndexNodeBuildIndexTaskCounter.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), metrics.FailLabel).Inc()
 		return ret, nil
 	}
-	log.Ctx(ctx).Info("IndexNode successfully scheduled", zap.Int64("IndexBuildID", req.BuildID), zap.String("ClusterID", req.ClusterID), zap.String("indexName", req.IndexName))
+	metrics.IndexNodeBuildIndexTaskCounter.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.SuccessLabel).Inc()
+	log.Info("IndexNode successfully scheduled",
+		zap.String("indexName", req.GetIndexName()))
 	return ret, nil
 }
 
-func (i *IndexNode) QueryJobs(ctx context.Context, req *indexpb.QueryJobsRequest) (*indexpb.QueryJobsResponse, error) {
+func (i *IndexNode) QueryJobs(ctx context.Context, req *workerpb.QueryJobsRequest) (*workerpb.QueryJobsResponse, error) {
 	log := log.Ctx(ctx).With(
-		zap.String("ClusterID", req.GetClusterID()),
+		zap.String("clusterID", req.GetClusterID()),
 	).WithRateGroup("in.queryJobs", 1, 60)
-	if !i.lifetime.Add(commonpbutil.IsHealthyOrStopping) {
-		stateCode := i.lifetime.GetState()
-		log.Warn("index node not ready", zap.String("state", stateCode.String()))
-		return &indexpb.QueryJobsResponse{
-			Status: &commonpb.Status{
-				ErrorCode: commonpb.ErrorCode_UnexpectedError,
-				Reason:    "state code is not healthy",
-			},
+	if err := i.lifetime.Add(merr.IsHealthyOrStopping); err != nil {
+		log.Warn("index node not ready", zap.Error(err))
+		return &workerpb.QueryJobsResponse{
+			Status: merr.Status(err),
 		}, nil
 	}
 	defer i.lifetime.Done()
-	infos := make(map[UniqueID]*taskInfo)
-	i.foreachTaskInfo(func(ClusterID string, buildID UniqueID, info *taskInfo) {
-		if ClusterID == req.ClusterID {
-			infos[buildID] = &taskInfo{
-				state:          info.state,
-				fileKeys:       common.CloneStringList(info.fileKeys),
-				serializedSize: info.serializedSize,
-				failReason:     info.failReason,
+	infos := make(map[UniqueID]*indexTaskInfo)
+	i.foreachIndexTaskInfo(func(ClusterID string, buildID UniqueID, info *indexTaskInfo) {
+		if ClusterID == req.GetClusterID() {
+			infos[buildID] = &indexTaskInfo{
+				state:               info.state,
+				fileKeys:            common.CloneStringList(info.fileKeys),
+				serializedSize:      info.serializedSize,
+				memSize:             info.memSize,
+				failReason:          info.failReason,
+				currentIndexVersion: info.currentIndexVersion,
+				indexStoreVersion:   info.indexStoreVersion,
 			}
 		}
 	})
-	ret := &indexpb.QueryJobsResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-			Reason:    "",
-		},
-		ClusterID:  req.ClusterID,
-		IndexInfos: make([]*indexpb.IndexTaskInfo, 0, len(req.BuildIDs)),
+	ret := &workerpb.QueryJobsResponse{
+		Status:     merr.Success(),
+		ClusterID:  req.GetClusterID(),
+		IndexInfos: make([]*workerpb.IndexTaskInfo, 0, len(req.GetBuildIDs())),
 	}
-	for i, buildID := range req.BuildIDs {
-		ret.IndexInfos = append(ret.IndexInfos, &indexpb.IndexTaskInfo{
+	for i, buildID := range req.GetBuildIDs() {
+		ret.IndexInfos = append(ret.IndexInfos, &workerpb.IndexTaskInfo{
 			BuildID:        buildID,
 			State:          commonpb.IndexState_IndexStateNone,
 			IndexFileKeys:  nil,
@@ -161,78 +155,71 @@ func (i *IndexNode) QueryJobs(ctx context.Context, req *indexpb.QueryJobsRequest
 			ret.IndexInfos[i].State = info.state
 			ret.IndexInfos[i].IndexFileKeys = info.fileKeys
 			ret.IndexInfos[i].SerializedSize = info.serializedSize
+			ret.IndexInfos[i].MemSize = info.memSize
 			ret.IndexInfos[i].FailReason = info.failReason
+			ret.IndexInfos[i].CurrentIndexVersion = info.currentIndexVersion
+			ret.IndexInfos[i].IndexStoreVersion = info.indexStoreVersion
 			log.RatedDebug(5, "querying index build task",
-				zap.Int64("IndexBuildID", buildID), zap.String("state", info.state.String()),
-				zap.String("fail reason", info.failReason))
+				zap.Int64("indexBuildID", buildID),
+				zap.String("state", info.state.String()),
+				zap.String("reason", info.failReason),
+			)
 		}
 	}
 	return ret, nil
 }
 
-func (i *IndexNode) DropJobs(ctx context.Context, req *indexpb.DropJobsRequest) (*commonpb.Status, error) {
-	log.Ctx(ctx).Info("drop index build jobs", zap.String("ClusterID", req.ClusterID), zap.Int64s("IndexBuildIDs", req.BuildIDs))
-	if !i.lifetime.Add(commonpbutil.IsHealthyOrStopping) {
-		stateCode := i.lifetime.GetState()
-		log.Ctx(ctx).Warn("index node not ready", zap.String("state", stateCode.String()), zap.String("ClusterID", req.ClusterID))
-		return &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_UnexpectedError,
-			Reason:    "state code is not healthy",
-		}, nil
+func (i *IndexNode) DropJobs(ctx context.Context, req *workerpb.DropJobsRequest) (*commonpb.Status, error) {
+	log.Ctx(ctx).Info("drop index build jobs",
+		zap.String("clusterID", req.ClusterID),
+		zap.Int64s("indexBuildIDs", req.BuildIDs),
+	)
+	if err := i.lifetime.Add(merr.IsHealthyOrStopping); err != nil {
+		log.Ctx(ctx).Warn("index node not ready", zap.Error(err), zap.String("clusterID", req.ClusterID))
+		return merr.Status(err), nil
 	}
 	defer i.lifetime.Done()
-	keys := make([]taskKey, 0, len(req.BuildIDs))
-	for _, buildID := range req.BuildIDs {
-		keys = append(keys, taskKey{ClusterID: req.ClusterID, BuildID: buildID})
+	keys := make([]taskKey, 0, len(req.GetBuildIDs()))
+	for _, buildID := range req.GetBuildIDs() {
+		keys = append(keys, taskKey{ClusterID: req.GetClusterID(), TaskID: buildID})
 	}
-	infos := i.deleteTaskInfos(keys)
+	infos := i.deleteIndexTaskInfos(ctx, keys)
 	for _, info := range infos {
 		if info.cancel != nil {
 			info.cancel()
 		}
 	}
-	log.Ctx(ctx).Info("drop index build jobs success", zap.String("ClusterID", req.ClusterID),
-		zap.Int64s("IndexBuildIDs", req.BuildIDs))
-	return &commonpb.Status{
-		ErrorCode: commonpb.ErrorCode_Success,
-		Reason:    "",
-	}, nil
+	log.Ctx(ctx).Info("drop index build jobs success", zap.String("clusterID", req.GetClusterID()),
+		zap.Int64s("indexBuildIDs", req.GetBuildIDs()))
+	return merr.Success(), nil
 }
 
-func (i *IndexNode) GetJobStats(ctx context.Context, req *indexpb.GetJobStatsRequest) (*indexpb.GetJobStatsResponse, error) {
-	if !i.lifetime.Add(commonpbutil.IsHealthyOrStopping) {
-		stateCode := i.lifetime.GetState()
-		log.Ctx(ctx).Warn("index node not ready", zap.String("state", stateCode.String()))
-		return &indexpb.GetJobStatsResponse{
-			Status: &commonpb.Status{
-				ErrorCode: commonpb.ErrorCode_UnexpectedError,
-				Reason:    "state code is not healthy",
-			},
+// GetJobStats should be GetSlots
+func (i *IndexNode) GetJobStats(ctx context.Context, req *workerpb.GetJobStatsRequest) (*workerpb.GetJobStatsResponse, error) {
+	if err := i.lifetime.Add(merr.IsHealthyOrStopping); err != nil {
+		log.Ctx(ctx).Warn("index node not ready", zap.Error(err))
+		return &workerpb.GetJobStatsResponse{
+			Status: merr.Status(err),
 		}, nil
 	}
 	defer i.lifetime.Done()
-	unissued, active := i.sched.IndexBuildQueue.GetTaskNum()
-	jobInfos := make([]*indexpb.JobInfo, 0)
-	i.foreachTaskInfo(func(ClusterID string, buildID UniqueID, info *taskInfo) {
-		if info.statistic != nil {
-			jobInfos = append(jobInfos, proto.Clone(info.statistic).(*indexpb.JobInfo))
-		}
-	})
+	unissued, active := i.sched.TaskQueue.GetTaskNum()
+
 	slots := 0
 	if i.sched.buildParallel > unissued+active {
 		slots = i.sched.buildParallel - unissued - active
 	}
-	log.Ctx(ctx).Info("Get Index Job Stats", zap.Int("Unissued", unissued), zap.Int("Active", active), zap.Int("Slot", slots))
-	return &indexpb.GetJobStatsResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-			Reason:    "",
-		},
+	log.Ctx(ctx).Info("Get Index Job Stats",
+		zap.Int("unissued", unissued),
+		zap.Int("active", active),
+		zap.Int("slot", slots),
+	)
+	return &workerpb.GetJobStatsResponse{
+		Status:           merr.Success(),
 		TotalJobNum:      int64(active) + int64(unissued),
 		InProgressJobNum: int64(active),
 		EnqueueJobNum:    int64(unissued),
 		TaskSlots:        int64(slots),
-		JobInfos:         jobInfos,
 		EnableDisk:       Params.IndexNodeCfg.EnableDisk.GetAsBool(),
 	}, nil
 }
@@ -240,35 +227,28 @@ func (i *IndexNode) GetJobStats(ctx context.Context, req *indexpb.GetJobStatsReq
 // GetMetrics gets the metrics info of IndexNode.
 // TODO(dragondriver): cache the Metrics and set a retention to the cache
 func (i *IndexNode) GetMetrics(ctx context.Context, req *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error) {
-	if !i.lifetime.Add(commonpbutil.IsHealthyOrStopping) {
+	if err := i.lifetime.Add(merr.IsHealthyOrStopping); err != nil {
 		log.Ctx(ctx).Warn("IndexNode.GetMetrics failed",
 			zap.Int64("nodeID", paramtable.GetNodeID()),
-			zap.String("req", req.Request),
-			zap.Error(errIndexNodeIsUnhealthy(paramtable.GetNodeID())))
+			zap.String("req", req.GetRequest()),
+			zap.Error(err))
 
 		return &milvuspb.GetMetricsResponse{
-			Status: &commonpb.Status{
-				ErrorCode: commonpb.ErrorCode_UnexpectedError,
-				Reason:    msgIndexNodeIsUnhealthy(paramtable.GetNodeID()),
-			},
-			Response: "",
+			Status: merr.Status(err),
 		}, nil
 	}
 	defer i.lifetime.Done()
 
-	metricType, err := metricsinfo.ParseMetricType(req.Request)
+	ret := gjson.Parse(req.GetRequest())
+	metricType, err := metricsinfo.ParseMetricRequestType(ret)
 	if err != nil {
 		log.Ctx(ctx).Warn("IndexNode.GetMetrics failed to parse metric type",
 			zap.Int64("nodeID", paramtable.GetNodeID()),
-			zap.String("req", req.Request),
+			zap.String("req", req.GetRequest()),
 			zap.Error(err))
 
 		return &milvuspb.GetMetricsResponse{
-			Status: &commonpb.Status{
-				ErrorCode: commonpb.ErrorCode_UnexpectedError,
-				Reason:    err.Error(),
-			},
-			Response: "",
+			Status: merr.Status(err),
 		}, nil
 	}
 
@@ -277,8 +257,8 @@ func (i *IndexNode) GetMetrics(ctx context.Context, req *milvuspb.GetMetricsRequ
 
 		log.Ctx(ctx).RatedDebug(60, "IndexNode.GetMetrics",
 			zap.Int64("nodeID", paramtable.GetNodeID()),
-			zap.String("req", req.Request),
-			zap.String("metric_type", metricType),
+			zap.String("req", req.GetRequest()),
+			zap.String("metricType", metricType),
 			zap.Error(err))
 
 		return metrics, nil
@@ -286,14 +266,341 @@ func (i *IndexNode) GetMetrics(ctx context.Context, req *milvuspb.GetMetricsRequ
 
 	log.Ctx(ctx).RatedWarn(60, "IndexNode.GetMetrics failed, request metric type is not implemented yet",
 		zap.Int64("nodeID", paramtable.GetNodeID()),
-		zap.String("req", req.Request),
-		zap.String("metric_type", metricType))
+		zap.String("req", req.GetRequest()),
+		zap.String("metricType", metricType))
 
 	return &milvuspb.GetMetricsResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_UnexpectedError,
-			Reason:    metricsinfo.MsgUnimplementedMetric,
-		},
-		Response: "",
+		Status: merr.Status(merr.WrapErrMetricNotFound(metricType)),
 	}, nil
+}
+
+func (i *IndexNode) CreateJobV2(ctx context.Context, req *workerpb.CreateJobV2Request) (*commonpb.Status, error) {
+	log := log.Ctx(ctx).With(
+		zap.String("clusterID", req.GetClusterID()), zap.Int64("TaskID", req.GetTaskID()),
+		zap.String("jobType", req.GetJobType().String()),
+	)
+
+	if err := i.lifetime.Add(merr.IsHealthy); err != nil {
+		log.Warn("index node not ready",
+			zap.Error(err),
+		)
+		return merr.Status(err), nil
+	}
+	defer i.lifetime.Done()
+
+	log.Info("IndexNode receive CreateJob request...")
+
+	switch req.GetJobType() {
+	case indexpb.JobType_JobTypeIndexJob:
+		indexRequest := req.GetIndexRequest()
+		log.Info("IndexNode building index ...",
+			zap.Int64("collectionID", indexRequest.CollectionID),
+			zap.Int64("partitionID", indexRequest.PartitionID),
+			zap.Int64("segmentID", indexRequest.SegmentID),
+			zap.String("indexFilePrefix", indexRequest.GetIndexFilePrefix()),
+			zap.Int64("indexVersion", indexRequest.GetIndexVersion()),
+			zap.Strings("dataPaths", indexRequest.GetDataPaths()),
+			zap.Any("typeParams", indexRequest.GetTypeParams()),
+			zap.Any("indexParams", indexRequest.GetIndexParams()),
+			zap.Int64("numRows", indexRequest.GetNumRows()),
+			zap.Int32("current_index_version", indexRequest.GetCurrentIndexVersion()),
+			zap.String("storePath", indexRequest.GetStorePath()),
+			zap.Int64("storeVersion", indexRequest.GetStoreVersion()),
+			zap.String("indexStorePath", indexRequest.GetIndexStorePath()),
+			zap.Int64("dim", indexRequest.GetDim()),
+			zap.Int64("fieldID", indexRequest.GetFieldID()),
+			zap.String("fieldType", indexRequest.GetFieldType().String()),
+			zap.Any("field", indexRequest.GetField()),
+		)
+		taskCtx, taskCancel := context.WithCancel(i.loopCtx)
+		if oldInfo := i.loadOrStoreIndexTask(indexRequest.GetClusterID(), indexRequest.GetBuildID(), &indexTaskInfo{
+			cancel: taskCancel,
+			state:  commonpb.IndexState_InProgress,
+		}); oldInfo != nil {
+			err := merr.WrapErrTaskDuplicate(req.GetJobType().String(),
+				fmt.Sprintf("building index task existed with %s-%d", req.GetClusterID(), req.GetTaskID()))
+			log.Warn("duplicated index build task", zap.Error(err))
+			metrics.IndexNodeBuildIndexTaskCounter.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.FailLabel).Inc()
+			return merr.Status(err), nil
+		}
+		cm, err := i.storageFactory.NewChunkManager(i.loopCtx, indexRequest.GetStorageConfig())
+		if err != nil {
+			log.Error("create chunk manager failed", zap.String("bucket", indexRequest.GetStorageConfig().GetBucketName()),
+				zap.String("accessKey", indexRequest.GetStorageConfig().GetAccessKeyID()),
+				zap.Error(err),
+			)
+			i.deleteIndexTaskInfos(ctx, []taskKey{{ClusterID: indexRequest.GetClusterID(), TaskID: indexRequest.GetBuildID()}})
+			metrics.IndexNodeBuildIndexTaskCounter.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.FailLabel).Inc()
+			return merr.Status(err), nil
+		}
+		task := newIndexBuildTask(taskCtx, taskCancel, indexRequest, cm, i)
+		ret := merr.Success()
+		if err := i.sched.TaskQueue.Enqueue(task); err != nil {
+			log.Warn("IndexNode failed to schedule",
+				zap.Error(err))
+			ret = merr.Status(err)
+			metrics.IndexNodeBuildIndexTaskCounter.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), metrics.FailLabel).Inc()
+			return ret, nil
+		}
+		metrics.IndexNodeBuildIndexTaskCounter.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.SuccessLabel).Inc()
+		log.Info("IndexNode index job enqueued successfully",
+			zap.String("indexName", indexRequest.GetIndexName()))
+		return ret, nil
+	case indexpb.JobType_JobTypeAnalyzeJob:
+		analyzeRequest := req.GetAnalyzeRequest()
+		log.Info("receive analyze job", zap.Int64("collectionID", analyzeRequest.GetCollectionID()),
+			zap.Int64("partitionID", analyzeRequest.GetPartitionID()),
+			zap.Int64("fieldID", analyzeRequest.GetFieldID()),
+			zap.String("fieldName", analyzeRequest.GetFieldName()),
+			zap.String("dataType", analyzeRequest.GetFieldType().String()),
+			zap.Int64("version", analyzeRequest.GetVersion()),
+			zap.Int64("dim", analyzeRequest.GetDim()),
+			zap.Float64("trainSizeRatio", analyzeRequest.GetMaxTrainSizeRatio()),
+			zap.Int64("numClusters", analyzeRequest.GetNumClusters()),
+		)
+		taskCtx, taskCancel := context.WithCancel(i.loopCtx)
+		if oldInfo := i.loadOrStoreAnalyzeTask(analyzeRequest.GetClusterID(), analyzeRequest.GetTaskID(), &analyzeTaskInfo{
+			cancel: taskCancel,
+			state:  indexpb.JobState_JobStateInProgress,
+		}); oldInfo != nil {
+			err := merr.WrapErrTaskDuplicate(req.GetJobType().String(),
+				fmt.Sprintf("analyze task already existed with %s-%d", req.GetClusterID(), req.GetTaskID()))
+			log.Warn("duplicated analyze task", zap.Error(err))
+			return merr.Status(err), nil
+		}
+		t := newAnalyzeTask(taskCtx, taskCancel, analyzeRequest, i)
+		ret := merr.Success()
+		if err := i.sched.TaskQueue.Enqueue(t); err != nil {
+			log.Warn("IndexNode failed to schedule", zap.Error(err))
+			ret = merr.Status(err)
+			return ret, nil
+		}
+		log.Info("IndexNode analyze job enqueued successfully")
+		return ret, nil
+	case indexpb.JobType_JobTypeStatsJob:
+		statsRequest := req.GetStatsRequest()
+		log.Info("receive stats job", zap.Int64("collectionID", statsRequest.GetCollectionID()),
+			zap.Int64("partitionID", statsRequest.GetPartitionID()),
+			zap.Int64("segmentID", statsRequest.GetSegmentID()),
+			zap.Int64("targetSegmentID", statsRequest.GetTargetSegmentID()),
+			zap.String("subJobType", statsRequest.GetSubJobType().String()),
+			zap.Int64("startLogID", statsRequest.GetStartLogID()),
+			zap.Int64("endLogID", statsRequest.GetEndLogID()),
+		)
+
+		taskCtx, taskCancel := context.WithCancel(i.loopCtx)
+		if oldInfo := i.loadOrStoreStatsTask(statsRequest.GetClusterID(), statsRequest.GetTaskID(), &statsTaskInfo{
+			cancel: taskCancel,
+			state:  indexpb.JobState_JobStateInProgress,
+		}); oldInfo != nil {
+			err := merr.WrapErrTaskDuplicate(req.GetJobType().String(),
+				fmt.Sprintf("stats task already existed with %s-%d", req.GetClusterID(), req.GetTaskID()))
+			log.Warn("duplicated stats task", zap.Error(err))
+			return merr.Status(err), nil
+		}
+		cm, err := i.storageFactory.NewChunkManager(i.loopCtx, statsRequest.GetStorageConfig())
+		if err != nil {
+			log.Error("create chunk manager failed", zap.String("bucket", statsRequest.GetStorageConfig().GetBucketName()),
+				zap.String("accessKey", statsRequest.GetStorageConfig().GetAccessKeyID()),
+				zap.Error(err),
+			)
+			i.deleteStatsTaskInfos(ctx, []taskKey{{ClusterID: req.GetClusterID(), TaskID: req.GetTaskID()}})
+			return merr.Status(err), nil
+		}
+
+		t := newStatsTask(taskCtx, taskCancel, statsRequest, i, io.NewBinlogIO(cm))
+		ret := merr.Success()
+		if err := i.sched.TaskQueue.Enqueue(t); err != nil {
+			log.Warn("IndexNode failed to schedule", zap.Error(err))
+			ret = merr.Status(err)
+			return ret, nil
+		}
+		log.Info("IndexNode stats job enqueued successfully")
+		return ret, nil
+
+	default:
+		log.Warn("IndexNode receive unknown type job")
+		return merr.Status(fmt.Errorf("IndexNode receive unknown type job with TaskID: %d", req.GetTaskID())), nil
+	}
+}
+
+func (i *IndexNode) QueryJobsV2(ctx context.Context, req *workerpb.QueryJobsV2Request) (*workerpb.QueryJobsV2Response, error) {
+	log := log.Ctx(ctx).With(
+		zap.String("clusterID", req.GetClusterID()), zap.Int64s("taskIDs", req.GetTaskIDs()),
+	).WithRateGroup("QueryResult", 1, 60)
+
+	if err := i.lifetime.Add(merr.IsHealthyOrStopping); err != nil {
+		log.Warn("IndexNode not ready", zap.Error(err))
+		return &workerpb.QueryJobsV2Response{
+			Status: merr.Status(err),
+		}, nil
+	}
+	defer i.lifetime.Done()
+
+	switch req.GetJobType() {
+	case indexpb.JobType_JobTypeIndexJob:
+		infos := make(map[UniqueID]*indexTaskInfo)
+		i.foreachIndexTaskInfo(func(ClusterID string, buildID UniqueID, info *indexTaskInfo) {
+			if ClusterID == req.GetClusterID() {
+				infos[buildID] = &indexTaskInfo{
+					state:                     info.state,
+					fileKeys:                  common.CloneStringList(info.fileKeys),
+					serializedSize:            info.serializedSize,
+					memSize:                   info.memSize,
+					failReason:                info.failReason,
+					currentIndexVersion:       info.currentIndexVersion,
+					indexStoreVersion:         info.indexStoreVersion,
+					currentScalarIndexVersion: info.currentScalarIndexVersion,
+				}
+			}
+		})
+		results := make([]*workerpb.IndexTaskInfo, 0, len(req.GetTaskIDs()))
+		for i, buildID := range req.GetTaskIDs() {
+			results = append(results, &workerpb.IndexTaskInfo{
+				BuildID:        buildID,
+				State:          commonpb.IndexState_IndexStateNone,
+				IndexFileKeys:  nil,
+				SerializedSize: 0,
+			})
+			if info, ok := infos[buildID]; ok {
+				results[i].State = info.state
+				results[i].IndexFileKeys = info.fileKeys
+				results[i].SerializedSize = info.serializedSize
+				results[i].MemSize = info.memSize
+				results[i].FailReason = info.failReason
+				results[i].CurrentIndexVersion = info.currentIndexVersion
+				results[i].IndexStoreVersion = info.indexStoreVersion
+				results[i].CurrentScalarIndexVersion = info.currentScalarIndexVersion
+			}
+		}
+		log.Debug("query index jobs result success", zap.Any("results", results))
+		return &workerpb.QueryJobsV2Response{
+			Status:    merr.Success(),
+			ClusterID: req.GetClusterID(),
+			Result: &workerpb.QueryJobsV2Response_IndexJobResults{
+				IndexJobResults: &workerpb.IndexJobResults{
+					Results: results,
+				},
+			},
+		}, nil
+	case indexpb.JobType_JobTypeAnalyzeJob:
+		results := make([]*workerpb.AnalyzeResult, 0, len(req.GetTaskIDs()))
+		for _, taskID := range req.GetTaskIDs() {
+			info := i.getAnalyzeTaskInfo(req.GetClusterID(), taskID)
+			if info != nil {
+				results = append(results, &workerpb.AnalyzeResult{
+					TaskID:        taskID,
+					State:         info.state,
+					FailReason:    info.failReason,
+					CentroidsFile: info.centroidsFile,
+				})
+			}
+		}
+		log.Debug("query analyze jobs result success", zap.Any("results", results))
+		return &workerpb.QueryJobsV2Response{
+			Status:    merr.Success(),
+			ClusterID: req.GetClusterID(),
+			Result: &workerpb.QueryJobsV2Response_AnalyzeJobResults{
+				AnalyzeJobResults: &workerpb.AnalyzeResults{
+					Results: results,
+				},
+			},
+		}, nil
+	case indexpb.JobType_JobTypeStatsJob:
+		results := make([]*workerpb.StatsResult, 0, len(req.GetTaskIDs()))
+		for _, taskID := range req.GetTaskIDs() {
+			info := i.getStatsTaskInfo(req.GetClusterID(), taskID)
+			if info != nil {
+				results = append(results, &workerpb.StatsResult{
+					TaskID:        taskID,
+					State:         info.state,
+					FailReason:    info.failReason,
+					CollectionID:  info.collID,
+					PartitionID:   info.partID,
+					SegmentID:     info.segID,
+					Channel:       info.insertChannel,
+					InsertLogs:    info.insertLogs,
+					StatsLogs:     info.statsLogs,
+					TextStatsLogs: info.textStatsLogs,
+					Bm25Logs:      info.bm25Logs,
+					NumRows:       info.numRows,
+				})
+			}
+		}
+		log.Debug("query stats job result success", zap.Any("results", results))
+		return &workerpb.QueryJobsV2Response{
+			Status:    merr.Success(),
+			ClusterID: req.GetClusterID(),
+			Result: &workerpb.QueryJobsV2Response_StatsJobResults{
+				StatsJobResults: &workerpb.StatsResults{
+					Results: results,
+				},
+			},
+		}, nil
+	default:
+		log.Warn("IndexNode receive querying unknown type jobs")
+		return &workerpb.QueryJobsV2Response{
+			Status: merr.Status(fmt.Errorf("IndexNode receive querying unknown type jobs")),
+		}, nil
+	}
+}
+
+func (i *IndexNode) DropJobsV2(ctx context.Context, req *workerpb.DropJobsV2Request) (*commonpb.Status, error) {
+	log := log.Ctx(ctx).With(zap.String("clusterID", req.GetClusterID()),
+		zap.Int64s("taskIDs", req.GetTaskIDs()),
+		zap.String("jobType", req.GetJobType().String()),
+	)
+
+	if err := i.lifetime.Add(merr.IsHealthyOrStopping); err != nil {
+		log.Warn("IndexNode not ready", zap.Error(err))
+		return merr.Status(err), nil
+	}
+	defer i.lifetime.Done()
+
+	log.Info("IndexNode receive DropJobs request")
+
+	switch req.GetJobType() {
+	case indexpb.JobType_JobTypeIndexJob:
+		keys := make([]taskKey, 0, len(req.GetTaskIDs()))
+		for _, buildID := range req.GetTaskIDs() {
+			keys = append(keys, taskKey{ClusterID: req.GetClusterID(), TaskID: buildID})
+		}
+		infos := i.deleteIndexTaskInfos(ctx, keys)
+		for _, info := range infos {
+			if info.cancel != nil {
+				info.cancel()
+			}
+		}
+		log.Info("drop index build jobs success")
+		return merr.Success(), nil
+	case indexpb.JobType_JobTypeAnalyzeJob:
+		keys := make([]taskKey, 0, len(req.GetTaskIDs()))
+		for _, taskID := range req.GetTaskIDs() {
+			keys = append(keys, taskKey{ClusterID: req.GetClusterID(), TaskID: taskID})
+		}
+		infos := i.deleteAnalyzeTaskInfos(ctx, keys)
+		for _, info := range infos {
+			if info.cancel != nil {
+				info.cancel()
+			}
+		}
+		log.Info("drop analyze jobs success")
+		return merr.Success(), nil
+	case indexpb.JobType_JobTypeStatsJob:
+		keys := make([]taskKey, 0, len(req.GetTaskIDs()))
+		for _, taskID := range req.GetTaskIDs() {
+			keys = append(keys, taskKey{ClusterID: req.GetClusterID(), TaskID: taskID})
+		}
+		infos := i.deleteStatsTaskInfos(ctx, keys)
+		for _, info := range infos {
+			if info.cancel != nil {
+				info.cancel()
+			}
+		}
+		log.Info("drop stats jobs success")
+		return merr.Success(), nil
+	default:
+		log.Warn("IndexNode receive dropping unknown type jobs")
+		return merr.Status(fmt.Errorf("IndexNode receive dropping unknown type jobs")), nil
+	}
 }

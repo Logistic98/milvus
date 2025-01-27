@@ -18,34 +18,54 @@ package accesslog
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"time"
 
 	"github.com/cockroachdb/errors"
-
-	"github.com/golang/protobuf/proto"
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"go.opentelemetry.io/otel/trace"
+	"github.com/gin-gonic/gin"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/peer"
-	"google.golang.org/grpc/status"
+
+	"github.com/milvus-io/milvus/internal/proxy/accesslog/info"
 )
 
-type BaseResponse interface {
-	GetStatus() *commonpb.Status
-}
+type AccessKey struct{}
 
-func UnaryAccessLoggerInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-	starttime := time.Now()
-	resp, err := handler(ctx, req)
-	PrintAccessInfo(ctx, resp, err, info, time.Since(starttime).Milliseconds())
+const ContextLogKey = "accesslog"
+
+func UnaryAccessLogInterceptor(ctx context.Context, req any, rpcInfo *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	accessInfo := info.NewGrpcAccessInfo(ctx, rpcInfo, req)
+	newCtx := context.WithValue(ctx, AccessKey{}, accessInfo)
+	resp, err := handler(newCtx, req)
+	accessInfo.SetResult(resp, err)
+	_globalL.Write(accessInfo)
 	return resp, err
 }
 
-func Join(path1, path2 string) string {
+func UnaryUpdateAccessInfoInterceptor(ctx context.Context, req any, rpcInfonfo *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	accessInfo := ctx.Value(AccessKey{}).(*info.GrpcAccessInfo)
+	accessInfo.UpdateCtx(ctx)
+	return handler(ctx, req)
+}
+
+func AccessLogMiddleware(ctx *gin.Context) {
+	accessInfo := info.NewRestfulInfo()
+	ctx.Set(ContextLogKey, accessInfo)
+	ctx.Next()
+	accessInfo.InitReq()
+	_globalL.Write(accessInfo)
+}
+
+func SetHTTPParams(p *gin.LogFormatterParams) {
+	value, ok := p.Keys[ContextLogKey]
+	if !ok {
+		return
+	}
+
+	info := value.(*info.RestfulInfo)
+	info.SetParams(p)
+}
+
+func join(path1, path2 string) string {
 	if strings.HasSuffix(path1, "/") {
 		return path1 + path2
 	}
@@ -60,50 +80,5 @@ func timeFromName(filename, prefix, ext string) (time.Time, error) {
 		return time.Time{}, errors.New("mismatched extension")
 	}
 	ts := filename[len(prefix) : len(filename)-len(ext)]
-	return time.Parse(timeFormat, ts)
-}
-
-func getAccessAddr(ctx context.Context) string {
-	ip, ok := peer.FromContext(ctx)
-	if !ok {
-		return "Unknown"
-	}
-	return fmt.Sprintf("%s-%s", ip.Addr.Network(), ip.Addr.String())
-}
-
-func getTraceID(ctx context.Context) (id string, ok bool) {
-	meta, ok := metadata.FromOutgoingContext(ctx)
-	if ok {
-		return meta.Get(clientRequestIDKey)[0], true
-	}
-
-	traceID := trace.SpanFromContext(ctx).SpanContext().TraceID()
-	return traceID.String(), traceID.IsValid()
-}
-
-func getResponseSize(resq interface{}) (int, bool) {
-	message, ok := resq.(proto.Message)
-	if !ok {
-		return 0, false
-	}
-
-	return proto.Size(message), true
-}
-
-func getErrCode(resp interface{}) (int, bool) {
-	baseResp, ok := resp.(BaseResponse)
-	if !ok {
-		return 0, false
-	}
-
-	status := baseResp.GetStatus()
-	return int(status.GetErrorCode()), true
-}
-
-func getGrpcStatus(err error) string {
-	code := status.Code(err)
-	if code != codes.OK {
-		return fmt.Sprintf("Grpc%s", code.String())
-	}
-	return code.String()
+	return time.Parse(timeNameFormat, ts)
 }

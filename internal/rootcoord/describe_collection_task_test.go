@@ -20,11 +20,14 @@ import (
 	"context"
 	"testing"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-	"github.com/milvus-io/milvus/internal/metastore/model"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus/internal/metastore/model"
+	mockrootcoord "github.com/milvus-io/milvus/internal/rootcoord/mocks"
+	"github.com/milvus-io/milvus/pkg/util/funcutil"
 )
 
 func Test_describeCollectionTask_Prepare(t *testing.T) {
@@ -57,10 +60,7 @@ func Test_describeCollectionTask_Execute(t *testing.T) {
 	t.Run("failed to get collection by name", func(t *testing.T) {
 		core := newTestCore(withInvalidMeta())
 		task := &describeCollectionTask{
-			baseTask: baseTask{
-				core: core,
-				done: make(chan error, 1),
-			},
+			baseTask: newBaseTask(context.Background(), core),
 			Req: &milvuspb.DescribeCollectionRequest{
 				Base: &commonpb.MsgBase{
 					MsgType: commonpb.MsgType_DescribeCollection,
@@ -76,10 +76,7 @@ func Test_describeCollectionTask_Execute(t *testing.T) {
 	t.Run("failed to get collection by id", func(t *testing.T) {
 		core := newTestCore(withInvalidMeta())
 		task := &describeCollectionTask{
-			baseTask: baseTask{
-				core: core,
-				done: make(chan error, 1),
-			},
+			baseTask: newBaseTask(context.Background(), core),
 			Req: &milvuspb.DescribeCollectionRequest{
 				Base: &commonpb.MsgBase{
 					MsgType: commonpb.MsgType_DescribeCollection,
@@ -93,24 +90,31 @@ func Test_describeCollectionTask_Execute(t *testing.T) {
 	})
 
 	t.Run("success", func(t *testing.T) {
-		meta := newMockMetaTable()
-		meta.GetCollectionByIDFunc = func(ctx context.Context, collectionID UniqueID, ts Timestamp, allowUnavailable bool) (*model.Collection, error) {
-			return &model.Collection{
-				CollectionID: 1,
-				Name:         "test coll",
-			}, nil
-		}
 		alias1, alias2 := funcutil.GenRandomStr(), funcutil.GenRandomStr()
-		meta.ListAliasesByIDFunc = func(collID UniqueID) []string {
-			return []string{alias1, alias2}
-		}
+		meta := mockrootcoord.NewIMetaTable(t)
+		meta.On("GetCollectionByID",
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+		).Return(&model.Collection{
+			CollectionID: 1,
+			Name:         "test coll",
+			DBID:         1,
+		}, nil)
+		meta.On("ListAliasesByID",
+			mock.Anything,
+			mock.Anything,
+		).Return([]string{alias1, alias2})
+		meta.EXPECT().GetDatabaseByID(mock.Anything, mock.Anything, mock.Anything).Return(&model.Database{
+			ID:   1,
+			Name: "test db",
+		}, nil)
 
 		core := newTestCore(withMeta(meta))
 		task := &describeCollectionTask{
-			baseTask: baseTask{
-				core: core,
-				done: make(chan error, 1),
-			},
+			baseTask: newBaseTask(context.Background(), core),
 			Req: &milvuspb.DescribeCollectionRequest{
 				Base: &commonpb.MsgBase{
 					MsgType: commonpb.MsgType_DescribeCollection,
@@ -122,6 +126,7 @@ func Test_describeCollectionTask_Execute(t *testing.T) {
 		err := task.Execute(context.Background())
 		assert.NoError(t, err)
 		assert.Equal(t, task.Rsp.GetStatus().GetErrorCode(), commonpb.ErrorCode_Success)
+		assert.Equal(t, "test db", task.Rsp.GetDbName())
 		assert.ElementsMatch(t, []string{alias1, alias2}, task.Rsp.GetAliases())
 	})
 }

@@ -22,8 +22,9 @@ import (
 	"math"
 	"reflect"
 
-	"github.com/golang/protobuf/proto"
+	"github.com/x448/float16"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus/pkg/common"
 	"github.com/milvus-io/milvus/pkg/log"
@@ -114,4 +115,93 @@ func SliceRemoveDuplicate(a interface{}) (ret []interface{}) {
 	}
 
 	return ret
+}
+
+func Float32ToFloat16Bytes(f float32) []byte {
+	ret := make([]byte, 2)
+	common.Endian.PutUint16(ret[:], float16.Fromfloat32(f).Bits())
+	return ret
+}
+
+func Float16BytesToFloat32(b []byte) float32 {
+	return float16.Frombits(common.Endian.Uint16(b)).Float32()
+}
+
+func Float16BytesToFloat32Vector(b []byte) []float32 {
+	dim := len(b) / 2
+	vec := make([]float32, 0, dim)
+	for j := 0; j < dim; j++ {
+		vec = append(vec, Float16BytesToFloat32(b[j*2:]))
+	}
+	return vec
+}
+
+func Float32ToBFloat16Bytes(f float32) []byte {
+	ret := make([]byte, 2)
+	common.Endian.PutUint16(ret[:], uint16(math.Float32bits(f)>>16))
+	return ret
+}
+
+func BFloat16BytesToFloat32(b []byte) float32 {
+	return math.Float32frombits(uint32(common.Endian.Uint16(b)) << 16)
+}
+
+func BFloat16BytesToFloat32Vector(b []byte) []float32 {
+	dim := len(b) / 2
+	vec := make([]float32, 0, dim)
+	for j := 0; j < dim; j++ {
+		vec = append(vec, BFloat16BytesToFloat32(b[j*2:]))
+	}
+	return vec
+}
+
+func SparseFloatBytesToMap(b []byte) map[uint32]float32 {
+	elemCount := len(b) / 8
+	values := make(map[uint32]float32)
+	for j := 0; j < elemCount; j++ {
+		idx := common.Endian.Uint32(b[j*8:])
+		f := BytesToFloat32(b[j*8+4:])
+		values[idx] = f
+	}
+	return values
+}
+
+// Float32ArrayToBytes serialize vector into byte slice, used in search placeholder
+// LittleEndian is used for convention
+func Float32ArrayToBytes(fv []float32) []byte {
+	data := make([]byte, 0, 4*len(fv)) // float32 occupies 4 bytes
+	buf := make([]byte, 4)
+	for _, f := range fv {
+		binary.LittleEndian.PutUint32(buf, math.Float32bits(f))
+		data = append(data, buf...)
+	}
+	return data
+}
+
+// Float32ArrayToFloat16Bytes converts float32 vector `fv` to float16 vector
+func Float32ArrayToFloat16Bytes(fv []float32) []byte {
+	data := make([]byte, 0, 2*len(fv)) // float16 occupies 2 bytes
+	for _, f := range fv {
+		data = append(data, Float32ToFloat16Bytes(f)...)
+	}
+	return data
+}
+
+// Float32ArrayToBFloat16Bytes converts float32 vector `fv` to bfloat16 vector
+func Float32ArrayToBFloat16Bytes(fv []float32) []byte {
+	data := make([]byte, 0, 2*len(fv)) // bfloat16 occupies 2 bytes
+	for _, f := range fv {
+		data = append(data, Float32ToBFloat16Bytes(f)...)
+	}
+	return data
+}
+
+// Int8ArrayToBytes serialize vector into byte slice, used in search placeholder
+// LittleEndian is used for convention
+func Int8ArrayToBytes(iv []int8) []byte {
+	data := make([]byte, 0, len(iv))
+	for _, i := range iv {
+		data = append(data, byte(i))
+	}
+	return data
 }

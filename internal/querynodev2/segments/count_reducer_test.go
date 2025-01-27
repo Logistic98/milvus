@@ -6,11 +6,10 @@ import (
 
 	"github.com/stretchr/testify/suite"
 
-	"github.com/milvus-io/milvus/internal/proto/segcorepb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/util/funcutil"
-
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/proto/segcorepb"
 )
 
 type InternalCntReducerSuite struct {
@@ -77,7 +76,7 @@ func (suite *SegCoreCntReducerSuite) TestInvalid() {
 		},
 	}
 
-	_, err := suite.r.Reduce(context.TODO(), results)
+	_, err := suite.r.Reduce(context.TODO(), results, nil, nil)
 	suite.Error(err)
 }
 
@@ -89,7 +88,7 @@ func (suite *SegCoreCntReducerSuite) TestNormalCase() {
 		funcutil.WrapCntToSegCoreResult(4),
 	}
 
-	res, err := suite.r.Reduce(context.TODO(), results)
+	res, err := suite.r.Reduce(context.TODO(), results, nil, nil)
 	suite.NoError(err)
 
 	total, err := funcutil.CntOfSegCoreResult(res)

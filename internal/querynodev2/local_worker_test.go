@@ -18,16 +18,21 @@ package querynodev2
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/suite"
 	clientv3 "go.etcd.io/etcd/client/v3"
 
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/mocks/util/mock_segcore"
 	"github.com/milvus-io/milvus/internal/querynodev2/segments"
 	"github.com/milvus-io/milvus/internal/util/dependency"
+	"github.com/milvus-io/milvus/pkg/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/proto/segcorepb"
 	"github.com/milvus-io/milvus/pkg/util/etcd"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
@@ -42,6 +47,7 @@ type LocalWorkerTestSuite struct {
 	partitionIDs   []int64
 	segmentIDs     []int64
 	schema         *schemapb.CollectionSchema
+	indexMeta      *segcorepb.CollectionIndexMeta
 
 	// dependency
 	node       *QueryNode
@@ -66,11 +72,11 @@ func (suite *LocalWorkerTestSuite) BeforeTest(suiteName, testName string) {
 	paramtable.Init()
 	suite.params = paramtable.Get()
 	// close GC at test to avoid data race
-	suite.params.Save(suite.params.QueryNodeCfg.GCEnabled.Key, "false")
+	suite.params.Save(suite.params.CommonCfg.GCEnabled.Key, "false")
 
 	suite.ctx, suite.cancel = context.WithCancel(context.Background())
 	// init node
-	factory := dependency.NewDefaultFactory(true)
+	factory := dependency.MockDefaultFactory(true, paramtable.Get())
 	suite.node = NewQueryNode(suite.ctx, factory)
 	//	init etcd
 	suite.etcdClient, err = etcd.GetEtcdClient(
@@ -88,13 +94,17 @@ func (suite *LocalWorkerTestSuite) BeforeTest(suiteName, testName string) {
 	err = suite.node.Start()
 	suite.NoError(err)
 
-	suite.schema = segments.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64)
-	collection := segments.NewCollection(suite.collectionID, suite.schema, querypb.LoadType_LoadCollection)
+	suite.schema = mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, true)
+	suite.indexMeta = mock_segcore.GenTestIndexMeta(suite.collectionID, suite.schema)
+	collection, err := segments.NewCollection(suite.collectionID, suite.schema, suite.indexMeta, &querypb.LoadMetaInfo{
+		LoadType: querypb.LoadType_LoadCollection,
+	})
+	suite.NoError(err)
 	loadMata := &querypb.LoadMetaInfo{
 		LoadType:     querypb.LoadType_LoadCollection,
 		CollectionID: suite.collectionID,
 	}
-	suite.node.manager.Collection.Put(suite.collectionID, collection.Schema(), loadMata)
+	suite.node.manager.Collection.PutOrRef(suite.collectionID, collection.Schema(), suite.indexMeta, loadMata)
 	suite.worker = NewLocalWorker(suite.node)
 }
 
@@ -106,15 +116,22 @@ func (suite *LocalWorkerTestSuite) AfterTest(suiteName, testName string) {
 
 func (suite *LocalWorkerTestSuite) TestLoadSegment() {
 	// load empty
+	schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, true)
 	req := &querypb.LoadSegmentsRequest{
+		Base: &commonpb.MsgBase{
+			TargetID: suite.node.session.GetServerID(),
+		},
 		CollectionID: suite.collectionID,
 		Infos: lo.Map(suite.segmentIDs, func(segID int64, _ int) *querypb.SegmentLoadInfo {
 			return &querypb.SegmentLoadInfo{
-				CollectionID: suite.collectionID,
-				PartitionID:  suite.partitionIDs[segID%2],
-				SegmentID:    segID,
+				CollectionID:  suite.collectionID,
+				PartitionID:   suite.partitionIDs[segID%2],
+				SegmentID:     segID,
+				InsertChannel: fmt.Sprintf("by-dev-rootcoord-dml_0_%dv0", suite.collectionID),
 			}
 		}),
+		Schema:        schema,
+		IndexInfoList: []*indexpb.IndexInfo{{}},
 	}
 	err := suite.worker.LoadSegments(suite.ctx, req)
 	suite.NoError(err)
@@ -122,6 +139,9 @@ func (suite *LocalWorkerTestSuite) TestLoadSegment() {
 
 func (suite *LocalWorkerTestSuite) TestReleaseSegment() {
 	req := &querypb.ReleaseSegmentsRequest{
+		Base: &commonpb.MsgBase{
+			TargetID: suite.node.session.GetServerID(),
+		},
 		CollectionID: suite.collectionID,
 		SegmentIDs:   suite.segmentIDs,
 	}

@@ -18,42 +18,48 @@ package grpcquerycoord
 
 import (
 	"context"
-	"net"
-	"strconv"
 	"sync"
 	"time"
 
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
-	"github.com/milvus-io/milvus/internal/util/componentutil"
-	"github.com/milvus-io/milvus/internal/util/dependency"
-	"github.com/milvus-io/milvus/pkg/tracer"
+	"github.com/tikv/client-go/v2/txnkv"
 	clientv3 "go.etcd.io/etcd/client/v3"
-	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-	dcc "github.com/milvus-io/milvus/internal/distributed/datacoord/client"
-	rcc "github.com/milvus-io/milvus/internal/distributed/rootcoord/client"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus/internal/coordinator/coordclient"
+	"github.com/milvus-io/milvus/internal/distributed/utils"
 	qc "github.com/milvus-io/milvus/internal/querycoordv2"
 	"github.com/milvus-io/milvus/internal/types"
+	"github.com/milvus-io/milvus/internal/util/dependency"
+	_ "github.com/milvus-io/milvus/internal/util/grpcclient"
 	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/tracer"
+	"github.com/milvus-io/milvus/pkg/util"
 	"github.com/milvus-io/milvus/pkg/util/etcd"
 	"github.com/milvus-io/milvus/pkg/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/util/interceptor"
 	"github.com/milvus-io/milvus/pkg/util/logutil"
+	"github.com/milvus-io/milvus/pkg/util/netutil"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/util/tikv"
 )
 
 // Server is the grpc server of QueryCoord.
 type Server struct {
-	wg         sync.WaitGroup
+	grpcWG     sync.WaitGroup
 	loopCtx    context.Context
 	loopCancel context.CancelFunc
 	grpcServer *grpc.Server
+	listener   *netutil.NetListener
+
+	serverID atomic.Int64
 
 	grpcErrChan chan error
 
@@ -62,9 +68,10 @@ type Server struct {
 	factory dependency.Factory
 
 	etcdCli *clientv3.Client
+	tikvCli *txnkv.Client
 
-	dataCoord types.DataCoord
-	rootCoord types.RootCoord
+	dataCoord types.DataCoordClient
+	rootCoord types.RootCoordClient
 }
 
 // NewServer create a new QueryCoord grpc server.
@@ -85,28 +92,47 @@ func NewServer(ctx context.Context, factory dependency.Factory) (*Server, error)
 	}, nil
 }
 
+func (s *Server) Prepare() error {
+	listener, err := netutil.NewListener(
+		netutil.OptIP(paramtable.Get().QueryCoordGrpcServerCfg.IP),
+		netutil.OptPort(paramtable.Get().QueryCoordGrpcServerCfg.Port.GetAsInt()),
+	)
+	if err != nil {
+		log.Ctx(s.loopCtx).Warn("QueryCoord fail to create net listener", zap.Error(err))
+		return err
+	}
+	log.Ctx(s.loopCtx).Info("QueryCoord listen on", zap.String("address", listener.Addr().String()), zap.Int("port", listener.Port()))
+	s.listener = listener
+	return nil
+}
+
 // Run initializes and starts QueryCoord's grpc service.
 func (s *Server) Run() error {
-
 	if err := s.init(); err != nil {
 		return err
 	}
-	log.Debug("QueryCoord init done ...")
+	log.Ctx(s.loopCtx).Info("QueryCoord init done ...")
 
 	if err := s.start(); err != nil {
 		return err
 	}
-	log.Debug("QueryCoord start done ...")
+	log.Ctx(s.loopCtx).Info("QueryCoord start done ...")
 	return nil
 }
 
+var getTiKVClient = tikv.GetTiKVClient
+
 // init initializes QueryCoord's grpc service.
 func (s *Server) init() error {
-	etcdConfig := &paramtable.Get().EtcdCfg
-	Params := &paramtable.Get().QueryCoordGrpcServerCfg
+	log := log.Ctx(s.loopCtx)
+	params := paramtable.Get()
+	etcdConfig := &params.EtcdCfg
 
-	etcdCli, err := etcd.GetEtcdClient(
+	etcdCli, err := etcd.CreateEtcdClient(
 		etcdConfig.UseEmbedEtcd.GetAsBool(),
+		etcdConfig.EtcdEnableAuth.GetAsBool(),
+		etcdConfig.EtcdAuthUserName.GetValue(),
+		etcdConfig.EtcdAuthPassword.GetValue(),
 		etcdConfig.EtcdUseSSL.GetAsBool(),
 		etcdConfig.Endpoints.GetAsStrings(),
 		etcdConfig.EtcdTLSCert.GetValue(),
@@ -114,15 +140,26 @@ func (s *Server) init() error {
 		etcdConfig.EtcdTLSCACert.GetValue(),
 		etcdConfig.EtcdTLSMinVersion.GetValue())
 	if err != nil {
-		log.Debug("QueryCoord connect to etcd failed", zap.Error(err))
+		log.Warn("QueryCoord connect to etcd failed", zap.Error(err))
 		return err
 	}
 	s.etcdCli = etcdCli
 	s.SetEtcdClient(etcdCli)
-	s.queryCoord.SetAddress(Params.GetAddress())
+	s.queryCoord.SetAddress(s.listener.Address())
 
-	s.wg.Add(1)
-	go s.startGrpcLoop(Params.Port.GetAsInt())
+	if params.MetaStoreCfg.MetaStoreType.GetValue() == util.MetaStoreTypeTiKV {
+		log.Info("Connecting to tikv metadata storage.")
+		s.tikvCli, err = getTiKVClient(&paramtable.Get().TiKVCfg)
+		if err != nil {
+			log.Warn("QueryCoord failed to connect to tikv", zap.Error(err))
+			return err
+		}
+		s.SetTiKVClient(s.tikvCli)
+		log.Info("Connected to tikv. Using tikv as metadata storage.")
+	}
+
+	s.grpcWG.Add(1)
+	go s.startGrpcLoop()
 	// wait for grpc server loop start
 	err = <-s.grpcErrChan
 	if err != nil {
@@ -131,62 +168,22 @@ func (s *Server) init() error {
 
 	// --- Master Server Client ---
 	if s.rootCoord == nil {
-		s.rootCoord, err = rcc.NewClient(s.loopCtx, qc.Params.EtcdCfg.MetaRootPath.GetValue(), s.etcdCli)
-		if err != nil {
-			log.Error("QueryCoord try to new RootCoord client failed", zap.Error(err))
-			panic(err)
-		}
+		s.rootCoord = coordclient.GetRootCoordClient(s.loopCtx)
 	}
 
-	if err = s.rootCoord.Init(); err != nil {
-		log.Error("QueryCoord RootCoordClient Init failed", zap.Error(err))
-		panic(err)
-	}
-
-	if err = s.rootCoord.Start(); err != nil {
-		log.Error("QueryCoord RootCoordClient Start failed", zap.Error(err))
-		panic(err)
-	}
 	// wait for master init or healthy
-	log.Debug("QueryCoord try to wait for RootCoord ready")
-	err = componentutil.WaitForComponentHealthy(s.loopCtx, s.rootCoord, "RootCoord", 1000000, time.Millisecond*200)
-	if err != nil {
-		log.Error("QueryCoord wait for RootCoord ready failed", zap.Error(err))
-		panic(err)
-	}
-
 	if err := s.SetRootCoord(s.rootCoord); err != nil {
 		panic(err)
 	}
-	log.Debug("QueryCoord report RootCoord ready")
 
 	// --- Data service client ---
 	if s.dataCoord == nil {
-		s.dataCoord, err = dcc.NewClient(s.loopCtx, qc.Params.EtcdCfg.MetaRootPath.GetValue(), s.etcdCli)
-		if err != nil {
-			log.Error("QueryCoord try to new DataCoord client failed", zap.Error(err))
-			panic(err)
-		}
+		s.dataCoord = coordclient.GetDataCoordClient(s.loopCtx)
 	}
 
-	if err = s.dataCoord.Init(); err != nil {
-		log.Error("QueryCoord DataCoordClient Init failed", zap.Error(err))
-		panic(err)
-	}
-	if err = s.dataCoord.Start(); err != nil {
-		log.Error("QueryCoord DataCoordClient Start failed", zap.Error(err))
-		panic(err)
-	}
-	log.Debug("QueryCoord try to wait for DataCoord ready")
-	err = componentutil.WaitForComponentHealthy(s.loopCtx, s.dataCoord, "DataCoord", 1000000, time.Millisecond*200)
-	if err != nil {
-		log.Error("QueryCoord wait for DataCoord ready failed", zap.Error(err))
-		panic(err)
-	}
 	if err := s.SetDataCoord(s.dataCoord); err != nil {
 		panic(err)
 	}
-	log.Debug("QueryCoord report DataCoord ready")
 
 	if err := s.queryCoord.Init(); err != nil {
 		return err
@@ -194,45 +191,56 @@ func (s *Server) init() error {
 	return nil
 }
 
-func (s *Server) startGrpcLoop(grpcPort int) {
-	defer s.wg.Done()
+func (s *Server) startGrpcLoop() {
+	defer s.grpcWG.Done()
 	Params := &paramtable.Get().QueryCoordGrpcServerCfg
-	var kaep = keepalive.EnforcementPolicy{
+	kaep := keepalive.EnforcementPolicy{
 		MinTime:             5 * time.Second, // If a client pings more than once every 5 seconds, terminate the connection
 		PermitWithoutStream: true,            // Allow pings even when there are no active streams
 	}
 
-	var kasp = keepalive.ServerParameters{
+	kasp := keepalive.ServerParameters{
 		Time:    60 * time.Second, // Ping the client if it is idle for 60 seconds to ensure the connection is still active
 		Timeout: 10 * time.Second, // Wait 10 second for the ping ack before assuming the connection is dead
 	}
-	log.Debug("network", zap.String("port", strconv.Itoa(grpcPort)))
-	lis, err := net.Listen("tcp", ":"+strconv.Itoa(grpcPort))
-	if err != nil {
-		log.Debug("GrpcServer:failed to listen:", zap.String("error", err.Error()))
-		s.grpcErrChan <- err
-		return
-	}
-
 	ctx, cancel := context.WithCancel(s.loopCtx)
 	defer cancel()
 
-	opts := tracer.GetInterceptorOpts()
-	s.grpcServer = grpc.NewServer(
+	grpcOpts := []grpc.ServerOption{
 		grpc.KeepaliveEnforcementPolicy(kaep),
 		grpc.KeepaliveParams(kasp),
 		grpc.MaxRecvMsgSize(Params.ServerMaxRecvSize.GetAsInt()),
 		grpc.MaxSendMsgSize(Params.ServerMaxSendSize.GetAsInt()),
 		grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
-			otelgrpc.UnaryServerInterceptor(opts...),
-			logutil.UnaryTraceLoggerInterceptor)),
+			logutil.UnaryTraceLoggerInterceptor,
+			interceptor.ClusterValidationUnaryServerInterceptor(),
+			interceptor.ServerIDValidationUnaryServerInterceptor(func() int64 {
+				if s.serverID.Load() == 0 {
+					s.serverID.Store(paramtable.GetNodeID())
+				}
+				return s.serverID.Load()
+			}),
+		)),
 		grpc.StreamInterceptor(grpc_middleware.ChainStreamServer(
-			otelgrpc.StreamServerInterceptor(opts...),
-			logutil.StreamTraceLoggerInterceptor)))
+			logutil.StreamTraceLoggerInterceptor,
+			interceptor.ClusterValidationStreamServerInterceptor(),
+			interceptor.ServerIDValidationStreamServerInterceptor(func() int64 {
+				if s.serverID.Load() == 0 {
+					s.serverID.Store(paramtable.GetNodeID())
+				}
+				return s.serverID.Load()
+			}),
+		)),
+		grpc.StatsHandler(tracer.GetDynamicOtelGrpcServerStatsHandler()),
+	}
+
+	grpcOpts = append(grpcOpts, utils.EnableInternalTLS("QueryCoord"))
+	s.grpcServer = grpc.NewServer(grpcOpts...)
 	querypb.RegisterQueryCoordServer(s.grpcServer, s)
+	coordclient.RegisterQueryCoordServer(s)
 
 	go funcutil.CheckGrpcReady(ctx, s.grpcErrChan)
-	if err := s.grpcServer.Serve(lis); err != nil {
+	if err := s.grpcServer.Serve(s.listener); err != nil {
 		s.grpcErrChan <- err
 	}
 }
@@ -246,20 +254,41 @@ func (s *Server) start() error {
 	return s.queryCoord.Start()
 }
 
+func (s *Server) GetQueryCoord() types.QueryCoordComponent {
+	return s.queryCoord
+}
+
 // Stop stops QueryCoord's grpc service.
-func (s *Server) Stop() error {
-	Params := &paramtable.Get().QueryCoordGrpcServerCfg
-	log.Debug("QueryCoord stop", zap.String("Address", Params.GetAddress()))
+func (s *Server) Stop() (err error) {
+	logger := log.Ctx(s.loopCtx)
+	if s.listener != nil {
+		logger = log.With(zap.String("address", s.listener.Address()))
+	}
+	logger.Info("QueryCoord stopping")
+	defer func() {
+		logger.Info("QueryCoord stopped", zap.Error(err))
+	}()
+
 	if s.etcdCli != nil {
 		defer s.etcdCli.Close()
 	}
-	err := s.queryCoord.Stop()
-	s.loopCancel()
+
 	if s.grpcServer != nil {
-		log.Debug("Graceful stop grpc server...")
-		s.grpcServer.GracefulStop()
+		utils.GracefulStopGRPCServer(s.grpcServer)
 	}
-	return err
+	s.grpcWG.Wait()
+
+	logger.Info("internal server[queryCoord] start to stop")
+	if err := s.queryCoord.Stop(); err != nil {
+		log.Error("failed to close queryCoord", zap.Error(err))
+	}
+	s.loopCancel()
+
+	// release port resource
+	if s.listener != nil {
+		s.listener.Close()
+	}
+	return nil
 }
 
 // SetRootCoord sets root coordinator's client
@@ -267,31 +296,35 @@ func (s *Server) SetEtcdClient(etcdClient *clientv3.Client) {
 	s.queryCoord.SetEtcdClient(etcdClient)
 }
 
+func (s *Server) SetTiKVClient(client *txnkv.Client) {
+	s.queryCoord.SetTiKVClient(client)
+}
+
 // SetRootCoord sets the RootCoord's client for QueryCoord component.
-func (s *Server) SetRootCoord(m types.RootCoord) error {
-	s.queryCoord.SetRootCoord(m)
+func (s *Server) SetRootCoord(m types.RootCoordClient) error {
+	s.queryCoord.SetRootCoordClient(m)
 	return nil
 }
 
 // SetDataCoord sets the DataCoord's client for QueryCoord component.
-func (s *Server) SetDataCoord(d types.DataCoord) error {
-	s.queryCoord.SetDataCoord(d)
+func (s *Server) SetDataCoord(d types.DataCoordClient) error {
+	s.queryCoord.SetDataCoordClient(d)
 	return nil
 }
 
 // GetComponentStates gets the component states of QueryCoord.
 func (s *Server) GetComponentStates(ctx context.Context, req *milvuspb.GetComponentStatesRequest) (*milvuspb.ComponentStates, error) {
-	return s.queryCoord.GetComponentStates(ctx)
+	return s.queryCoord.GetComponentStates(ctx, req)
 }
 
 // GetTimeTickChannel gets the time tick channel of QueryCoord.
 func (s *Server) GetTimeTickChannel(ctx context.Context, req *internalpb.GetTimeTickChannelRequest) (*milvuspb.StringResponse, error) {
-	return s.queryCoord.GetTimeTickChannel(ctx)
+	return s.queryCoord.GetTimeTickChannel(ctx, req)
 }
 
 // GetStatisticsChannel gets the statistics channel of QueryCoord.
 func (s *Server) GetStatisticsChannel(ctx context.Context, req *internalpb.GetStatisticsChannelRequest) (*milvuspb.StringResponse, error) {
-	return s.queryCoord.GetStatisticsChannel(ctx)
+	return s.queryCoord.GetStatisticsChannel(ctx, req)
 }
 
 // ShowCollections shows the collections in the QueryCoord.
@@ -372,6 +405,10 @@ func (s *Server) CreateResourceGroup(ctx context.Context, req *milvuspb.CreateRe
 	return s.queryCoord.CreateResourceGroup(ctx, req)
 }
 
+func (s *Server) UpdateResourceGroups(ctx context.Context, req *querypb.UpdateResourceGroupsRequest) (*commonpb.Status, error) {
+	return s.queryCoord.UpdateResourceGroups(ctx, req)
+}
+
 func (s *Server) DropResourceGroup(ctx context.Context, req *milvuspb.DropResourceGroupRequest) (*commonpb.Status, error) {
 	return s.queryCoord.DropResourceGroup(ctx, req)
 }
@@ -390,4 +427,56 @@ func (s *Server) ListResourceGroups(ctx context.Context, req *milvuspb.ListResou
 
 func (s *Server) DescribeResourceGroup(ctx context.Context, req *querypb.DescribeResourceGroupRequest) (*querypb.DescribeResourceGroupResponse, error) {
 	return s.queryCoord.DescribeResourceGroup(ctx, req)
+}
+
+func (s *Server) ActivateChecker(ctx context.Context, req *querypb.ActivateCheckerRequest) (*commonpb.Status, error) {
+	return s.queryCoord.ActivateChecker(ctx, req)
+}
+
+func (s *Server) DeactivateChecker(ctx context.Context, req *querypb.DeactivateCheckerRequest) (*commonpb.Status, error) {
+	return s.queryCoord.DeactivateChecker(ctx, req)
+}
+
+func (s *Server) ListCheckers(ctx context.Context, req *querypb.ListCheckersRequest) (*querypb.ListCheckersResponse, error) {
+	return s.queryCoord.ListCheckers(ctx, req)
+}
+
+func (s *Server) ListQueryNode(ctx context.Context, req *querypb.ListQueryNodeRequest) (*querypb.ListQueryNodeResponse, error) {
+	return s.queryCoord.ListQueryNode(ctx, req)
+}
+
+func (s *Server) GetQueryNodeDistribution(ctx context.Context, req *querypb.GetQueryNodeDistributionRequest) (*querypb.GetQueryNodeDistributionResponse, error) {
+	return s.queryCoord.GetQueryNodeDistribution(ctx, req)
+}
+
+func (s *Server) SuspendBalance(ctx context.Context, req *querypb.SuspendBalanceRequest) (*commonpb.Status, error) {
+	return s.queryCoord.SuspendBalance(ctx, req)
+}
+
+func (s *Server) ResumeBalance(ctx context.Context, req *querypb.ResumeBalanceRequest) (*commonpb.Status, error) {
+	return s.queryCoord.ResumeBalance(ctx, req)
+}
+
+func (s *Server) SuspendNode(ctx context.Context, req *querypb.SuspendNodeRequest) (*commonpb.Status, error) {
+	return s.queryCoord.SuspendNode(ctx, req)
+}
+
+func (s *Server) ResumeNode(ctx context.Context, req *querypb.ResumeNodeRequest) (*commonpb.Status, error) {
+	return s.queryCoord.ResumeNode(ctx, req)
+}
+
+func (s *Server) TransferSegment(ctx context.Context, req *querypb.TransferSegmentRequest) (*commonpb.Status, error) {
+	return s.queryCoord.TransferSegment(ctx, req)
+}
+
+func (s *Server) TransferChannel(ctx context.Context, req *querypb.TransferChannelRequest) (*commonpb.Status, error) {
+	return s.queryCoord.TransferChannel(ctx, req)
+}
+
+func (s *Server) CheckQueryNodeDistribution(ctx context.Context, req *querypb.CheckQueryNodeDistributionRequest) (*commonpb.Status, error) {
+	return s.queryCoord.CheckQueryNodeDistribution(ctx, req)
+}
+
+func (s *Server) UpdateLoadConfig(ctx context.Context, req *querypb.UpdateLoadConfigRequest) (*commonpb.Status, error) {
+	return s.queryCoord.UpdateLoadConfig(ctx, req)
 }

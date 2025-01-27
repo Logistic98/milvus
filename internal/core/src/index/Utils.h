@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <unordered_map>
 #include <vector>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,8 +26,12 @@
 #include <tuple>
 #include <map>
 #include <string>
+#include <boost/algorithm/string.hpp>
 
 #include "common/Types.h"
+#include "common/FieldData.h"
+#include "common/QueryInfo.h"
+#include "common/RangeSearchHelper.h"
 #include "index/IndexInfo.h"
 #include "storage/Types.h"
 
@@ -44,21 +49,11 @@ BIN_List();
 std::vector<std::tuple<IndexType, MetricType>>
 unsupported_index_combinations();
 
-template <typename T>
-inline bool
-is_in_list(const T& t, std::function<std::vector<T>()> list_func) {
-    auto l = list_func();
-    return std::find(l.begin(), l.end(), t) != l.end();
-}
-
 bool
 is_in_bin_list(const IndexType& index_type);
 
 bool
 is_in_nm_list(const IndexType& index_type);
-
-bool
-is_in_disk_list(const IndexType& index_type);
 
 bool
 is_unsupported(const IndexType& index_type, const MetricType& metric_type);
@@ -88,7 +83,22 @@ template <typename T>
 inline std::optional<T>
 GetValueFromConfig(const Config& cfg, const std::string& key) {
     if (cfg.contains(key)) {
-        return cfg.at(key).get<T>();
+        try {
+            // compatibility for boolean string
+            if constexpr (std::is_same_v<T, bool>) {
+                if (cfg.at(key).is_boolean()) {
+                    return cfg.at(key).get<bool>();
+                }
+                return boost::algorithm::to_lower_copy(
+                           cfg.at(key).get<std::string>()) == "true";
+            }
+            return cfg.at(key).get<T>();
+        } catch (std::exception& e) {
+            PanicInfo(ErrorCode::UnexpectedError,
+                      "get value from config for key {} failed, error: {}",
+                      key,
+                      e.what());
+        }
     }
     return std::nullopt;
 }
@@ -97,6 +107,22 @@ template <typename T>
 inline void
 SetValueToConfig(Config& cfg, const std::string& key, const T value) {
     cfg[key] = value;
+}
+
+template <typename T>
+inline void
+CheckMetricTypeSupport(const MetricType& metric_type) {
+    if constexpr (std::is_same_v<T, bin1>) {
+        AssertInfo(
+            IsBinaryVectorMetricType(metric_type),
+            "binary vector does not support metric type: " + metric_type);
+    } else if constexpr (std::is_same_v<T, int8>) {
+        AssertInfo(IsIntVectorMetricType(metric_type),
+                   "int vector does not support metric type: " + metric_type);
+    } else {
+        AssertInfo(IsFloatVectorMetricType(metric_type),
+                   "float vector does not support metric type: " + metric_type);
+    }
 }
 
 int64_t
@@ -108,6 +134,12 @@ GetMetricTypeFromConfig(const Config& config);
 std::string
 GetIndexTypeFromConfig(const Config& config);
 
+IndexVersion
+GetIndexEngineVersionFromConfig(const Config& config);
+
+int32_t
+GetBitmapCardinalityLimitFromConfig(const Config& config);
+
 storage::FieldDataMeta
 GetFieldDataMetaFromConfig(const Config& config);
 
@@ -117,5 +149,22 @@ GetIndexMetaFromConfig(const Config& config);
 Config
 ParseConfigFromIndexParams(
     const std::map<std::string, std::string>& index_params);
+
+void
+AssembleIndexDatas(std::map<std::string, FieldDataPtr>& index_datas);
+
+void
+AssembleIndexDatas(std::map<std::string, FieldDataChannelPtr>& index_datas,
+                   std::unordered_map<std::string, FieldDataPtr>& result);
+
+// On Linux, read() (and similar system calls) will transfer at most 0x7ffff000 (2,147,479,552) bytes once
+void
+ReadDataFromFD(int fd, void* buf, size_t size, size_t chunk_size = 0x7ffff000);
+
+bool
+CheckAndUpdateKnowhereRangeSearchParam(const SearchInfo& search_info,
+                                       const int64_t topk,
+                                       const MetricType& metric_type,
+                                       knowhere::Json& search_config);
 
 }  // namespace milvus::index

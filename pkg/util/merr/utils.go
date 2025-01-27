@@ -22,16 +22,15 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/errors"
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
+	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/util/paramtable"
 )
 
-var (
-	// For compatibility
-	oldErrCodes = map[int32]commonpb.ErrorCode{
-		ErrServiceNotReady.code():    commonpb.ErrorCode_NotReadyServe,
-		ErrCollectionNotFound.code(): commonpb.ErrorCode_CollectionNotExists,
-	}
-)
+const InputErrorFlagKey string = "is_input_error"
 
 // Code returns the error code of the given error,
 // WARN: DO NOT use this for now
@@ -41,14 +40,14 @@ func Code(err error) int32 {
 	}
 
 	cause := errors.Cause(err)
-	switch cause := cause.(type) {
+	switch specificErr := cause.(type) {
 	case milvusError:
-		return cause.code()
+		return specificErr.code()
 
 	default:
-		if errors.Is(cause, context.Canceled) {
+		if errors.Is(specificErr, context.Canceled) {
 			return CanceledCode
-		} else if errors.Is(cause, context.DeadlineExceeded) {
+		} else if errors.Is(specificErr, context.DeadlineExceeded) {
 			return TimeoutCode
 		} else {
 			return errUnexpected.code()
@@ -56,8 +55,16 @@ func Code(err error) int32 {
 	}
 }
 
-func IsRetriable(err error) bool {
-	return Code(err)&retriableFlag != 0
+func IsRetryableErr(err error) bool {
+	if err, ok := err.(milvusError); ok {
+		return err.retriable
+	}
+
+	return false
+}
+
+func IsCanceledOrTimeout(err error) bool {
+	return errors.IsAny(err, context.Canceled, context.DeadlineExceeded)
 }
 
 // Status returns a status according to the given err,
@@ -68,11 +75,68 @@ func Status(err error) *commonpb.Status {
 	}
 
 	code := Code(err)
-	return &commonpb.Status{
+
+	status := &commonpb.Status{
 		Code:   code,
-		Reason: err.Error(),
+		Reason: previousLastError(err).Error(),
 		// Deprecated, for compatibility
 		ErrorCode: oldCode(code),
+		Retriable: IsRetryableErr(err),
+		Detail:    err.Error(),
+	}
+
+	if GetErrorType(err) == InputError {
+		status.ExtraInfo = map[string]string{InputErrorFlagKey: "true"}
+	}
+	return status
+}
+
+func previousLastError(err error) error {
+	lastErr := err
+	for {
+		nextErr := errors.Unwrap(err)
+		if nextErr == nil {
+			break
+		}
+		lastErr = err
+		err = nextErr
+	}
+	return lastErr
+}
+
+func CheckRPCCall(resp any, err error) error {
+	if err != nil {
+		return err
+	}
+	if resp == nil {
+		return errUnexpected
+	}
+	switch resp := resp.(type) {
+	case interface{ GetStatus() *commonpb.Status }:
+		return Error(resp.GetStatus())
+	case *commonpb.Status:
+		return Error(resp)
+	}
+	return nil
+}
+
+func Success(reason ...string) *commonpb.Status {
+	status := Status(nil)
+	// NOLINT
+	status.Reason = strings.Join(reason, " ")
+	return status
+}
+
+// Deprecated
+func StatusWithErrorCode(err error, code commonpb.ErrorCode) *commonpb.Status {
+	if err == nil {
+		return &commonpb.Status{}
+	}
+
+	return &commonpb.Status{
+		Code:      Code(err),
+		Reason:    err.Error(),
+		ErrorCode: code,
 	}
 }
 
@@ -80,17 +144,96 @@ func oldCode(code int32) commonpb.ErrorCode {
 	switch code {
 	case ErrServiceNotReady.code():
 		return commonpb.ErrorCode_NotReadyServe
+
 	case ErrCollectionNotFound.code():
 		return commonpb.ErrorCode_CollectionNotExists
+
+	case ErrParameterInvalid.code():
+		return commonpb.ErrorCode_IllegalArgument
+
 	case ErrNodeNotMatch.code():
 		return commonpb.ErrorCode_NodeIDNotMatch
+
+	case ErrCollectionNotFound.code(), ErrPartitionNotFound.code(), ErrReplicaNotFound.code():
+		return commonpb.ErrorCode_MetaFailed
+
+	case ErrReplicaNotAvailable.code(), ErrChannelNotAvailable.code(), ErrNodeNotAvailable.code():
+		return commonpb.ErrorCode_NoReplicaAvailable
+
+	case ErrServiceMemoryLimitExceeded.code():
+		return commonpb.ErrorCode_InsufficientMemoryToLoad
+
+	case ErrServiceDiskLimitExceeded.code():
+		return commonpb.ErrorCode_DiskQuotaExhausted
+
+	case ErrServiceTimeTickLongDelay.code():
+		return commonpb.ErrorCode_TimeTickLongDelay
+
+	case ErrServiceRateLimit.code():
+		return commonpb.ErrorCode_RateLimit
+
+	case ErrServiceQuotaExceeded.code():
+		return commonpb.ErrorCode_ForceDeny
+
+	case ErrIndexNotFound.code():
+		return commonpb.ErrorCode_IndexNotExist
+
+	case ErrSegmentNotFound.code():
+		return commonpb.ErrorCode_SegmentNotFound
+
+	case ErrChannelLack.code():
+		return commonpb.ErrorCode_MetaFailed
+
 	default:
 		return commonpb.ErrorCode_UnexpectedError
 	}
 }
 
+func OldCodeToMerr(code commonpb.ErrorCode) error {
+	switch code {
+	case commonpb.ErrorCode_NotReadyServe:
+		return ErrServiceNotReady
+
+	case commonpb.ErrorCode_CollectionNotExists:
+		return ErrCollectionNotFound
+
+	case commonpb.ErrorCode_IllegalArgument:
+		return ErrParameterInvalid
+
+	case commonpb.ErrorCode_NodeIDNotMatch:
+		return ErrNodeNotMatch
+
+	case commonpb.ErrorCode_InsufficientMemoryToLoad, commonpb.ErrorCode_MemoryQuotaExhausted:
+		return ErrServiceMemoryLimitExceeded
+
+	case commonpb.ErrorCode_DiskQuotaExhausted:
+		return ErrServiceDiskLimitExceeded
+
+	case commonpb.ErrorCode_TimeTickLongDelay:
+		return ErrServiceTimeTickLongDelay
+
+	case commonpb.ErrorCode_RateLimit:
+		return ErrServiceRateLimit
+
+	case commonpb.ErrorCode_ForceDeny:
+		return ErrServiceQuotaExceeded
+
+	case commonpb.ErrorCode_IndexNotExist:
+		return ErrIndexNotFound
+
+	case commonpb.ErrorCode_SegmentNotFound:
+		return ErrSegmentNotFound
+
+	case commonpb.ErrorCode_MetaFailed:
+		return ErrChannelNotFound
+
+	default:
+		return errUnexpected
+	}
+}
+
 func Ok(status *commonpb.Status) bool {
-	return status.ErrorCode == commonpb.ErrorCode_Success && status.Code == 0
+	return status.GetErrorCode() == commonpb.ErrorCode_Success && status.GetCode() == 0
 }
 
 // Error returns a error according to the given status,
@@ -100,13 +243,23 @@ func Error(status *commonpb.Status) error {
 		return nil
 	}
 
+	var eType ErrorType
+	_, ok := status.GetExtraInfo()[InputErrorFlagKey]
+	if ok {
+		eType = InputError
+	}
+
 	// use code first
 	code := status.GetCode()
 	if code == 0 {
-		return newMilvusError(fmt.Sprintf("legacy error code:%d, reason: %s", status.GetErrorCode(), status.GetReason()), errUnexpected.errCode, false)
+		return newMilvusError(status.GetReason(), Code(OldCodeToMerr(status.GetErrorCode())), false, WithDetail(status.GetDetail()), WithErrorType(eType))
 	}
+	return newMilvusError(status.GetReason(), code, status.GetRetriable(), WithDetail(status.GetDetail()), WithErrorType(eType))
+}
 
-	return newMilvusError(status.GetReason(), code, code&retriableFlag != 0)
+// SegcoreError returns a merr according to the given segcore error code and message
+func SegcoreError(code int32, msg string) error {
+	return newMilvusError(msg, code, false)
 }
 
 // CheckHealthy checks whether the state is healthy,
@@ -114,272 +267,973 @@ func Error(status *commonpb.Status) error {
 // otherwise returns ErrServiceNotReady wrapped with current state
 func CheckHealthy(state commonpb.StateCode) error {
 	if state != commonpb.StateCode_Healthy {
-		return WrapErrServiceNotReady(state.String())
+		return WrapErrServiceNotReady(paramtable.GetRole(), paramtable.GetNodeID(), state.String())
 	}
 
 	return nil
 }
 
+func IsHealthy(stateCode commonpb.StateCode) error {
+	if stateCode == commonpb.StateCode_Healthy {
+		return nil
+	}
+	return CheckHealthy(stateCode)
+}
+
+func IsHealthyOrStopping(stateCode commonpb.StateCode) error {
+	if stateCode == commonpb.StateCode_Healthy || stateCode == commonpb.StateCode_Stopping {
+		return nil
+	}
+	return CheckHealthy(stateCode)
+}
+
+func AnalyzeState(role string, nodeID int64, state *milvuspb.ComponentStates) error {
+	if err := Error(state.GetStatus()); err != nil {
+		return errors.Wrapf(err, "%s=%d not healthy", role, nodeID)
+	} else if state := state.GetState().GetStateCode(); state != commonpb.StateCode_Healthy {
+		return WrapErrServiceNotReady(role, nodeID, state.String())
+	}
+
+	return nil
+}
+
+func WrapErrAsInputError(err error) error {
+	if merr, ok := err.(milvusError); ok {
+		WithErrorType(InputError)(&merr)
+		return merr
+	}
+	return err
+}
+
+func WrapErrAsInputErrorWhen(err error, targets ...milvusError) error {
+	if merr, ok := err.(milvusError); ok {
+		for _, target := range targets {
+			if target.errCode == merr.errCode {
+				log.Info("mark error as input error", zap.Error(err))
+				WithErrorType(InputError)(&merr)
+				return merr
+			}
+		}
+	}
+	return err
+}
+
+func WrapErrCollectionReplicateMode(operation string) error {
+	return wrapFields(ErrCollectionReplicateMode, value("operation", operation))
+}
+
+func GetErrorType(err error) ErrorType {
+	if merr, ok := err.(milvusError); ok {
+		return merr.errType
+	}
+
+	return SystemError
+}
+
 // Service related
-func WrapErrServiceNotReady(stage string, msg ...string) error {
-	err := errors.Wrapf(ErrServiceNotReady, "stage=%s", stage)
+func WrapErrServiceNotReady(role string, sessionID int64, state string, msg ...string) error {
+	err := wrapFieldsWithDesc(ErrServiceNotReady,
+		state,
+		value(role, sessionID),
+	)
 	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "; "))
+		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
 	return err
 }
 
 func WrapErrServiceUnavailable(reason string, msg ...string) error {
-	err := errors.Wrap(ErrServiceUnavailable, reason)
+	err := wrapFieldsWithDesc(ErrServiceUnavailable, reason)
 	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "; "))
+		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
 	return err
 }
 
 func WrapErrServiceMemoryLimitExceeded(predict, limit float32, msg ...string) error {
-	err := errors.Wrapf(ErrServiceMemoryLimitExceeded, "predict=%v, limit=%v", predict, limit)
+	toMB := func(mem float32) float32 {
+		return mem / 1024 / 1024
+	}
+	err := wrapFields(ErrServiceMemoryLimitExceeded,
+		value("predict(MB)", toMB(predict)),
+		value("limit(MB)", toMB(limit)),
+	)
 	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "; "))
+		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
 	return err
 }
 
 func WrapErrServiceRequestLimitExceeded(limit int32, msg ...string) error {
-	err := errors.Wrapf(ErrServiceRequestLimitExceeded, "limit=%v", limit)
+	err := wrapFields(ErrServiceRequestLimitExceeded,
+		value("limit", limit),
+	)
 	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "; "))
+		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
 	return err
 }
 
-func WrapErrServiceInternal(msg string, others ...string) error {
-	msg = strings.Join(append([]string{msg}, others...), "; ")
-	err := errors.Wrap(ErrServiceInternal, msg)
+func WrapErrServiceInternal(reason string, msg ...string) error {
+	err := wrapFieldsWithDesc(ErrServiceInternal, reason)
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
 
+func WrapErrServiceCrossClusterRouting(expectedCluster, actualCluster string, msg ...string) error {
+	err := wrapFields(ErrServiceCrossClusterRouting,
+		value("expectedCluster", expectedCluster),
+		value("actualCluster", actualCluster),
+	)
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrServiceDiskLimitExceeded(predict, limit float32, msg ...string) error {
+	toMB := func(mem float32) float32 {
+		return mem / 1024 / 1024
+	}
+	err := wrapFields(ErrServiceDiskLimitExceeded,
+		value("predict(MB)", toMB(predict)),
+		value("limit(MB)", toMB(limit)),
+	)
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrServiceRateLimit(rate float64, msg ...string) error {
+	err := wrapFields(ErrServiceRateLimit, value("rate", rate))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrServiceQuotaExceeded(reason string, msg ...string) error {
+	err := wrapFields(ErrServiceQuotaExceeded, value("reason", reason))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrServiceUnimplemented(grpcErr error) error {
+	return wrapFieldsWithDesc(ErrServiceUnimplemented, grpcErr.Error())
+}
+
+// database related
+func WrapErrDatabaseNotFound(database any, msg ...string) error {
+	err := wrapFields(ErrDatabaseNotFound, value("database", database))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrDatabaseNumLimitExceeded(limit int, msg ...string) error {
+	err := wrapFields(ErrDatabaseNumLimitExceeded, value("limit", limit))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrDatabaseNameInvalid(database any, msg ...string) error {
+	err := wrapFields(ErrDatabaseInvalidName, value("database", database))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrPrivilegeGroupNameInvalid(privilegeGroup any, msg ...string) error {
+	err := wrapFields(ErrPrivilegeGroupInvalidName, value("privilegeGroup", privilegeGroup))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
 	return err
 }
 
 // Collection related
 func WrapErrCollectionNotFound(collection any, msg ...string) error {
-	err := wrapWithField(ErrCollectionNotFound, "collection", collection)
+	err := wrapFields(ErrCollectionNotFound, value("collection", collection))
 	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "; "))
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrCollectionNotFoundWithDB(db any, collection any, msg ...string) error {
+	err := wrapFields(ErrCollectionNotFound,
+		value("database", db),
+		value("collection", collection),
+	)
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
 	return err
 }
 
 func WrapErrCollectionNotLoaded(collection any, msg ...string) error {
-	err := wrapWithField(ErrCollectionNotLoaded, "collection", collection)
+	err := wrapFields(ErrCollectionNotLoaded, value("collection", collection))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrCollectionNumLimitExceeded(db string, limit int, msg ...string) error {
+	err := wrapFields(ErrCollectionNumLimitExceeded, value("dbName", db), value("limit", limit))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrCollectionIDOfAliasNotFound(collectionID int64, msg ...string) error {
+	err := wrapFields(ErrCollectionIDOfAliasNotFound, value("collectionID", collectionID))
 	if len(msg) > 0 {
 		err = errors.Wrap(err, strings.Join(msg, "; "))
 	}
 	return err
 }
 
-func WrapErrCollectionResourceLimitExceeded(msg ...string) error {
-	var err error = ErrCollectionNumLimitExceeded
+func WrapErrCollectionNotFullyLoaded(collection any, msg ...string) error {
+	err := wrapFields(ErrCollectionNotFullyLoaded, value("collection", collection))
 	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "; "))
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrCollectionLoaded(collection string, msgAndArgs ...any) error {
+	err := wrapFields(ErrCollectionLoaded, value("collection", collection))
+	if len(msgAndArgs) > 0 {
+		msg := msgAndArgs[0].(string)
+		err = errors.Wrapf(err, msg, msgAndArgs[1:]...)
+	}
+	return err
+}
+
+func WrapErrCollectionIllegalSchema(collection string, msgAndArgs ...any) error {
+	err := wrapFields(ErrCollectionIllegalSchema, value("collection", collection))
+	if len(msgAndArgs) > 0 {
+		msg := msgAndArgs[0].(string)
+		err = errors.Wrapf(err, msg, msgAndArgs[1:]...)
+	}
+	return err
+}
+
+// WrapErrCollectionOnRecovering wraps ErrCollectionOnRecovering with collection
+func WrapErrCollectionOnRecovering(collection any, msgAndArgs ...any) error {
+	err := wrapFields(ErrCollectionOnRecovering, value("collection", collection))
+	if len(msgAndArgs) > 0 {
+		msg := msgAndArgs[0].(string)
+		err = errors.Wrapf(err, msg, msgAndArgs[1:]...)
+	}
+	return err
+}
+
+// WrapErrCollectionVectorClusteringKeyNotAllowed wraps ErrCollectionVectorClusteringKeyNotAllowed with collection
+func WrapErrCollectionVectorClusteringKeyNotAllowed(collection any, msgAndArgs ...any) error {
+	err := wrapFields(ErrCollectionVectorClusteringKeyNotAllowed, value("collection", collection))
+	if len(msgAndArgs) > 0 {
+		msg := msgAndArgs[0].(string)
+		err = errors.Wrapf(err, msg, msgAndArgs[1:]...)
+	}
+	return err
+}
+
+func WrapErrAliasNotFound(db any, alias any, msg ...string) error {
+	err := wrapFields(ErrAliasNotFound,
+		value("database", db),
+		value("alias", alias),
+	)
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrAliasCollectionNameConflict(db any, alias any, msg ...string) error {
+	err := wrapFields(ErrAliasCollectionNameConfilct,
+		value("database", db),
+		value("alias", alias),
+	)
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrAliasAlreadyExist(db any, alias any, msg ...string) error {
+	err := wrapFields(ErrAliasAlreadyExist,
+		value("database", db),
+		value("alias", alias),
+	)
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
 	return err
 }
 
 // Partition related
 func WrapErrPartitionNotFound(partition any, msg ...string) error {
-	err := wrapWithField(ErrPartitionNotFound, "partition", partition)
+	err := wrapFields(ErrPartitionNotFound, value("partition", partition))
 	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "; "))
+		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
 	return err
 }
 
 func WrapErrPartitionNotLoaded(partition any, msg ...string) error {
-	err := wrapWithField(ErrPartitionNotLoaded, "partition", partition)
+	err := wrapFields(ErrPartitionNotLoaded, value("partition", partition))
 	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "; "))
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrPartitionNotFullyLoaded(partition any, msg ...string) error {
+	err := wrapFields(ErrPartitionNotFullyLoaded, value("partition", partition))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapGeneralCapacityExceed(newGeneralSize any, generalCapacity any, msg ...string) error {
+	err := wrapFields(ErrGeneralCapacityExceeded, value("newGeneralSize", newGeneralSize),
+		value("generalCapacity", generalCapacity))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
 	return err
 }
 
 // ResourceGroup related
 func WrapErrResourceGroupNotFound(rg any, msg ...string) error {
-	err := wrapWithField(ErrResourceGroupNotFound, "rg", rg)
+	err := wrapFields(ErrResourceGroupNotFound, value("rg", rg))
 	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "; "))
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+// WrapErrResourceGroupAlreadyExist wraps ErrResourceGroupNotFound with resource group
+func WrapErrResourceGroupAlreadyExist(rg any, msg ...string) error {
+	err := wrapFields(ErrResourceGroupAlreadyExist, value("rg", rg))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+// WrapErrResourceGroupReachLimit wraps ErrResourceGroupReachLimit with resource group and limit
+func WrapErrResourceGroupReachLimit(rg any, limit any, msg ...string) error {
+	err := wrapFields(ErrResourceGroupReachLimit, value("rg", rg), value("limit", limit))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+// WrapErrResourceGroupIllegalConfig wraps ErrResourceGroupIllegalConfig with resource group
+func WrapErrResourceGroupIllegalConfig(rg any, cfg any, msg ...string) error {
+	err := wrapFields(ErrResourceGroupIllegalConfig, value("rg", rg), value("config", cfg))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+// WrapErrStreamingNodeNotEnough make a streaming node is not enough error
+func WrapErrStreamingNodeNotEnough(current int, expected int, msg ...string) error {
+	err := wrapFields(ErrServiceResourceInsufficient, value("currentStreamingNode", current), value("expectedStreamingNode", expected))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+// go:deprecated
+// WrapErrResourceGroupNodeNotEnough wraps ErrResourceGroupNodeNotEnough with resource group
+func WrapErrResourceGroupNodeNotEnough(rg any, current any, expected any, msg ...string) error {
+	err := wrapFields(ErrResourceGroupNodeNotEnough, value("rg", rg), value("currentNodeNum", current), value("expectedNodeNum", expected))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+// WrapErrResourceGroupServiceAvailable wraps ErrResourceGroupServiceAvailable with resource group
+func WrapErrResourceGroupServiceAvailable(msg ...string) error {
+	err := wrapFields(ErrResourceGroupServiceAvailable)
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
 	return err
 }
 
 // Replica related
 func WrapErrReplicaNotFound(id int64, msg ...string) error {
-	err := wrapWithField(ErrReplicaNotFound, "replica", id)
+	err := wrapFields(ErrReplicaNotFound, value("replica", id))
 	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "; "))
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrReplicaNotAvailable(id int64, msg ...string) error {
+	err := wrapFields(ErrReplicaNotAvailable, value("replica", id))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
 	return err
 }
 
 // Channel related
-func WrapErrChannelNotFound(name string, msg ...string) error {
-	err := wrapWithField(ErrChannelNotFound, "channel", name)
+
+func warpChannelErr(mErr milvusError, name string, msg ...string) error {
+	err := wrapFields(mErr, value("channel", name))
 	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "; "))
+		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
 	return err
+}
+
+func WrapErrChannelNotFound(name string, msg ...string) error {
+	return warpChannelErr(ErrChannelNotFound, name, msg...)
+}
+
+func WrapErrChannelCPExceededMaxLag(name string, msg ...string) error {
+	return warpChannelErr(ErrChannelCPExceededMaxLag, name, msg...)
 }
 
 func WrapErrChannelLack(name string, msg ...string) error {
-	err := wrapWithField(ErrChannelLack, "channel", name)
-	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "; "))
-	}
-	return err
+	return warpChannelErr(ErrChannelLack, name, msg...)
 }
 
 func WrapErrChannelReduplicate(name string, msg ...string) error {
-	err := wrapWithField(ErrChannelReduplicate, "channel", name)
-	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "; "))
-	}
-	return err
+	return warpChannelErr(ErrChannelReduplicate, name, msg...)
+}
+
+func WrapErrChannelNotAvailable(name string, msg ...string) error {
+	return warpChannelErr(ErrChannelNotAvailable, name, msg...)
 }
 
 // Segment related
 func WrapErrSegmentNotFound(id int64, msg ...string) error {
-	err := wrapWithField(ErrSegmentNotFound, "segment", id)
+	err := wrapFields(ErrSegmentNotFound, value("segment", id))
 	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "; "))
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrSegmentsNotFound(ids []int64, msg ...string) error {
+	err := wrapFields(ErrSegmentNotFound, value("segments", ids))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrSegmentLoadFailed(id int64, msg ...string) error {
+	err := wrapFields(ErrSegmentLoadFailed, value("segment", id))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
 	return err
 }
 
 func WrapErrSegmentNotLoaded(id int64, msg ...string) error {
-	err := wrapWithField(ErrSegmentNotLoaded, "segment", id)
+	err := wrapFields(ErrSegmentNotLoaded, value("segment", id))
 	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "; "))
+		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
 	return err
 }
 
 func WrapErrSegmentLack(id int64, msg ...string) error {
-	err := wrapWithField(ErrSegmentLack, "segment", id)
+	err := wrapFields(ErrSegmentLack, value("segment", id))
 	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "; "))
+		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
 	return err
 }
 
 func WrapErrSegmentReduplicate(id int64, msg ...string) error {
-	err := wrapWithField(ErrSegmentReduplicate, "segment", id)
+	err := wrapFields(ErrSegmentReduplicate, value("segment", id))
 	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "; "))
+		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
 	return err
 }
 
 // Index related
-func WrapErrIndexNotFound(msg ...string) error {
-	err := error(ErrIndexNotFound)
+func WrapErrIndexNotFound(indexName string, msg ...string) error {
+	err := wrapFields(ErrIndexNotFound, value("indexName", indexName))
 	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "; "))
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrIndexNotFoundForSegments(segmentIDs []int64, msg ...string) error {
+	err := wrapFields(ErrIndexNotFound, value("segmentIDs", segmentIDs))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrIndexNotFoundForCollection(collection string, msg ...string) error {
+	err := wrapFields(ErrIndexNotFound, value("collection", collection))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrIndexNotSupported(indexType string, msg ...string) error {
+	err := wrapFields(ErrIndexNotSupported, value("indexType", indexType))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrIndexDuplicate(indexName string, msg ...string) error {
+	err := wrapFields(ErrIndexDuplicate, value("indexName", indexName))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrTaskDuplicate(taskType string, msg ...string) error {
+	err := wrapFields(ErrTaskDuplicate, value("taskType", taskType))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
 	return err
 }
 
 // Node related
 func WrapErrNodeNotFound(id int64, msg ...string) error {
-	err := wrapWithField(ErrNodeNotFound, "node", id)
+	err := wrapFields(ErrNodeNotFound, value("node", id))
 	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "; "))
+		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
 	return err
 }
 
 func WrapErrNodeOffline(id int64, msg ...string) error {
-	err := wrapWithField(ErrNodeOffline, "node", id)
+	err := wrapFields(ErrNodeOffline, value("node", id))
 	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "; "))
+		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
 	return err
 }
 
 func WrapErrNodeLack(expectedNum, actualNum int64, msg ...string) error {
-	err := errors.Wrapf(ErrNodeLack, "expectedNum=%d, actualNum=%d", expectedNum, actualNum)
+	err := wrapFields(ErrNodeLack,
+		value("expectedNum", expectedNum),
+		value("actualNum", actualNum),
+	)
 	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "; "))
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrNodeLackAny(msg ...string) error {
+	err := error(ErrNodeLack)
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrNodeNotAvailable(id int64, msg ...string) error {
+	err := wrapFields(ErrNodeNotAvailable, value("node", id))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrNodeStateUnexpected(id int64, state string, msg ...string) error {
+	err := wrapFields(ErrNodeStateUnexpected, value("node", id), value("state", state))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
 	return err
 }
 
 func WrapErrNodeNotMatch(expectedNodeID, actualNodeID int64, msg ...string) error {
-	err := errors.Wrapf(ErrNodeNotMatch, "expectedNodeID=%d, actualNodeID=%d", expectedNodeID, actualNodeID)
+	err := wrapFields(ErrNodeNotMatch,
+		value("expectedNodeID", expectedNodeID),
+		value("actualNodeID", actualNodeID),
+	)
 	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "; "))
+		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
 	return err
 }
 
 // IO related
 func WrapErrIoKeyNotFound(key string, msg ...string) error {
-	err := errors.Wrapf(ErrIoKeyNotFound, "key=%s", key)
+	err := wrapFields(ErrIoKeyNotFound, value("key", key))
 	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "; "))
+		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
 	return err
 }
 
-func WrapErrIoFailed(key string, msg ...string) error {
-	err := errors.Wrapf(ErrIoFailed, "key=%s", key)
+func WrapErrIoFailed(key string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return wrapFieldsWithDesc(ErrIoFailed, err.Error(), value("key", key))
+}
+
+func WrapErrIoFailedReason(reason string, msg ...string) error {
+	err := wrapFieldsWithDesc(ErrIoFailed, reason)
 	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "; "))
+		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
 	return err
+}
+
+func WrapErrIoUnexpectEOF(key string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return wrapFieldsWithDesc(ErrIoUnexpectEOF, err.Error(), value("key", key))
 }
 
 // Parameter related
 func WrapErrParameterInvalid[T any](expected, actual T, msg ...string) error {
-	err := errors.Wrapf(ErrParameterInvalid, "expected=%v, actual=%v", expected, actual)
+	err := wrapFields(ErrParameterInvalid,
+		value("expected", expected),
+		value("actual", actual),
+	)
 	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "; "))
+		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
 	return err
 }
 
 func WrapErrParameterInvalidRange[T any](lower, upper, actual T, msg ...string) error {
-	err := errors.Wrapf(ErrParameterInvalid, "expected in (%v, %v), actual=%v", lower, upper, actual)
+	err := wrapFields(ErrParameterInvalid,
+		bound("value", actual, lower, upper),
+	)
 	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "; "))
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrParameterInvalidMsg(fmt string, args ...any) error {
+	return errors.Wrapf(ErrParameterInvalid, fmt, args...)
+}
+
+func WrapErrParameterMissing[T any](param T, msg ...string) error {
+	err := wrapFields(ErrParameterMissing,
+		value("missing_param", param),
+	)
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrParameterTooLarge(name string, msg ...string) error {
+	err := wrapFields(ErrParameterTooLarge, value("message", name))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
 	return err
 }
 
 // Metrics related
 func WrapErrMetricNotFound(name string, msg ...string) error {
-	err := errors.Wrapf(ErrMetricNotFound, "metric=%s", name)
+	err := wrapFields(ErrMetricNotFound, value("metric", name))
 	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "; "))
+		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
 	return err
 }
 
-// Topic related
-func WrapErrTopicNotFound(name string, msg ...string) error {
-	err := errors.Wrapf(ErrTopicNotFound, "topic=%s", name)
+// Message queue related
+func WrapErrMqTopicNotFound(name string, msg ...string) error {
+	err := wrapFields(ErrMqTopicNotFound, value("topic", name))
 	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "; "))
+		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
 	return err
 }
 
-func WrapErrTopicNotEmpty(name string, msg ...string) error {
-	err := errors.Wrapf(ErrTopicNotEmpty, "topic=%s", name)
+func WrapErrMqTopicNotEmpty(name string, msg ...string) error {
+	err := wrapFields(ErrMqTopicNotEmpty, value("topic", name))
 	if len(msg) > 0 {
-		err = errors.Wrap(err, strings.Join(msg, "; "))
+		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}
 	return err
 }
 
-func wrapWithField(err error, name string, value any) error {
-	return errors.Wrapf(err, "%s=%v", name, value)
+func WrapErrMqInternal(err error, msg ...string) error {
+	err = wrapFieldsWithDesc(ErrMqInternal, err.Error())
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrTooManyConsumers(vchannel string, msg ...string) error {
+	err := wrapFields(ErrTooManyConsumers, value("vchannel", vchannel))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrPrivilegeNotAuthenticated(fmt string, args ...any) error {
+	err := errors.Wrapf(ErrPrivilegeNotAuthenticated, fmt, args...)
+	return err
+}
+
+func WrapErrPrivilegeNotPermitted(fmt string, args ...any) error {
+	err := errors.Wrapf(ErrPrivilegeNotPermitted, fmt, args...)
+	return err
+}
+
+// Segcore related
+func WrapErrSegcore(code int32, msg ...string) error {
+	err := wrapFields(ErrSegcore, value("segcoreCode", code))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrSegcoreUnsupported(code int32, msg ...string) error {
+	err := wrapFields(ErrSegcoreUnsupported, value("segcoreCode", code))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+// field related
+func WrapErrFieldNotFound[T any](field T, msg ...string) error {
+	err := wrapFields(ErrFieldNotFound, value("field", field))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrFieldNameInvalid(field any, msg ...string) error {
+	err := wrapFields(ErrFieldInvalidName, value("field", field))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func wrapFields(err milvusError, fields ...errorField) error {
+	for i := range fields {
+		err.msg += fmt.Sprintf("[%s]", fields[i].String())
+	}
+	err.detail = err.msg
+	return err
+}
+
+func wrapFieldsWithDesc(err milvusError, desc string, fields ...errorField) error {
+	for i := range fields {
+		err.msg += fmt.Sprintf("[%s]", fields[i].String())
+	}
+	err.msg += ": " + desc
+	err.detail = err.msg
+	return err
+}
+
+type errorField interface {
+	String() string
+}
+
+type valueField struct {
+	name  string
+	value any
+}
+
+func value(name string, value any) valueField {
+	return valueField{
+		name,
+		value,
+	}
+}
+
+func (f valueField) String() string {
+	return fmt.Sprintf("%s=%v", f.name, f.value)
+}
+
+type boundField struct {
+	name  string
+	value any
+	lower any
+	upper any
+}
+
+func bound(name string, value, lower, upper any) boundField {
+	return boundField{
+		name,
+		value,
+		lower,
+		upper,
+	}
+}
+
+func (f boundField) String() string {
+	return fmt.Sprintf("%v out of range %v <= %s <= %v", f.value, f.lower, f.name, f.upper)
+}
+
+func WrapErrImportFailed(msg ...string) error {
+	err := error(ErrImportFailed)
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrInconsistentRequery(msg ...string) error {
+	err := error(ErrInconsistentRequery)
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrCompactionReadDeltaLogErr(msg ...string) error {
+	err := error(ErrCompactionReadDeltaLogErr)
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrIllegalCompactionPlan(msg ...string) error {
+	err := error(ErrIllegalCompactionPlan)
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrCompactionPlanConflict(msg ...string) error {
+	err := error(ErrCompactionPlanConflict)
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrCompactionResultNotFound(msg ...string) error {
+	err := error(ErrCompactionResultNotFound)
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrClusteringCompactionGetCollectionFail(collectionID int64, err error) error {
+	return wrapFieldsWithDesc(ErrClusteringCompactionGetCollectionFail, err.Error(), value("collectionID", collectionID))
+}
+
+func WrapErrClusteringCompactionClusterNotSupport(msg ...string) error {
+	err := error(ErrClusteringCompactionClusterNotSupport)
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrClusteringCompactionCollectionNotSupport(msg ...string) error {
+	err := error(ErrClusteringCompactionCollectionNotSupport)
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrClusteringCompactionNotSupportVector(msg ...string) error {
+	err := error(ErrClusteringCompactionNotSupportVector)
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrClusteringCompactionSubmitTaskFail(taskType string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return wrapFieldsWithDesc(ErrClusteringCompactionSubmitTaskFail, err.Error(), value("taskType", taskType))
+}
+
+func WrapErrClusteringCompactionMetaError(operation string, err error) error {
+	return wrapFieldsWithDesc(ErrClusteringCompactionMetaError, err.Error(), value("operation", operation))
+}
+
+func WrapErrCleanPartitionStatsFail(msg ...string) error {
+	err := error(ErrCleanPartitionStatsFail)
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrAnalyzeTaskNotFound(id int64) error {
+	return wrapFields(ErrAnalyzeTaskNotFound, value("analyzeId", id))
+}
+
+func WrapErrBuildCompactionRequestFail(err error) error {
+	return wrapFieldsWithDesc(ErrBuildCompactionRequestFail, err.Error())
+}
+
+func WrapErrGetCompactionPlanResultFail(err error) error {
+	return wrapFieldsWithDesc(ErrGetCompactionPlanResultFail, err.Error())
+}
+
+func WrapErrCompactionResult(msg ...string) error {
+	err := error(ErrCompactionResult)
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrDataNodeSlotExhausted(msg ...string) error {
+	err := error(ErrDataNodeSlotExhausted)
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrDuplicatedCompactionTask(msg ...string) error {
+	err := error(ErrDuplicatedCompactionTask)
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
 }

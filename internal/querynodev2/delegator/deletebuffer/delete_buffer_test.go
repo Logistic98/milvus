@@ -19,9 +19,10 @@ package deletebuffer
 import (
 	"testing"
 
-	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
+
+	"github.com/milvus-io/milvus/internal/storage"
 )
 
 func TestSkipListDeleteBuffer(t *testing.T) {
@@ -75,6 +76,64 @@ func (s *DoubleCacheBufferSuite) TestCache() {
 
 	s.Equal(2, len(buffer.ListAfter(11)))
 	s.Equal(1, len(buffer.ListAfter(12)))
+}
+
+func (s *DoubleCacheBufferSuite) TestPut() {
+	buffer := NewDoubleCacheDeleteBuffer[*Item](10, 1)
+	buffer.Put(&Item{
+		Ts: 11,
+		Data: []BufferItem{
+			{
+				PartitionID: 200,
+				DeleteData: storage.DeleteData{
+					Pks:      []storage.PrimaryKey{storage.NewVarCharPrimaryKey("test1")},
+					Tss:      []uint64{11},
+					RowCount: 1,
+				},
+			},
+		},
+	})
+
+	buffer.Put(&Item{
+		Ts: 12,
+		Data: []BufferItem{
+			{
+				PartitionID: 200,
+				DeleteData: storage.DeleteData{
+					Pks:      []storage.PrimaryKey{storage.NewVarCharPrimaryKey("test2")},
+					Tss:      []uint64{12},
+					RowCount: 1,
+				},
+			},
+		},
+	})
+
+	s.Equal(2, len(buffer.ListAfter(11)))
+	s.Equal(1, len(buffer.ListAfter(12)))
+	entryNum, memorySize := buffer.Size()
+	s.EqualValues(2, entryNum)
+	s.EqualValues(234, memorySize)
+
+	buffer.Put(&Item{
+		Ts: 13,
+		Data: []BufferItem{
+			{
+				PartitionID: 200,
+				DeleteData: storage.DeleteData{
+					Pks:      []storage.PrimaryKey{storage.NewVarCharPrimaryKey("test3")},
+					Tss:      []uint64{13},
+					RowCount: 1,
+				},
+			},
+		},
+	})
+
+	s.Equal(2, len(buffer.ListAfter(11)))
+	s.Equal(2, len(buffer.ListAfter(12)))
+	s.Equal(1, len(buffer.ListAfter(13)))
+	entryNum, memorySize = buffer.Size()
+	s.EqualValues(2, entryNum)
+	s.EqualValues(234, memorySize)
 }
 
 func TestDoubleCacheDeleteBuffer(t *testing.T) {

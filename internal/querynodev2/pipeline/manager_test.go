@@ -17,32 +17,32 @@
 package pipeline
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
 
-	"github.com/milvus-io/milvus-proto/go-api/msgpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/querynodev2/delegator"
 	"github.com/milvus-io/milvus/internal/querynodev2/segments"
-	"github.com/milvus-io/milvus/internal/querynodev2/tsafe"
 	"github.com/milvus-io/milvus/pkg/mq/msgdispatcher"
 	"github.com/milvus-io/milvus/pkg/mq/msgstream"
-	"github.com/milvus-io/milvus/pkg/mq/msgstream/mqwrapper"
+	"github.com/milvus-io/milvus/pkg/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
 type PipelineManagerTestSuite struct {
 	suite.Suite
-	//data
+	// data
 	collectionID int64
 	channel      string
-	//dependencies
-	tSafeManager TSafeManager
-	delegators   *typeutil.ConcurrentMap[string, delegator.ShardDelegator]
+	// dependencies
+	delegators *typeutil.ConcurrentMap[string, delegator.ShardDelegator]
 
-	//mocks
+	// mocks
 	segmentManager    *segments.MockSegmentManager
 	collectionManager *segments.MockCollectionManager
 	delegator         *delegator.MockShardDelegator
@@ -57,13 +57,10 @@ func (suite *PipelineManagerTestSuite) SetupSuite() {
 
 func (suite *PipelineManagerTestSuite) SetupTest() {
 	paramtable.Init()
-	//init dependency
-	//	init tsafeManager
-	suite.tSafeManager = tsafe.NewTSafeReplica()
-	suite.tSafeManager.Add(suite.channel, 0)
+	// init dependency
 	suite.delegators = typeutil.NewConcurrentMap[string, delegator.ShardDelegator]()
 
-	//init mock
+	// init mock
 	//	init manager
 	suite.collectionManager = segments.NewMockCollectionManager(suite.T())
 	suite.segmentManager = segments.NewMockSegmentManager(suite.T())
@@ -75,39 +72,39 @@ func (suite *PipelineManagerTestSuite) SetupTest() {
 }
 
 func (suite *PipelineManagerTestSuite) TestBasic() {
-	//init mock
+	// init mock
 	//  mock collection manager
-	suite.collectionManager.EXPECT().Get(suite.collectionID).Return(&segments.Collection{})
+	suite.collectionManager.EXPECT().Get(suite.collectionID).Return(segments.NewTestCollection(suite.collectionID, querypb.LoadType_UnKnownType, &schemapb.CollectionSchema{}))
 	//  mock mq factory
-	suite.msgDispatcher.EXPECT().Register(suite.channel, mock.Anything, mqwrapper.SubscriptionPositionUnknown).Return(suite.msgChan, nil)
+	suite.msgDispatcher.EXPECT().Register(mock.Anything, mock.Anything).Return(suite.msgChan, nil)
 	suite.msgDispatcher.EXPECT().Deregister(suite.channel)
 
-	//build manager
+	// build manager
 	manager := &segments.Manager{
 		Collection: suite.collectionManager,
 		Segment:    suite.segmentManager,
 	}
-	pipelineManager := NewManager(manager, suite.tSafeManager, suite.msgDispatcher, suite.delegators)
+	pipelineManager := NewManager(manager, suite.msgDispatcher, suite.delegators)
 	defer pipelineManager.Close()
 
-	//Add pipeline
+	// Add pipeline
 	_, err := pipelineManager.Add(suite.collectionID, suite.channel)
 	suite.NoError(err)
 	suite.Equal(1, pipelineManager.Num())
 
-	//Get pipeline
+	// Get pipeline
 	pipeline := pipelineManager.Get(suite.channel)
 	suite.NotNil(pipeline)
 
-	//Init Consumer
-	err = pipeline.ConsumeMsgStream(&msgpb.MsgPosition{})
+	// Init Consumer
+	err = pipeline.ConsumeMsgStream(context.Background(), &msgpb.MsgPosition{})
 	suite.NoError(err)
 
-	//Start pipeline
+	// Start pipeline
 	err = pipelineManager.Start(suite.channel)
 	suite.NoError(err)
 
-	//Remove pipeline
+	// Remove pipeline
 	pipelineManager.Remove(suite.channel)
 	suite.Equal(0, pipelineManager.Num())
 }

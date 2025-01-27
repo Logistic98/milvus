@@ -21,18 +21,18 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/errors"
-
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus-proto/go-api/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/milvuspb"
-	"github.com/milvus-io/milvus-proto/go-api/schemapb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/metastore/model"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/indexpb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/log"
+	"github.com/milvus-io/milvus/pkg/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/util/merr"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
@@ -43,6 +43,7 @@ type watchInfo struct {
 	vChannels      []string
 	startPositions []*commonpb.KeyDataPair
 	schema         *schemapb.CollectionSchema
+	dbProperties   []*commonpb.KeyValuePair
 }
 
 // Broker communicates with other components.
@@ -54,16 +55,11 @@ type Broker interface {
 
 	WatchChannels(ctx context.Context, info *watchInfo) error
 	UnwatchChannels(ctx context.Context, info *watchInfo) error
-	Flush(ctx context.Context, cID int64, segIDs []int64) error
-	Import(ctx context.Context, req *datapb.ImportTaskRequest) (*datapb.ImportTaskResponse, error)
-	UnsetIsImportingState(context.Context, *datapb.UnsetIsImportingStateRequest) (*commonpb.Status, error)
 	GetSegmentStates(context.Context, *datapb.GetSegmentStatesRequest) (*datapb.GetSegmentStatesResponse, error)
 	GcConfirm(ctx context.Context, collectionID, partitionID UniqueID) bool
 
 	DropCollectionIndex(ctx context.Context, collID UniqueID, partIDs []UniqueID) error
-	GetSegmentIndexState(ctx context.Context, collID UniqueID, indexName string, segIDs []UniqueID) ([]*indexpb.SegmentIndexState, error)
-	DescribeIndex(ctx context.Context, colID UniqueID) (*indexpb.DescribeIndexResponse, error)
-
+	// notify observer to clean their meta cache
 	BroadcastAlteredCollection(ctx context.Context, req *milvuspb.AlterCollectionRequest) error
 }
 
@@ -165,10 +161,12 @@ func (b *ServerBroker) WatchChannels(ctx context.Context, info *watchInfo) error
 	log.Ctx(ctx).Info("watching channels", zap.Uint64("ts", info.ts), zap.Int64("collection", info.collectionID), zap.Strings("vChannels", info.vChannels))
 
 	resp, err := b.s.dataCoord.WatchChannels(ctx, &datapb.WatchChannelsRequest{
-		CollectionID:   info.collectionID,
-		ChannelNames:   info.vChannels,
-		StartPositions: info.startPositions,
-		Schema:         info.schema,
+		CollectionID:    info.collectionID,
+		ChannelNames:    info.vChannels,
+		StartPositions:  info.startPositions,
+		Schema:          info.schema,
+		CreateTimestamp: info.ts,
+		DbProperties:    info.dbProperties,
 	})
 	if err != nil {
 		return err
@@ -185,35 +183,6 @@ func (b *ServerBroker) WatchChannels(ctx context.Context, info *watchInfo) error
 func (b *ServerBroker) UnwatchChannels(ctx context.Context, info *watchInfo) error {
 	// TODO: release flowgraph on datanodes.
 	return nil
-}
-
-func (b *ServerBroker) Flush(ctx context.Context, cID int64, segIDs []int64) error {
-	resp, err := b.s.dataCoord.Flush(ctx, &datapb.FlushRequest{
-		Base: commonpbutil.NewMsgBase(
-			commonpbutil.WithMsgType(commonpb.MsgType_Flush),
-			commonpbutil.WithSourceID(b.s.session.ServerID),
-		),
-		DbID:         0,
-		SegmentIDs:   segIDs,
-		CollectionID: cID,
-		IsImport:     true,
-	})
-	if err != nil {
-		return errors.New("failed to call flush to data coordinator: " + err.Error())
-	}
-	if resp.GetStatus().GetErrorCode() != commonpb.ErrorCode_Success {
-		return errors.New(resp.Status.Reason)
-	}
-	log.Info("flush on collection succeed", zap.Int64("collection ID", cID))
-	return nil
-}
-
-func (b *ServerBroker) Import(ctx context.Context, req *datapb.ImportTaskRequest) (*datapb.ImportTaskResponse, error) {
-	return b.s.dataCoord.Import(ctx, req)
-}
-
-func (b *ServerBroker) UnsetIsImportingState(ctx context.Context, req *datapb.UnsetIsImportingStateRequest) (*commonpb.Status, error) {
-	return b.s.dataCoord.UnsetIsImportingState(ctx, req)
 }
 
 func (b *ServerBroker) GetSegmentStates(ctx context.Context, req *datapb.GetSegmentStatesRequest) (*datapb.GetSegmentStatesResponse, error) {
@@ -250,17 +219,26 @@ func (b *ServerBroker) GetSegmentIndexState(ctx context.Context, collID UniqueID
 	if err != nil {
 		return nil, err
 	}
-	if resp.Status.ErrorCode != commonpb.ErrorCode_Success {
-		return nil, errors.New(resp.Status.Reason)
+	if resp.GetStatus().GetErrorCode() != commonpb.ErrorCode_Success {
+		return nil, merr.Error(resp.GetStatus())
 	}
 
 	return resp.GetStates(), nil
 }
 
 func (b *ServerBroker) BroadcastAlteredCollection(ctx context.Context, req *milvuspb.AlterCollectionRequest) error {
-	log.Info("broadcasting request to alter collection", zap.String("collection name", req.GetCollectionName()), zap.Int64("collection id", req.GetCollectionID()))
+	log.Ctx(ctx).Info("broadcasting request to alter collection",
+		zap.String("collectionName", req.GetCollectionName()),
+		zap.Int64("collectionID", req.GetCollectionID()),
+		zap.Any("props", req.GetProperties()),
+		zap.Any("deleteKeys", req.GetDeleteKeys()))
 
-	colMeta, err := b.s.meta.GetCollectionByID(ctx, req.GetCollectionID(), typeutil.MaxTimestamp, false)
+	colMeta, err := b.s.meta.GetCollectionByID(ctx, req.GetDbName(), req.GetCollectionID(), typeutil.MaxTimestamp, false)
+	if err != nil {
+		return err
+	}
+
+	db, err := b.s.meta.GetDatabaseByName(ctx, req.GetDbName(), typeutil.MaxTimestamp)
 	if err != nil {
 		return err
 	}
@@ -276,10 +254,13 @@ func (b *ServerBroker) BroadcastAlteredCollection(ctx context.Context, req *milv
 			Description: colMeta.Description,
 			AutoID:      colMeta.AutoID,
 			Fields:      model.MarshalFieldModels(colMeta.Fields),
+			Functions:   model.MarshalFunctionModels(colMeta.Functions),
 		},
 		PartitionIDs:   partitionIDs,
 		StartPositions: colMeta.StartPositions,
-		Properties:     req.GetProperties(),
+		Properties:     colMeta.Properties,
+		DbID:           db.ID,
+		VChannels:      colMeta.VirtualChannelNames,
 	}
 
 	resp, err := b.s.dataCoord.BroadcastAlteredCollection(ctx, dcReq)
@@ -290,24 +271,28 @@ func (b *ServerBroker) BroadcastAlteredCollection(ctx context.Context, req *milv
 	if resp.ErrorCode != commonpb.ErrorCode_Success {
 		return errors.New(resp.Reason)
 	}
-	log.Info("done to broadcast request to alter collection", zap.String("collection name", req.GetCollectionName()), zap.Int64("collection id", req.GetCollectionID()))
+	log.Ctx(ctx).Info("done to broadcast request to alter collection", zap.String("collectionName", req.GetCollectionName()), zap.Int64("collectionID", req.GetCollectionID()), zap.Any("props", req.GetProperties()))
 	return nil
 }
 
-func (b *ServerBroker) DescribeIndex(ctx context.Context, colID UniqueID) (*indexpb.DescribeIndexResponse, error) {
-	return b.s.dataCoord.DescribeIndex(ctx, &indexpb.DescribeIndexRequest{
-		CollectionID: colID,
-	})
-}
-
 func (b *ServerBroker) GcConfirm(ctx context.Context, collectionID, partitionID UniqueID) bool {
+	log := log.Ctx(ctx).With(zap.Int64("collection", collectionID), zap.Int64("partition", partitionID))
+
+	log.Info("confirming if gc is finished")
+
 	req := &datapb.GcConfirmRequest{CollectionId: collectionID, PartitionId: partitionID}
 	resp, err := b.s.dataCoord.GcConfirm(ctx, req)
 	if err != nil {
+		log.Warn("gc is not finished", zap.Error(err))
 		return false
 	}
+
 	if resp.GetStatus().GetErrorCode() != commonpb.ErrorCode_Success {
+		log.Warn("gc is not finished", zap.String("code", resp.GetStatus().GetErrorCode().String()),
+			zap.String("reason", resp.GetStatus().GetReason()))
 		return false
 	}
+
+	log.Info("received gc_confirm response", zap.Bool("finished", resp.GetGcFinished()))
 	return resp.GetGcFinished()
 }
